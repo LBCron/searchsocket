@@ -22,6 +22,13 @@ function mockResult(title: string) {
   };
 }
 
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function createMockFetch(response: SearchResponse = mockResponse()) {
   return vi.fn<typeof fetch>().mockResolvedValue(
     new Response(JSON.stringify(response), {
@@ -382,5 +389,178 @@ describe("createSearch", () => {
 
     expect(search.error).toBeInstanceOf(Error);
     expect(search.error!.message).toBe("Invalid search response");
+  });
+
+  it("sets error when the response body is JSON null", async () => {
+    const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("null", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+
+    expect(search.error!.message).toBe("Invalid search response");
+    expect(search.status).toBe("error");
+  });
+
+  it("sets error when results is null rather than reporting no matches", async () => {
+    const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ q: "test", scope: "", results: null }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+
+    // "empty" would be indistinguishable from a genuine zero-result search.
+    expect(search.status).toBe("error");
+    expect(search.error!.message).toBe("Invalid search response");
+    expect(search.results).toEqual([]);
+  });
+
+  it("sets error when a result row is missing its required fields", async () => {
+    const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ q: "test", scope: "", results: [{ title: "No url" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+
+    expect(search.status).toBe("error");
+    expect(search.error!.message).toBe("Invalid search response");
+  });
+
+  it("does not let an abandoned response overwrite a newer cache entry", async () => {
+    const pending: Array<(response: Response) => void> = [];
+    // Deliberately ignores `signal`: fetchImpl is a documented extension point,
+    // so correctness cannot depend on the transport honouring cancellation.
+    const mockFetch = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          pending.push(resolve);
+        })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "same");
+    await advanceAndSettle(0);
+    search.retry();
+    await tick();
+    await advanceAndSettle(0);
+    expect(pending).toHaveLength(2);
+
+    // Reverse order: the retry lands first, the abandoned original second.
+    pending[1]!(jsonResponse(mockResponse([mockResult("New")])));
+    await advanceAndSettle(0);
+    pending[0]!(jsonResponse(mockResponse([mockResult("Old")])));
+    await advanceAndSettle(0);
+
+    expect(search.results.map((r) => r.title)).toEqual(["New"]);
+
+    await setQueryAndFlush(search, "other");
+    await advanceAndSettle(0);
+    pending[2]!(jsonResponse(mockResponse([])));
+    await advanceAndSettle(0);
+
+    await setQueryAndFlush(search, "same");
+    await advanceAndSettle(0);
+
+    expect(search.results.map((r) => r.title)).toEqual(["New"]);
+    // Served from the cache, so the revisit issued no fourth request.
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores a response that lands after destroy", async () => {
+    const pending: Array<(response: Response) => void> = [];
+    const mockFetch = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          pending.push(resolve);
+        })
+    );
+    const search = createSearch({ fetchImpl: mockFetch, debounce: 0 });
+
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+    expect(pending).toHaveLength(1);
+
+    search.destroy();
+    pending[0]!(jsonResponse(mockResponse([mockResult("Late")])));
+    await advanceAndSettle(0);
+
+    expect(search.results).toEqual([]);
+    expect(search.error).toBeNull();
+    expect(search.status).toBe("loading");
+  });
+
+  it("leaves a pending request in charge when an abandoned one resolves first", async () => {
+    const pending: Array<(response: Response) => void> = [];
+    const mockFetch = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          pending.push(resolve);
+        })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "same");
+    await advanceAndSettle(0);
+    search.retry();
+    await tick();
+    await advanceAndSettle(0);
+
+    // The abandoned original resolves while its replacement is still in flight:
+    // it must neither settle results nor claim the search has finished.
+    pending[0]!(jsonResponse(mockResponse([mockResult("Old")])));
+    await advanceAndSettle(0);
+
+    expect(search.loading).toBe(true);
+    expect(search.status).toBe("loading");
+    expect(search.results).toEqual([]);
+
+    pending[1]!(jsonResponse(mockResponse([mockResult("New")])));
+    await advanceAndSettle(0);
+
+    expect(search.loading).toBe(false);
+    expect(search.results.map((r) => r.title)).toEqual(["New"]);
+  });
+
+  it("ignores a response that lands after clear()", async () => {
+    const pending: Array<(response: Response) => void> = [];
+    const mockFetch = vi.fn<typeof fetch>(
+      () =>
+        new Promise<Response>((resolve) => {
+          pending.push(resolve);
+        })
+    );
+    const search = tracked(createSearch({ fetchImpl: mockFetch, debounce: 0 }));
+
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+
+    search.clear();
+    pending[0]!(jsonResponse(mockResponse([mockResult("Late")])));
+    await advanceAndSettle(0);
+
+    expect(search.results).toEqual([]);
+    expect(search.status).toBe("idle");
+    expect(search.hasSearched).toBe(false);
+
+    // The abandoned response must not have seeded the cache either.
+    await setQueryAndFlush(search, "test");
+    await advanceAndSettle(0);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(search.results).toEqual([]);
   });
 });

@@ -79,6 +79,52 @@ export interface SearchClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * The wire is untyped, so a cast is a promise, not a check. A JSON `null` body,
+ * an error page that happened to parse, or `results: null` from a custom
+ * endpoint would otherwise reach the caller as a valid-looking empty response —
+ * indistinguishable from "no matches".
+ *
+ * Hand-written rather than a `zod` schema on purpose: this is a browser entry
+ * point, and the store in `src/svelte/` needs the same check but ships as raw
+ * source that cannot import from here. Every field the type declares as
+ * required is checked; an optional one only has to be the right type when it is present.
+ */
+function isSearchResult(value: unknown): value is SearchResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<SearchResult>;
+  if (
+    typeof result.url !== "string" ||
+    typeof result.title !== "string" ||
+    typeof result.snippet !== "string" ||
+    typeof result.score !== "number"
+  ) {
+    return false;
+  }
+  // An optional field may be absent, but a present one still has to be the
+  // type it is read as: `sectionTitle` reaches string methods and `chunks` is
+  // iterated.
+  if (result.sectionTitle !== undefined && typeof result.sectionTitle !== "string") return false;
+  if (result.chunks !== undefined) {
+    if (!Array.isArray(result.chunks)) return false;
+    if (!result.chunks.every((chunk) => typeof chunk === "object" && chunk !== null)) return false;
+  }
+  return true;
+}
+
+function isSearchResponse(payload: unknown): payload is SearchResponse {
+  if (typeof payload !== "object" || payload === null) return false;
+  const response = payload as Partial<SearchResponse>;
+  return (
+    typeof response.q === "string" &&
+    typeof response.scope === "string" &&
+    typeof response.meta === "object" &&
+    response.meta !== null &&
+    Array.isArray(response.results) &&
+    response.results.every(isSearchResult)
+  );
+}
+
 export function createSearchClient(options: SearchClientOptions = {}) {
   const endpoint = options.endpoint ?? "/api/search";
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -108,7 +154,11 @@ export function createSearchClient(options: SearchClientOptions = {}) {
         throw new Error(message);
       }
 
-      return payload as SearchResponse;
+      if (!isSearchResponse(payload)) {
+        throw new Error("Invalid search response");
+      }
+
+      return payload;
     }
   };
 }
