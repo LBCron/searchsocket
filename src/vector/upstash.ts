@@ -642,17 +642,26 @@ export class UpstashSearchStore {
       urlFilterable = false;
     }
 
-    filterParts.push(...planRetrievalConstraints({ tags: opts.tags }).clauses);
+    // A tag that cannot be expressed as a filter literal is enforced locally
+    // below instead. Discarding this flag meant the query came back unfiltered
+    // and was then cut to `limit` before anything checked the tags, so a
+    // matching chunk sitting behind `limit` non-matching ones disappeared.
+    const tagPlan = planRetrievalConstraints({ tags: opts.tags });
+    filterParts.push(...tagPlan.clauses);
 
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
 
+    // Anything the backend could not be asked to exclude has to be excluded
+    // here, which only works if enough candidates were fetched to survive it.
+    const filteredLocally = !urlFilterable || !tagPlan.complete;
+
     let results;
     try {
       results = await this.chunksNs.query<ChunkVectorMetadata>({
         data,
-        topK: urlFilterable ? opts.limit : Math.min(opts.limit * 10, 200),
+        topK: filteredLocally ? Math.min(opts.limit * 10, 200) : opts.limit,
         includeMetadata: true,
         filter: filterParts.join(" AND "),
         queryMode: QueryMode.HYBRID,
@@ -668,7 +677,14 @@ export class UpstashSearchStore {
       // these, but a filter-syntax surprise must not leak another tenant's
       // record into results. The URL is always re-checked locally so the
       // unfilterable-URL fallback above cannot return another page's chunks.
-      .filter((doc) => recordBelongsToScope(doc.metadata, scope) && doc.metadata?.url === url)
+      .filter(
+        (doc) =>
+          recordBelongsToScope(doc.metadata, scope) &&
+          doc.metadata?.url === url &&
+          // Applied before the slice, so `limit` counts chunks that actually
+          // match rather than chunks that merely came back.
+          matchesTags(doc.metadata?.tags ?? [], opts.tags ?? [])
+      )
       .slice(0, opts.limit)
       .map((doc) => ({
       // Logical chunk key, so the value round-trips back into deleteByIds().

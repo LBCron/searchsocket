@@ -411,3 +411,77 @@ function createFakeIndex() {
   };
   return { index, pagesNs, chunksNs };
 }
+
+describe("section sub-results honour an unexpressible tag", () => {
+  /**
+   * A tag containing an apostrophe cannot be a filter literal, so the backend
+   * cannot be asked to exclude anything. The store used to cut the result to
+   * `limit` before any tag check ran, so a matching chunk sitting behind
+   * `limit` non-matching ones vanished — the same starvation the pushdown work
+   * fixed for pages, still present on the section-expansion path.
+   */
+  function storeOverChunks(chunks: Array<{ id: string; tags: string[] }>) {
+    const queries: Array<{ topK: number; filter: string }> = [];
+    const index = {
+      namespace: () => ({
+        query: vi.fn(async (args: { topK: number; filter: string }) => {
+          queries.push({ topK: args.topK, filter: args.filter });
+          return chunks.slice(0, args.topK).map((chunk, i) => ({
+            id: `alpha:main:${INDEX_SCHEMA_VERSION}:chunk:${chunk.id}`,
+            score: 1 - i / 100,
+            metadata: {
+              projectId: "alpha",
+              scopeName: "main",
+              schemaVersion: INDEX_SCHEMA_VERSION,
+              type: "chunk",
+              url: "/guide",
+              tags: chunk.tags
+            }
+          }));
+        })
+      })
+    };
+    const store = new UpstashSearchStore({
+      index: index as never,
+      pagesNamespace: "pages",
+      chunksNamespace: "chunks"
+    } as never);
+    return { store, queries };
+  }
+
+  it("finds a matching chunk ranked behind the requested limit", async () => {
+    // Five untagged chunks, then the one that actually carries the tag.
+    const chunks = [
+      ...Array.from({ length: 5 }, (_v, i) => ({ id: `c${i}`, tags: ["other"] })),
+      { id: "c5", tags: ["it's"] }
+    ];
+    const { store, queries } = storeOverChunks(chunks);
+
+    const hits = await store.searchChunksByUrl(
+      "query",
+      "/guide",
+      { limit: 5, tags: ["it's"] },
+      alpha
+    );
+
+    // The apostrophe is never sent to the backend...
+    expect(queries[0]!.filter).not.toContain("it's");
+    // ...so the store must over-fetch to compensate...
+    expect(queries[0]!.topK).toBeGreaterThan(5);
+    // ...and return the match that a plain slice would have discarded.
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.id).toMatch(/c5$/);
+    expect(hits[0]!.metadata.tags).toEqual(["it's"]);
+  });
+
+  it("still asks the backend to do the work when the tag is expressible", async () => {
+    const chunks = [{ id: "c0", tags: ["guides"] }];
+    const { store, queries } = storeOverChunks(chunks);
+
+    await store.searchChunksByUrl("query", "/guide", { limit: 5, tags: ["guides"] }, alpha);
+
+    expect(queries[0]!.filter).toContain("tags CONTAINS 'guides'");
+    // No local fallback needed, so no over-fetch.
+    expect(queries[0]!.topK).toBe(5);
+  });
+});

@@ -145,6 +145,11 @@ describe("searchsocket CLI safety (real process)", () => {
       child = undefined;
     });
 
+    // These budgets are generous on purpose. This spawns a real CLI process and
+    // waits on wall-clock output while the rest of the suite runs in parallel,
+    // so on a loaded machine the child is competing for CPU with dozens of other
+    // test files. The assertion is that the watcher *eventually* reacts; a tight
+    // budget only measures how busy the machine is.
     async function waitFor(output: () => string, needle: string, timeoutMs: number): Promise<boolean> {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -165,7 +170,7 @@ describe("searchsocket CLI safety (real process)", () => {
 
       // chokidar walks the tree before it reports anything, so wait for the
       // watcher's own ready signal rather than guessing at a delay.
-      expect(await waitFor(() => out, "watcher ready", 15_000)).toBe(true);
+      expect(await waitFor(() => out, "watcher ready", 45_000)).toBe(true);
 
       fs.writeFileSync(path.join(tmpDir, "content", "notes.txt"), "not indexed\n");
       await new Promise((r) => setTimeout(r, 1000));
@@ -179,23 +184,23 @@ describe("searchsocket CLI safety (real process)", () => {
       fs.mkdirSync(path.join(tmpDir, "content", "guides"));
       fs.writeFileSync(path.join(tmpDir, "content", "guides", "new.md"), "# new\n");
 
-      expect(await waitFor(() => out, "new.md", 15_000)).toBe(true);
+      expect(await waitFor(() => out, "new.md", 45_000)).toBe(true);
       expect(out).not.toContain("notes.txt");
       expect(out).not.toContain(".hidden.md");
 
       // The configured glob uses {md,mdx} alternation, which chokidar never saw
       // and the event filter has to expand itself.
       fs.writeFileSync(path.join(tmpDir, "content", "guides", "other.mdx"), "# other\n");
-      expect(await waitFor(() => out, "other.mdx", 15_000)).toBe(true);
+      expect(await waitFor(() => out, "other.mdx", 45_000)).toBe(true);
 
       // Deleting it is a change too.
       fs.rmSync(path.join(tmpDir, "content", "guides", "new.md"));
-      expect(await waitFor(() => out, "detected unlink", 15_000)).toBe(true);
+      expect(await waitFor(() => out, "detected unlink", 45_000)).toBe(true);
 
       const exited = new Promise<void>((resolve) => child!.on("exit", () => resolve()));
       child.kill("SIGINT");
       await Promise.race([exited, new Promise((r) => setTimeout(r, 8000))]);
       expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
-    }, 60_000);
+    }, 180_000);
   });
 });
