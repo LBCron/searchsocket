@@ -257,6 +257,11 @@ export class IndexPipeline {
       }
     }
 
+    // Set when robots.txt was configured to be respected but could not be read.
+    // The run then has no way to know which pages are excluded, so it must not
+    // write anything — see the reasoning where this is assigned.
+    let exclusionPolicyUnknown = false;
+
     // Apply robots.txt filtering
     if (this.config.respectRobotsTxt) {
       let robotsRules = null;
@@ -283,12 +288,18 @@ export class IndexPipeline {
         } else if (robotsFetch.status === "unavailable") {
           // An unreadable policy is not permission to index everything: a page
           // the last readable robots.txt excluded would quietly become public.
-          // A run warning is the containment that already exists for this —
-          // it makes the run non-authoritative, so nothing is deleted and no
-          // artifacts are published from it.
+          //
+          // Marking the run non-authoritative stops deletions and artifact
+          // publication, but that is not enough on its own — the exposure here
+          // comes from a *write*. Crawling a sitemap that still lists /private
+          // while robots.txt 503s would index and serve it. There is no cached
+          // ruleset to fall back on (the pipeline persists nothing), so the
+          // only safe reading of an unknown policy is to write nothing at all
+          // and let the next run try again.
           this.logger.warn(
             `Could not read robots.txt (${robotsFetch.reason}); treating the exclusion policy as unknown.`
           );
+          exclusionPolicyUnknown = true;
           runWarnings.push({
             kind: "source-failure",
             detail: `robots.txt unreadable: ${robotsFetch.reason}`
@@ -896,15 +907,22 @@ export class IndexPipeline {
     this.logger.info(`Page changes: ${pagesChanged} changed/new, ${pagesDeleted} deleted, ${pageRecords.length - changedPages.length} unchanged`);
     this.logger.info(`Changes detected: ${changedChunks.length} changed, ${deletes.length} deleted, ${chunks.length - changedChunks.length} unchanged`);
 
-    if (indexMutationRefused && !options.dryRun) {
+    // Two independent reasons to write nothing: a refused deletion plan (writing
+    // would dilute the ratio the next run measures) and an unknown exclusion
+    // policy (writing could publish a page robots.txt meant to exclude).
+    const writesBlocked = indexMutationRefused || exclusionPolicyUnknown;
+
+    if (writesBlocked && !options.dryRun) {
+      const reason = indexMutationRefused
+        ? "writing them would make the refused deletion look acceptable on the next run"
+        : "robots.txt could not be read, so the run cannot tell which pages are excluded";
       this.logger.warn(
         `Leaving the index untouched: ${changedPages.length} page change(s) and ` +
-          `${changedChunks.length} chunk change(s) were not written, because writing them ` +
-          "would make the refused deletion look acceptable on the next run."
+          `${changedChunks.length} chunk change(s) were not written, because ${reason}.`
       );
     }
 
-    if (!options.dryRun && !indexMutationRefused) {
+    if (!options.dryRun && !writesBlocked) {
       // Upsert before delete, in both force and incremental mode: a crash
       // between the two must leave the old generation searchable, never an
       // empty index. Page IDs are stable, so re-upserting overwrites in place
@@ -950,7 +968,7 @@ export class IndexPipeline {
     const upsertStart = stageStart();
     let documentsUpserted = 0;
 
-    if (!options.dryRun && !indexMutationRefused && changedChunks.length > 0) {
+    if (!options.dryRun && !writesBlocked && changedChunks.length > 0) {
       this.logger.info(`Upserting ${changedChunks.length} chunk${changedChunks.length === 1 ? "" : "s"} to Upstash Vector...`);
 
       const CHUNK_TEXT_MAX_CHARS = 30_000;
@@ -1013,7 +1031,7 @@ export class IndexPipeline {
     stageEnd("upsert", upsertStart);
     // A refused run already reported that it wrote nothing; following that with
     // an upsert count of zero would read as "nothing needed writing".
-    if (!indexMutationRefused) {
+    if (!writesBlocked) {
       if (changedChunks.length > 0) {
         this.logger.info(`Upserted ${documentsUpserted} document${documentsUpserted === 1 ? "" : "s"} (${stageTimingsMs["upsert"]}ms)`);
       } else {
@@ -1038,7 +1056,7 @@ export class IndexPipeline {
       options.customRecords === undefined &&
       [...existingPageHashes.values()].some((entry) => entry.custom);
     const pageSetComplete =
-      !indexMutationRefused &&
+      !writesBlocked &&
       !retainedCustomRecords &&
       runWarnings.every((warning) => warning.kind === "chunks-limited");
 
@@ -1048,9 +1066,19 @@ export class IndexPipeline {
         await writeLlmsTxt(pages, this.config, this.cwd, this.logger);
         stageEnd("llms_txt", llmsStart);
       } else {
-        this.logger.warn(
-          "Keeping the existing llms.txt: this run's page list may be incomplete."
-        );
+        // Name the cause. "May be incomplete" on its own sends people looking
+        // for a bug, and the custom-record case in particular is a standing
+        // condition they have to act on rather than a transient hiccup.
+        const cause = writesBlocked
+          ? "the run wrote nothing to the index"
+          : retainedCustomRecords
+            ? "the index holds custom records this run was not given, so the exported list " +
+              "would drop them — pass customRecords to refresh the exports"
+            : `this run's page list is incomplete (${runWarnings
+                .filter((warning) => warning.kind !== "chunks-limited")
+                .map((warning) => warning.kind)
+                .join(", ")})`;
+        this.logger.warn(`Keeping the existing llms.txt: ${cause}.`);
       }
     }
 
