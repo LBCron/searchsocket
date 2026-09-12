@@ -41,6 +41,105 @@ const DEFAULT_RETRY_BASE_MS = 200;
  */
 const METADATA_UPDATE_CONCURRENCY = 8;
 
+/**
+ * Characters GLOB reads as pattern syntax. Upstash documents no escape sequence
+ * for them, so a path prefix containing one cannot be turned into a pattern
+ * that provably means what the caller wrote — the same reason
+ * `filterStringLiteral` rejects quotes instead of guessing an escape. Such a
+ * prefix is simply not pushed down; the caller re-checks it locally.
+ */
+const GLOB_METACHARS = /[*?[\]]/;
+
+/**
+ * Caller-supplied retrieval constraints the backend can apply itself, instead
+ * of the caller trimming an already-cut global candidate window.
+ *
+ * Deliberately a typed option rather than more text folded into `filter`:
+ * ownership clauses and caller constraints stay separate expressions, so no
+ * caller value can widen what a query is allowed to see.
+ *
+ * These narrow the candidate set; they are not a guarantee. A value the filter
+ * grammar cannot express is not sent at all — `planRetrievalConstraints`
+ * reports that as `complete: false` — so the caller remains responsible for
+ * enforcing the constraint on the records it gets back, with
+ * `matchesPathPrefix` and `matchesTags`. Ownership isolation is the store's
+ * job and is never delegated this way.
+ */
+export interface RetrievalConstraints {
+  /** Segment prefix on `url`: `/docs` selects `/docs` and `/docs/...`, not `/docsmith`. */
+  pathPrefix?: string;
+  /** Every tag must be present on the record — AND across tags, not OR. */
+  tags?: string[];
+}
+
+/** Does `url` sit at or under `prefix`, counting whole path segments? */
+export function matchesPathPrefix(url: string, prefix: string): boolean {
+  if (prefix === "/") return true;
+  return url === prefix || url.startsWith(`${prefix}/`);
+}
+
+/** Does a record carry every requested tag? */
+export function matchesTags(recordTags: string[], tags: string[]): boolean {
+  return tags.every((tag) => recordTags.includes(tag));
+}
+
+function pathPrefixClause(prefix: string): string | null {
+  if (GLOB_METACHARS.test(prefix)) return null;
+  try {
+    // Parenthesised because it contains an OR: AND binds tighter than OR in
+    // Upstash's grammar, so a bare disjunction here would escape the scope
+    // clauses it is joined to and match every project.
+    return (
+      `(url = ${filterStringLiteral(prefix, "path prefix")}` +
+      ` OR url GLOB ${filterStringLiteral(`${prefix}/*`, "path prefix")})`
+    );
+  } catch {
+    // A quote or backslash in the prefix; not expressible, not an error.
+    return null;
+  }
+}
+
+/**
+ * Translate retrieval constraints into backend filter clauses.
+ *
+ * `complete` is false when a constraint could not be expressed, which tells the
+ * caller the backend result is still a superset and that recall depends on a
+ * bounded overfetch. `matchesPathPrefix`/`matchesTags` above and the clauses
+ * here describe exactly the same sets: a filter that means one thing in the
+ * backend and another in JS would be worse than no pushdown at all.
+ */
+export function planRetrievalConstraints(constraints: RetrievalConstraints): {
+  clauses: string[];
+  complete: boolean;
+} {
+  const clauses: string[] = [];
+  let complete = true;
+
+  const prefix = constraints.pathPrefix;
+  // "/" constrains nothing, so it needs no clause and is never incomplete.
+  if (prefix !== undefined && prefix !== "/") {
+    const clause = pathPrefixClause(prefix);
+    if (clause) {
+      clauses.push(clause);
+    } else {
+      complete = false;
+    }
+  }
+
+  for (const tag of constraints.tags ?? []) {
+    // `tags` is stored as a string[], and CONTAINS tests array membership.
+    try {
+      clauses.push(`tags CONTAINS ${filterStringLiteral(tag, "tag")}`);
+    } catch {
+      // A quote or backslash in the tag; the caller's local predicate still
+      // enforces it.
+      complete = false;
+    }
+  }
+
+  return { clauses, complete };
+}
+
 /** Coerce an untrusted numeric option to a finite integer inside [min, max]. */
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -453,10 +552,11 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<VectorHit[]> {
     const filterParts = [...scopeFilterClauses(scope)];
+    filterParts.push(...planRetrievalConstraints(opts).clauses);
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
@@ -519,6 +619,12 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
+      /**
+       * Narrows to chunks carrying every tag. There is no `pathPrefix` here on
+       * purpose: `url` already pins the page, so a prefix could only contradict
+       * it, and an option a method ignores is worse than one it does not offer.
+       */
+      tags?: string[];
     },
     scope: Scope
   ): Promise<VectorHit[]> {
@@ -535,6 +641,8 @@ export class UpstashSearchStore {
       // Not a backend failure — the URL simply cannot be expressed as a literal.
       urlFilterable = false;
     }
+
+    filterParts.push(...planRetrievalConstraints({ tags: opts.tags }).clauses);
 
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
@@ -599,7 +707,7 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     return this.queryPages({ data }, opts, scope);
@@ -610,7 +718,7 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     return this.queryPages({ vector }, opts, scope);
@@ -621,10 +729,11 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     const filterParts = [...scopeFilterClauses(scope)];
+    filterParts.push(...planRetrievalConstraints(opts).clauses);
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
