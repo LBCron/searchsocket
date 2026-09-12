@@ -1,6 +1,7 @@
 import path from "node:path";
 import { IndexPipeline } from "../indexing/pipeline";
 import { Logger } from "../core/logger";
+import { SearchSocketError } from "../errors";
 import type { IndexingHooks } from "../types";
 
 interface MinimalResolvedConfig {
@@ -39,6 +40,17 @@ export interface SearchSocketAutoIndexOptions {
   scope?: string;
   verbose?: boolean;
   hooks?: IndexingHooks;
+  /**
+   * Treat missing Upstash credentials as a skip rather than a build failure.
+   * Defaults to true, matching `searchsocket index --allow-unconfigured`: a
+   * contributor without credentials should still be able to build the site.
+   * Set to false when the build is the deploy — then an unconfigured
+   * production build fails instead of shipping a stale index.
+   *
+   * This only covers a missing backend. A configured backend that fails
+   * mid-run still fails the build.
+   */
+  allowUnconfigured?: boolean;
 }
 
 function shouldRunAutoIndex(options: SearchSocketAutoIndexOptions): boolean {
@@ -119,12 +131,31 @@ export function searchsocketVitePlugin(options: SearchSocketAutoIndexOptions = {
         try {
           logger.info("[searchsocket] build completed, starting incremental index...");
 
-          const pipeline = await IndexPipeline.create({
-            cwd,
-            configPath: options.configPath,
-            logger,
-            hooks: options.hooks
-          });
+          let pipeline: IndexPipeline;
+          try {
+            pipeline = await IndexPipeline.create({
+              cwd,
+              configPath: options.configPath,
+              logger,
+              hooks: options.hooks
+            });
+          } catch (error) {
+            if (
+              error instanceof SearchSocketError &&
+              error.code === "VECTOR_BACKEND_UNAVAILABLE" &&
+              (options.allowUnconfigured ?? true)
+            ) {
+              // Reuse the thrown message rather than naming the default env
+              // vars: a project that set upstash.urlEnv/tokenEnv needs to be
+              // told about *its* variables.
+              logger.warn(
+                `[searchsocket] skipping indexing — ${error.message} ` +
+                  "Pass allowUnconfigured: false to fail the build instead."
+              );
+              return;
+            }
+            throw error;
+          }
 
           const stats = await pipeline.run({
             changedOnly: options.changedOnly ?? true,

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { searchsocketVitePlugin } from "../src/sveltekit/plugin";
 import { IndexPipeline } from "../src/indexing/pipeline";
+import { SearchSocketError } from "../src/errors";
+import { Logger } from "../src/core/logger";
 
 const originalEnv = { ...process.env };
 
@@ -190,5 +192,98 @@ describe("searchsocketVitePlugin", () => {
 
     expect(create).toHaveBeenCalledTimes(1);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+  it("skips indexing without failing the build when credentials are missing", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+
+    const create = vi
+      .spyOn(IndexPipeline, "create")
+      .mockRejectedValue(
+        new SearchSocketError("VECTOR_BACKEND_UNAVAILABLE", "Missing Upstash Vector credentials.")
+      );
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+
+    // A contributor without credentials must still be able to build the site.
+    await expect(closeBundle(plugin)).resolves.toBeUndefined();
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails the build on missing credentials when allowUnconfigured is false", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+
+    vi.spyOn(IndexPipeline, "create").mockRejectedValue(
+      new SearchSocketError("VECTOR_BACKEND_UNAVAILABLE", "Missing Upstash Vector credentials.")
+    );
+
+    const plugin = searchsocketVitePlugin({
+      cwd: process.cwd(),
+      verbose: false,
+      allowUnconfigured: false
+    });
+
+    await expect(closeBundle(plugin)).rejects.toThrow("Missing Upstash Vector credentials.");
+  });
+
+  it("still fails the build when a configured run fails mid-index", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+
+    // A missing credential is a skip; a configured backend going away mid-run
+    // is not, even though it carries the same error code.
+    vi.spyOn(IndexPipeline, "create").mockResolvedValue({
+      run: vi
+        .fn()
+        .mockRejectedValue(new SearchSocketError("VECTOR_BACKEND_UNAVAILABLE", "upsert failed"))
+    } as unknown as IndexPipeline);
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+
+    await expect(closeBundle(plugin)).rejects.toThrow("upsert failed");
+  });
+
+  it("names the project's own credential variables when it skips", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+
+    vi.spyOn(IndexPipeline, "create").mockRejectedValue(
+      new SearchSocketError(
+        "VECTOR_BACKEND_UNAVAILABLE",
+        "Missing Upstash Vector credentials. Set MY_VECTOR_URL and MY_VECTOR_TOKEN environment variables."
+      )
+    );
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+    await closeBundle(plugin);
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("MY_VECTOR_URL"));
+  });
+
+  it("can skip and then index on a later closeBundle once credentials appear", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+
+    const create = vi
+      .spyOn(IndexPipeline, "create")
+      .mockRejectedValueOnce(
+        new SearchSocketError("VECTOR_BACKEND_UNAVAILABLE", "Missing Upstash Vector credentials.")
+      )
+      .mockResolvedValueOnce({
+        run: vi.fn().mockResolvedValue({
+          pagesProcessed: 1,
+          chunksTotal: 1,
+          chunksChanged: 1,
+          documentsUpserted: 1,
+          deletes: 0,
+          routeExact: 1,
+          routeBestEffort: 0,
+          stageTimingsMs: {}
+        })
+      } as unknown as IndexPipeline);
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+
+    await expect(closeBundle(plugin)).resolves.toBeUndefined();
+    await expect(closeBundle(plugin)).resolves.toBeUndefined();
+
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });
