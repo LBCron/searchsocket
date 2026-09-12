@@ -38,7 +38,14 @@ import type {
   RouteMatch,
   Scope
 } from "../types";
-import { toStoredMeta } from "../utils/structured-meta";
+import {
+  METADATA_BYTE_BUDGET,
+  metadataByteSize,
+  toStoredMeta,
+  truncateToUtf8Bytes,
+  utf8ByteLength
+} from "../utils/structured-meta";
+import { INDEX_SCHEMA_VERSION } from "../vector/ids";
 
 /**
  * Build a plain-text summary of a page for the page search index.
@@ -174,6 +181,27 @@ function fingerprintMetadata(metadata: Record<string, unknown>): string {
 }
 
 /**
+ * Copy a structured-metadata bag one level deeper than a spread does.
+ *
+ * `{ ...meta }` clones the object but leaves every `string[]` value pointing at
+ * the array hanging off the IndexedPage — the same array every chunk of that
+ * page shares. A `transformChunk` hook doing `chunk.meta.frameworks.push(...)`
+ * therefore grew a page payload that had already been measured against the byte
+ * budget and fingerprinted, so the record reached the backend over the limit
+ * while describing itself with the hash of something smaller. Page plans are
+ * built before the chunk hooks run, which is exactly when that happens.
+ */
+function copyStoredMeta(
+  meta: Record<string, string | number | boolean | string[]>
+): Record<string, string | number | boolean | string[]> {
+  const copy: Record<string, string | number | boolean | string[]> = {};
+  for (const [key, value] of Object.entries(meta)) {
+    copy[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return copy;
+}
+
+/**
  * The metadata a page record is written with, and the single definition of it.
  *
  * Both the write and the metadata fingerprint read this, so the two cannot
@@ -206,22 +234,22 @@ function buildPageMetadata(record: PageRecord): Record<string, unknown> {
     incomingAnchorText: record.incomingAnchorText ?? "",
     weight: record.weight ?? null,
     custom: record.custom ?? false,
-    ...(record.meta && Object.keys(record.meta).length > 0 ? { meta: { ...record.meta } } : {})
+    ...(record.meta && Object.keys(record.meta).length > 0 ? { meta: copyStoredMeta(record.meta) } : {})
   };
 }
-
-/** Hard cap on stored chunk text, to stay within Upstash's 48KB metadata limit. */
-const CHUNK_TEXT_MAX_CHARS = 30_000;
 
 /**
  * The metadata a chunk record is written with, and the single definition of it.
  * See buildPageMetadata() for why the write and the fingerprint share it.
+ *
+ * `chunkText` is stored in full here. It used to be cut at 30,000 JavaScript
+ * characters "to stay within Upstash's 48KB metadata limit", which a code-unit
+ * slice cannot do: 30,000 CJK characters are ~90,000 UTF-8 bytes before the
+ * rest of the record is added, and an equally valid ASCII chunk was cut long
+ * before it needed to be. The real limit is enforced by byte, on the complete
+ * serialized payload, in fitMetadataToBudget() below.
  */
 function buildChunkMetadata(chunk: Chunk, embeddingText: string): Record<string, unknown> {
-  const cappedText = embeddingText.length > CHUNK_TEXT_MAX_CHARS
-    ? embeddingText.slice(0, CHUNK_TEXT_MAX_CHARS)
-    : embeddingText;
-
   return {
     url: chunk.url,
     path: chunk.path,
@@ -229,7 +257,7 @@ function buildChunkMetadata(chunk: Chunk, embeddingText: string): Record<string,
     sectionTitle: chunk.sectionTitle ?? "",
     headingPath: chunk.headingPath.join(" > "),
     snippet: chunk.snippet,
-    chunkText: cappedText,
+    chunkText: embeddingText,
     tags: [...chunk.tags],
     ordinal: chunk.ordinal,
     contentHash: chunk.contentHash,
@@ -241,7 +269,7 @@ function buildChunkMetadata(chunk: Chunk, embeddingText: string): Record<string,
     publishedAt: chunk.publishedAt ?? null,
     incomingAnchorText: chunk.incomingAnchorText ?? "",
     custom: chunk.custom ?? false,
-    ...(chunk.meta && Object.keys(chunk.meta).length > 0 ? { meta: { ...chunk.meta } } : {})
+    ...(chunk.meta && Object.keys(chunk.meta).length > 0 ? { meta: copyStoredMeta(chunk.meta) } : {})
   };
 }
 
@@ -259,14 +287,155 @@ interface PlannedWrite {
   metadataHash: string;
 }
 
-/** Attach the metadata fingerprint to a planned write. */
-function planWrite(id: string, data: string, metadata: Record<string, unknown>): PlannedWrite {
-  const metadataHash = fingerprintMetadata(metadata);
+/**
+ * What a record picks up after this module hands it over, and which the byte
+ * budget therefore has to reserve room for.
+ *
+ * `UpstashSearchStore.upsertChunks`/`upsertPages` stamp the scope identity onto
+ * every record, and `planWrite` appends the metadata fingerprint. None of that
+ * is ours to trim. Measuring only the projection built above would declare a
+ * payload safe and then have the backend reject it — mid-batch, after earlier
+ * records in the same call had already landed.
+ *
+ * The fingerprint is a sha256 hex digest, so its length is a constant 64 and a
+ * placeholder measures identically to the real thing.
+ */
+function storeEnvelope(kind: WriteKind, id: string, scope: Scope): Record<string, unknown> {
+  return {
+    ...(kind === "chunk" ? { chunkKey: id } : {}),
+    projectId: scope.projectId,
+    scopeName: scope.scopeName,
+    schemaVersion: INDEX_SCHEMA_VERSION,
+    type: kind,
+    metadataHash: "0".repeat(64)
+  };
+}
+
+type WriteKind = "chunk" | "page";
+
+/**
+ * The one free-text field per record kind that may be shortened to fit.
+ *
+ * Everything else is identity, provenance or link structure: shortening any of
+ * it would quietly change what search returns and what `get_page` reports,
+ * rather than merely storing less of the body.
+ */
+const TRIMMABLE_METADATA_FIELD: Record<WriteKind, string> = {
+  chunk: "chunkText",
+  page: "summary"
+};
+
+/** Context a planned write needs in order to be measured against the budget. */
+interface WriteBudget {
+  kind: WriteKind;
+  /** The page this record belongs to; a chunk reports the page it came from. */
+  url: string;
+  scope: Scope;
+  logger: Logger;
+}
+
+/**
+ * The largest field in a metadata projection, by serialized size.
+ *
+ * Used only to make the rejection actionable: "this record is too big" is not
+ * something a site owner can act on, whereas "its `meta` is 60 KB" is.
+ */
+function largestMetadataField(metadata: Record<string, unknown>): { key: string; bytes: number } {
+  let key = "";
+  let bytes = -1;
+  for (const [entryKey, value] of Object.entries(metadata)) {
+    // Ties broken by key order so the message is the same on every run.
+    const size = utf8ByteLength(JSON.stringify({ [entryKey]: value }));
+    if (size > bytes || (size === bytes && entryKey < key)) {
+      key = entryKey;
+      bytes = size;
+    }
+  }
+  return { key, bytes: Math.max(bytes, 0) };
+}
+
+/**
+ * Bring a record's metadata inside the per-vector byte budget, or refuse it.
+ *
+ * Measured on the FINAL object — the projection plus everything the store will
+ * add — serialized exactly as it will be sent, because JSON escaping inflates
+ * newlines, quotes and control characters and the key names are payload too.
+ *
+ * When the required fields alone do not fit there is nothing honest left to do
+ * but stop. Trimming identity or link structure would store a record that lies
+ * about itself, and letting it through means the backend rejects one item in
+ * the middle of a batch whose earlier items are already written.
+ */
+function fitMetadataToBudget(
+  id: string,
+  metadata: Record<string, unknown>,
+  budget: WriteBudget
+): Record<string, unknown> {
+  const envelope = storeEnvelope(budget.kind, id, budget.scope);
+  const measure = (candidate: Record<string, unknown>): number =>
+    metadataByteSize({ ...candidate, ...envelope });
+
+  let size = measure(metadata);
+  if (size <= METADATA_BYTE_BUDGET) return metadata;
+
+  const field = TRIMMABLE_METADATA_FIELD[budget.kind];
+  const originalBytes = utf8ByteLength(
+    typeof metadata[field] === "string" ? (metadata[field] as string) : ""
+  );
+
+  // Removing N UTF-8 bytes from the field removes at least N from the
+  // serialized payload — escaping only ever inflates — so one pass converges.
+  // The loop is a guard against that reasoning being wrong, not an algorithm.
+  let fitted = metadata;
+  for (let attempt = 0; attempt < 4 && size > METADATA_BYTE_BUDGET; attempt += 1) {
+    const current = typeof fitted[field] === "string" ? (fitted[field] as string) : "";
+    if (current.length === 0) break;
+    const target = utf8ByteLength(current) - (size - METADATA_BYTE_BUDGET);
+    fitted = { ...fitted, [field]: truncateToUtf8Bytes(current, target) };
+    size = measure(fitted);
+  }
+
+  if (size > METADATA_BYTE_BUDGET) {
+    const { [field]: _trimmed, ...required } = fitted;
+    const largest = largestMetadataField({ ...required, ...envelope });
+    throw new SearchSocketError(
+      "INVALID_REQUEST",
+      `Cannot index ${budget.kind} "${id}" on page ${budget.url}: its required metadata is ` +
+        `${size} bytes serialized, over the ${METADATA_BYTE_BUDGET}-byte per-record limit, ` +
+        `even with "${field}" removed entirely. The largest field is "${largest.key}" ` +
+        `(${largest.bytes} bytes). Shorten it, or drop it from the page's metadata.`
+    );
+  }
+
+  const keptBytes = utf8ByteLength(fitted[field] as string);
+  budget.logger.warn(
+    `Trimmed "${field}" of ${budget.kind} ${id} (${budget.url}) from ${originalBytes} to ` +
+      `${keptBytes} UTF-8 bytes to fit the ${METADATA_BYTE_BUDGET}-byte metadata limit.`
+  );
+  return fitted;
+}
+
+/**
+ * Fit the metadata to the byte budget, then attach its fingerprint.
+ *
+ * The order is the whole point. The metadata fingerprint exists to describe
+ * exactly what is stored; hashing before the trim would leave the stored
+ * payload and the hash that claims to describe it disagreeing, so the next run
+ * would see "unchanged" for a record whose text it never actually wrote.
+ */
+function planWrite(
+  id: string,
+  data: string,
+  metadata: Record<string, unknown>,
+  budget: WriteBudget
+): PlannedWrite {
+  const fitted = fitMetadataToBudget(id, metadata, budget);
+  const metadataHash = fingerprintMetadata(fitted);
   return {
     id,
     data,
-    metadata: { ...metadata, metadataHash },
-    contentHash: String(metadata.contentHash ?? ""),
+    metadata: { ...fitted, metadataHash },
+    contentHash: String(fitted.contentHash ?? ""),
     metadataHash
   };
 }
@@ -826,7 +995,14 @@ export class IndexPipeline {
 
     // Plan every page write up front, fingerprinting the metadata that will
     // actually be persisted rather than a hand-picked subset of it.
-    const pageWrites = pageRecords.map((r) => planWrite(r.url, r.summary ?? r.title, buildPageMetadata(r)));
+    const pageWrites = pageRecords.map((r) =>
+      planWrite(r.url, r.summary ?? r.title, buildPageMetadata(r), {
+        kind: "page",
+        url: r.url,
+        scope,
+        logger: this.logger
+      })
+    );
 
     // Determine changed and stale pages.
     //
@@ -998,7 +1174,12 @@ export class IndexPipeline {
     const chunkWrites = chunks.map((chunk) => {
       chunk.contentHash = buildChunkEmbeddingHash(chunk, this.config.chunking.prependTitle);
       const embeddingText = buildEmbeddingText(chunk, this.config.chunking.prependTitle);
-      return planWrite(chunk.chunkKey, embeddingText, buildChunkMetadata(chunk, embeddingText));
+      return planWrite(chunk.chunkKey, embeddingText, buildChunkMetadata(chunk, embeddingText), {
+        kind: "chunk",
+        url: chunk.url,
+        scope,
+        logger: this.logger
+      });
     });
 
     // Fetch existing hashes for the specific chunk keys we have now.
