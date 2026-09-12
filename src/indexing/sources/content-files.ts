@@ -992,10 +992,16 @@ export async function loadContentFilesPages(
       markdown = svelteAnalysisToMarkdown(analysis, body);
     }
 
+    const sourceRelativePath = path.relative(cwd, filePath).replace(/\\/g, "/");
+
     pages.push({
       url: filePathToUrl(filePath, baseDir),
       markdown,
-      sourcePath: path.relative(cwd, filePath).replace(/\\/g, "/"),
+      sourcePath: sourceRelativePath,
+      // This loader already knows the file behind the URL, so record it as an
+      // exact match rather than letting the route mapper guess at it.
+      routeFile: sourceRelativePath,
+      routeResolution: "exact",
       outgoingLinks: [],
       ...(tags ? { tags } : {})
     });
