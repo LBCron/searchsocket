@@ -29,8 +29,33 @@ function anchorTextMatches(anchorText: string | undefined, normalizedQuery: stri
   return normalizedAnchor.includes(normalizedQuery) || normalizedQuery.includes(normalizedAnchor);
 }
 
+/**
+ * Fold a title, anchor or query down to the letters, digits and spaces that
+ * lexical matching compares.
+ *
+ * The class is Unicode-aware (`\p{L}`/`\p{N}`) rather than `a-z0-9`: the ASCII
+ * form deleted every non-ASCII letter, so a Japanese, Cyrillic, Greek or
+ * accented-Latin title collapsed to the empty string or to a fragment that
+ * matched the wrong query, leaving the title and anchor boosts dead on
+ * multilingual content.
+ *
+ * NFC runs after lowercasing so both spellings of a precomposed character
+ * (`é` vs `e` + combining acute) fold together, and marks NFC cannot compose
+ * away are kept: they are meaningful letters in Devanagari, Thai, Hebrew and
+ * Arabic, and dropping them would normalize `दिन` and `दान` alike and boost the
+ * wrong word. Accents are preserved rather than folded — accent-insensitive
+ * recall would be a separate, script-aware policy. Variation selectors are
+ * marks that carry no text, so they go before the class runs.
+ */
 function normalizeForTitleMatch(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFC")
+    .replace(/[\uFE00-\uFE0F]/g, "")
+    .replace(/[^\p{L}\p{N}\p{M}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return /[\p{L}\p{N}]/u.test(normalized) ? normalized : "";
 }
 
 export function rankHits(hits: VectorHit[], config: ResolvedSearchSocketConfig, query?: string, debug?: boolean): RankedHit[] {
