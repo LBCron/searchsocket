@@ -410,6 +410,29 @@ describe("raw Svelte protections that survive an adversarial template", () => {
     ).toBeUndefined();
   });
 
+  it("withholds a page whose entire body was ignored", async () => {
+    // Regression: an ignore attribute covering the whole body left the markdown
+    // empty with no exclusion marker. The extractor read that as a failed
+    // extraction, which makes the run non-authoritative — so whatever was
+    // indexed before the attribute was added stayed searchable indefinitely.
+    // An operator who ignores everything has excluded the page, not broken it.
+    const { result } = await indexSvelte(
+      `<main data-search-ignore><p>Previously indexed prose.</p></main>`
+    );
+
+    // "excluded" is the authoritative outcome that lets the stale records go.
+    // "failed" is what this used to be, and it is what kept them.
+    expect(result).toEqual({ status: "excluded", reason: "noindex" });
+  });
+
+  it("still reports a genuinely unreadable page as a failure, not an exclusion", async () => {
+    // The counterpart: an empty body with nothing deliberately dropped must NOT
+    // become a silent noindex, or an extraction bug would start deleting pages.
+    const analysis = analyzeSvelteSource("<script>\n  const a = 1;\n</script>", testConfig());
+    expect(analysis.droppedIgnoredText).toBe(false);
+    expect(analysis.excluded).toBeUndefined();
+  });
+
   it("does not stall on a long run of unmatched braces", () => {
     const started = Date.now();
     analyzeSvelteSource(`<main>${"{".repeat(16000)}</main>`, testConfig());

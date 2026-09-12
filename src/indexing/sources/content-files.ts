@@ -257,6 +257,8 @@ export interface SvelteSourceAnalysis {
   unresolved: string[];
   /** How many `{#...}` control-flow blocks contributed text unconditionally. */
   conditionalBlocks: number;
+  /** Whether an ignore-attributed subtree actually had its text dropped. */
+  droppedIgnoredText: boolean;
   /** Plain text of the template, with ignored subtrees dropped. */
   text: string;
 }
@@ -557,6 +559,7 @@ interface SvelteScanContext {
   componentAliases: Set<string>;
   controlDepth: number;
   conditionalBlocks: number;
+  droppedIgnoredText: boolean;
   excluded?: SvelteExclusionReason;
   weight?: number;
   unresolved: string[];
@@ -802,6 +805,9 @@ function walkSvelteNodes(roots: ParsedNode[], ctx: SvelteScanContext): void {
     const ignored = attrs.values.has(ctx.ignoreAttr);
     const children = node.children;
     if (!children?.length) continue;
+    // Remember that text was deliberately discarded. A page whose whole body
+    // was ignored otherwise looks indistinguishable from one we failed to read.
+    if (ignored && collectText) ctx.droppedIgnoredText = true;
     for (let i = children.length - 1; i >= 0; i--) {
       stack.push({ node: children[i]!, collectText: collectText && !ignored });
     }
@@ -859,6 +865,7 @@ export function analyzeSvelteSource(
     componentAliases: findComponentAliases(source),
     controlDepth: 0,
     conditionalBlocks: 0,
+    droppedIgnoredText: false,
     unresolved: [],
     textParts: []
   };
@@ -881,6 +888,7 @@ export function analyzeSvelteSource(
     ...(ctx.weight !== undefined ? { weight: ctx.weight } : {}),
     unresolved: ctx.unresolved,
     conditionalBlocks: ctx.conditionalBlocks,
+    droppedIgnoredText: ctx.droppedIgnoredText,
     text
   };
 }
@@ -902,6 +910,14 @@ function svelteAnalysisToMarkdown(analysis: SvelteSourceAnalysis, body: string):
   }
   if (analysis.weight !== undefined) {
     return matter.stringify(body, { searchsocket: { weight: analysis.weight } });
+  }
+  // Everything the page had to say was inside an ignored subtree. Returning an
+  // empty body would read as an extraction failure, which makes the run
+  // non-authoritative and leaves whatever was indexed before this element was
+  // ignored sitting in the index forever. The operator asked for that content
+  // not to be indexed, so say so plainly and let the stale records be removed.
+  if (!body.trim() && analysis.droppedIgnoredText) {
+    return "<!-- noindex -->";
   }
   return body;
 }
