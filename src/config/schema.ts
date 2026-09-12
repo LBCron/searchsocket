@@ -97,13 +97,6 @@ export const searchSocketConfigSchema = z.object({
       maxRetries: z.number().int().min(0).max(10).optional()
     })
     .optional(),
-  embedding: z
-    .object({
-      model: z.string().optional(),
-      dimensions: z.number().int().positive().optional(),
-      taskType: z.string().optional()
-    })
-    .optional(),
   indexing: z
     .object({
       /**

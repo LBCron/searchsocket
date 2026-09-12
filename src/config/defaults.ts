@@ -61,11 +61,6 @@ export function createDefaultConfig(projectId: string): ResolvedSearchSocketConf
       batchSize: 90,
       maxRetries: 2
     },
-    embedding: {
-      model: "bge-large-en-v1.5",
-      dimensions: 1024,
-      taskType: "RETRIEVAL_DOCUMENT"
-    },
     indexing: {
       maxDeletionRatio: 0.5
     },

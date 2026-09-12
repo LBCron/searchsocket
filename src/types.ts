@@ -83,11 +83,6 @@ export interface SearchSocketConfig {
     /** Retries for transient failures (rate limit, timeout, 5xx). Default 2. */
     maxRetries?: number;
   };
-  embedding?: {
-    model?: string;
-    dimensions?: number;
-    taskType?: string;
-  };
   indexing?: {
     /**
      * Refuse deletions removing more than this fraction of existing pages
@@ -241,11 +236,6 @@ export interface ResolvedSearchSocketConfig {
     };
     batchSize: number;
     maxRetries: number;
-  };
-  embedding: {
-    model: string;
-    dimensions: number;
-    taskType: string;
   };
   indexing: {
     maxDeletionRatio: number;
