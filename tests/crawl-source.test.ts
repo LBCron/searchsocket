@@ -325,6 +325,215 @@ describe("loadCrawledPages", () => {
     expect(seen).toEqual(["https://example.com/a"]);
   });
 
+  /**
+   * The sitemap cap is a data-loss path: it used to stop the traversal and
+   * return an empty list, so a capped run looked like a complete small site
+   * and the pipeline deleted everything it never saw.
+   */
+  describe("sitemap cap", () => {
+    /**
+     * A root sitemap index listing `childCount` children, one page each.
+     * MAX_SITEMAPS counts the root, so `childCount` 49 sits exactly on the cap.
+     */
+    function mockWideIndex(childCount: number) {
+      return vi.spyOn(globalThis, "fetch").mockImplementation(async (input: string | URL | Request) => {
+        const url = String(input);
+
+        if (url === "https://example.com/sitemap.xml") {
+          const children = Array.from(
+            { length: childCount },
+            (_v, i) => `<sitemap><loc>/child-${i}.xml</loc></sitemap>`
+          ).join("");
+          return mockResponse(
+            `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${children}</sitemapindex>`
+          );
+        }
+
+        const child = /^https:\/\/example\.com\/child-(\d+)\.xml$/.exec(url);
+        if (child) {
+          return mockResponse(
+            `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+              `<url><loc>https://example.com/p-${child[1]}</loc></url></urlset>`
+          );
+        }
+
+        return mockResponse("<html><body><main>page</main></body></html>");
+      });
+    }
+
+    function sitemapConfig() {
+      const config = createDefaultConfig("crawl-test");
+      config.source.mode = "crawl";
+      config.source.crawl = {
+        baseUrl: "https://example.com",
+        routes: [],
+        sitemapUrl: "/sitemap.xml"
+      };
+      return config;
+    }
+
+    it("stays complete when the traversal sits exactly on the cap", async () => {
+      mockWideIndex(49);
+
+      const result = await loadCrawledPages(sitemapConfig());
+
+      expect(result.records).toHaveLength(49);
+      expect(result.complete).toBe(true);
+      expect(result.limitedBy).toBeUndefined();
+      expect(result.failures).toEqual([]);
+    });
+
+    it("stays complete below the cap", async () => {
+      mockWideIndex(10);
+
+      const result = await loadCrawledPages(sitemapConfig());
+
+      expect(result.records).toHaveLength(10);
+      expect(result.complete).toBe(true);
+    });
+
+    it("reports a wide index truncated by the cap as incomplete", async () => {
+      mockWideIndex(60);
+
+      const result = await loadCrawledPages(sitemapConfig());
+
+      // The root consumes a slot, so only 49 of the 60 children are read.
+      expect(result.records).toHaveLength(49);
+      expect(result.complete).toBe(false);
+      expect(result.limitedBy).toBe("max-sitemaps");
+    });
+
+    it("reports a nested index truncated by the cap as incomplete", async () => {
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input: string | URL | Request) => {
+        const url = String(input);
+
+        if (url === "https://example.com/sitemap.xml") {
+          return mockResponse(`
+            <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <sitemap><loc>/group-a.xml</loc></sitemap>
+              <sitemap><loc>/group-b.xml</loc></sitemap>
+            </sitemapindex>
+          `);
+        }
+
+        const group = /^https:\/\/example\.com\/group-([ab])\.xml$/.exec(url);
+        if (group) {
+          const leaves = Array.from(
+            { length: 30 },
+            (_v, i) => `<sitemap><loc>/${group[1]}-${i}.xml</loc></sitemap>`
+          ).join("");
+          return mockResponse(
+            `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${leaves}</sitemapindex>`
+          );
+        }
+
+        const leaf = /^https:\/\/example\.com\/([ab])-(\d+)\.xml$/.exec(url);
+        if (leaf) {
+          return mockResponse(
+            `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+              `<url><loc>https://example.com/${leaf[1]}-${leaf[2]}</loc></url></urlset>`
+          );
+        }
+
+        return mockResponse("<html><body><main>page</main></body></html>");
+      });
+
+      const result = await loadCrawledPages(sitemapConfig());
+
+      expect(result.complete).toBe(false);
+      expect(result.limitedBy).toBe("max-sitemaps");
+    });
+
+    it("keeps a nested index below the cap complete", async () => {
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input: string | URL | Request) => {
+        const url = String(input);
+
+        if (url === "https://example.com/sitemap.xml") {
+          return mockResponse(`
+            <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <sitemap><loc>/group.xml</loc></sitemap>
+            </sitemapindex>
+          `);
+        }
+
+        if (url === "https://example.com/group.xml") {
+          const leaves = Array.from({ length: 5 }, (_v, i) => `<sitemap><loc>/leaf-${i}.xml</loc></sitemap>`).join("");
+          return mockResponse(
+            `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${leaves}</sitemapindex>`
+          );
+        }
+
+        const leaf = /^https:\/\/example\.com\/leaf-(\d+)\.xml$/.exec(url);
+        if (leaf) {
+          return mockResponse(
+            `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+              `<url><loc>https://example.com/n-${leaf[1]}</loc></url></urlset>`
+          );
+        }
+
+        return mockResponse("<html><body><main>page</main></body></html>");
+      });
+
+      const result = await loadCrawledPages(sitemapConfig());
+
+      expect(result.records).toHaveLength(5);
+      expect(result.complete).toBe(true);
+      expect(result.limitedBy).toBeUndefined();
+    });
+
+    it("prefers the discovery cap over --max-pages when both truncated the run", async () => {
+      mockWideIndex(60);
+
+      const result = await loadCrawledPages(sitemapConfig(), 5);
+
+      expect(result.records).toHaveLength(5);
+      expect(result.limitedBy).toBe("max-sitemaps");
+    });
+  });
+
+  it("records an unreadable child sitemap as a failure instead of shrinking silently", async () => {
+    const config = createDefaultConfig("crawl-test");
+    config.source.mode = "crawl";
+    config.source.crawl = {
+      baseUrl: "https://example.com",
+      routes: [],
+      sitemapUrl: "/sitemap.xml"
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+
+      if (url === "https://example.com/sitemap.xml") {
+        return mockResponse(`
+            <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <sitemap><loc>/good.xml</loc></sitemap>
+              <sitemap><loc>/broken.xml</loc></sitemap>
+            </sitemapindex>
+          `);
+      }
+
+      if (url === "https://example.com/good.xml") {
+        return mockResponse(`
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <url><loc>https://example.com/docs</loc></url>
+            </urlset>
+          `);
+      }
+
+      if (url === "https://example.com/broken.xml") {
+        return mockResponse("nope", { status: 500 });
+      }
+
+      return mockResponse("<html><body><main>docs</main></body></html>");
+    });
+
+    const result = await loadCrawledPages(config);
+
+    expect(result.records.map((page) => page.url)).toEqual(["/docs"]);
+    expect(result.complete).toBe(false);
+    expect(result.failures.map((failure) => failure.target)).toEqual(["https://example.com/broken.xml"]);
+  });
+
   it("ignores non-http(s) sitemap loc entries", async () => {
     const config = createDefaultConfig("crawl-test");
     config.source.mode = "crawl";
