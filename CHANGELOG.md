@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Upgrade cost
+
+The first indexing run after upgrading re-writes more than usual. Nothing is lost, and
+the extra cost is one-off:
+
+- **Every page summary re-upserts once.** The page fingerprint is now computed over
+  canonical JSON, so every existing page hash differs and each page summary is written
+  again.
+- **Unchanged chunks get a metadata-only refresh — no re-embedding.** The text is not
+  re-sent, so these cost a write but not an embedding.
+- **`content-files` chunks whose text contained HTML entities re-embed once.** Raw
+  `.svelte` extraction now decodes entities properly, so that text genuinely changed.
+
+### Changed
+
+- **A refused large-deletion plan now writes nothing at all.** Previously a run stopped by
+  `indexing.maxDeletionRatio` still upserted its additions, which enlarged the
+  inventory the ratio is measured against — an identical retry then saw the same stale
+  records as a smaller fraction and deleted them without `--accept-large-deletion`
+  being supplied. The whole mutation is now refused, so a refused plan stays refused
+  however often it is repeated. The separate empty-source guard is unchanged: it stops
+  deletions but still writes the run's additions.
+- **An unreadable `robots.txt` blocks index writes** in `crawl` mode, the only mode that
+  fetches it over the network. If the fetch times out, returns a server error, or exceeds
+  the 512 KiB size cap, the run cannot tell which pages the site means to exclude, so it
+  writes nothing rather than risk publishing an excluded page. A 404 or 410 still means
+  "no rules here" and indexing proceeds. `static-output`/`build` read `robots.txt` from
+  the build directory and treat an unreadable file as absent.
+- **`robots.txt` matching follows RFC 9309** for `*` wildcards, the `$` end-anchor, group
+  merging across consecutive `User-agent` lines, and longest-rule-wins specificity. Not
+  certified-complete: percent-encoded paths are compared as written, not canonicalised.
+- **`llms.txt` / `llms-full.txt` are only republished by a run holding the complete
+  page list.** A truncated crawl, a failed extraction, or a refused deletion plan
+  leaves the existing files alone. Sharp edge: if the index holds custom records and a
+  run is not passed `customRecords`, those pages are missing from the run's page list
+  and the exports are **not** refreshed — the warning now says so, and names
+  `customRecords` as the fix. Passing `customRecords: []` asserts there are none.
+- **`pathPrefix` is now a segment prefix.** `/docs` matches `/docs` and `/docs/api` and
+  no longer matches `/docsmith`. This is a behaviour change for any prefix that was
+  relying on raw string matching.
+- **`results: null` from a search endpoint is an error, not an empty result set.** The
+  client and the `createSearch` store validate the response shape; on a 2xx response a
+  `null` body, a parseable error page, or `results: null` raises `Invalid search
+  response`. A rejected response is never written to the result cache.
+- **Title and anchor ranking keeps non-ASCII letters.** Matching is Unicode-aware and
+  NFC-normalized, so Japanese, Cyrillic, Greek and accented-Latin titles get the
+  lexical boosts. Accents are preserved rather than folded, so a query for `cafe` no
+  longer matches a title of `café`.
+- **Chunk metadata is budgeted in UTF-8 bytes** against Upstash's 48 KB per-record
+  limit, measured on the exact JSON that will be sent rather than in characters. The
+  trimmable text field is truncated to fit with a warning; if the required fields alone
+  do not fit, the run fails naming the page URL and the offending field.
+- **Raw `.svelte` `content-files` mode honours noindex/weight/ignore signals
+  statically**, and **withholds** a page when a recognised signal is present but not
+  statically decidable — an expression, inside an `{#if}`, or a spread the scanner can tie
+  to a protective attribute. Reading an undecidable protective signal as false would
+  publish a page someone asked to hold back. Known gaps, pinned by tests:
+  `{@html}`/`{@render}` contents are not extracted, `+layout.svelte` signals do not
+  propagate to the pages beneath, and a conditional `data-search-ignore` drops its subtree
+  without withholding the page.
+- **The `svelte` peer range is now `^5.20.0`.** The generated templates use
+  `$props.id()`, which landed in Svelte 5.20.0; the previous `^5.0.0` allowed versions
+  that cannot compile them.
+
+### Fixed
+
+- The relevance playground returned 500 for every error. It read `error.statusCode`,
+  but `SearchSocketError` exposes `status`, so intended 4xx responses were reported as
+  server errors.
+- Documentation corrections throughout: browser examples import `searchsocketScrollToText`
+  from `searchsocket/scroll` rather than the server-only `searchsocket/sveltekit`
+  barrel; the quickstart installs `search-trigger` as well as `search-dialog`; the
+  page-retrieval route is `/api/search/pages/<path>`, nested under `api.path`; hook
+  examples use the real `ExtractedPage` and `IndexStats` shapes; the removed
+  `embedding.*` keys no longer appear in a config example; `scoreGapThreshold` is
+  described as adjacent-gap trimming, which is what the code does; scores are no longer
+  described as a 0–1 confidence scale; the Upstash Vector feature claim says hybrid
+  retrieval with DBSF fusion rather than reranking and input enrichment; `SECURITY.md`
+  lists the supported versions and the anonymous `mcp.handle.access: "public"` mode.
+
 ## [0.10.0] - 2026-08-20
 
 An MCP release. The SvelteKit handle route can now serve anonymous callers a

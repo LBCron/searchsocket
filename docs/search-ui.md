@@ -4,7 +4,7 @@ This guide walks through building a complete search experience with SearchSocket
 
 ## Quick start with templates
 
-SearchSocket includes copy-paste Svelte 5 components you can add to your project and customize freely:
+SearchSocket includes copy-paste Svelte 5 components you can add to your project and customize freely. They use `$props.id()`, so they need **Svelte 5.20 or newer**:
 
 ```bash
 pnpm searchsocket add search-dialog     # Cmd+K command palette
@@ -22,7 +22,7 @@ search-ui.ts             pure helpers (highlighting, breadcrumbs, shortcuts)
 search-theme.css         design tokens and part styles
 ```
 
-Nothing imports back into `node_modules` — once copied, the code is entirely yours. Existing files are skipped unless you pass `--overwrite`, so adding a second component never clobbers edits you made to the shared files.
+The component source, markup and styling are yours once copied — nothing reaches back into the package for those. The templates do still import SearchSocket's runtime (`searchsocket/svelte`, `searchsocket/client`), which is what talks to your search API. Existing files are skipped unless you pass `--overwrite`, so adding a second component never clobbers edits you made to the shared files.
 
 The default is styled with plain CSS driven by semantic variables, so it needs **no CSS framework** and looks finished without edits. It follows your app's light/dark convention by default, ships full keyboard navigation and ARIA wiring, and respects reduced-motion and forced-colors preferences.
 
@@ -32,7 +32,7 @@ A complete integration:
 <!-- src/routes/+layout.svelte -->
 <script lang="ts">
   import { afterNavigate } from "$app/navigation";
-  import { searchsocketScrollToText } from "searchsocket/sveltekit";
+  import { searchsocketScrollToText } from "searchsocket/scroll";
   import SearchDialog from "$lib/components/search/SearchDialog.svelte";
   import SearchTrigger from "$lib/components/search/SearchTrigger.svelte";
 
@@ -289,7 +289,7 @@ Wire the keyboard shortcut in your root layout:
 <!-- src/routes/+layout.svelte -->
 <script>
   import { afterNavigate } from "$app/navigation";
-  import { searchsocketScrollToText } from "searchsocket/sveltekit";
+  import { searchsocketScrollToText } from "searchsocket/scroll";
   import SearchModal from "$lib/components/SearchModal.svelte";
 
   let searchOpen = $state(false);
@@ -328,7 +328,10 @@ $effect(() => {
 
 ## Scoped search
 
-Scope search to a section of your site (e.g., only docs, only blog) by passing `pathPrefix`:
+Scope search to a section of your site (e.g., only docs, only blog) by passing `pathPrefix`.
+
+`pathPrefix` matches whole **path segments**, not raw string prefixes: `/docs` matches
+`/docs` and `/docs/api`, and does not match `/docsmith`. `/` matches everything.
 
 ```svelte
 <script>
@@ -492,7 +495,7 @@ For search result navigation to scroll to the matching section, add the handler 
 <!-- src/routes/+layout.svelte -->
 <script>
   import { afterNavigate } from "$app/navigation";
-  import { searchsocketScrollToText } from "searchsocket/sveltekit";
+  import { searchsocketScrollToText } from "searchsocket/scroll";
 
   afterNavigate(searchsocketScrollToText);
 </script>
@@ -508,7 +511,7 @@ Customize the highlight appearance:
 
 ```css
 /* CSS Custom Highlight API (modern browsers) */
-::highlight(ssk-highlight) {
+::highlight(ssk-search-match) {
   background-color: rgba(250, 204, 21, 0.4);
 }
 
@@ -765,7 +768,7 @@ const response = await client.search({
   q: "deployment",
   topK: 10,
   groupBy: "page",        // "page" (default) or "chunk"
-  pathPrefix: "/docs",     // filter by URL prefix
+  pathPrefix: "/docs",     // filter to this path segment and its subtree
   tags: ["guide"],         // filter by tags (AND logic)
   filters: { version: 2 }, // structured metadata filters
   maxSubResults: 5         // max chunks per page result
@@ -788,7 +791,10 @@ interface SearchResult {
   snippet: string;              // text excerpt
   chunkText?: string;           // matched section's indexed text; omitted unless
                                 //   api.exposeInternalFields is enabled
-  score: number;                // relevance score (0-1)
+  score: number;                // relevance score. Comparable within one result
+                                //   set only: additive boosts and the pageWeights
+                                //   multiplier put it outside 0-1, and it is not
+                                //   a confidence value
   routeFile?: string;           // SvelteKit source file path; omitted unless
                                 //   api.exposeInternalFields is enabled
   chunks?: SearchResultChunk[]; // sub-results (page mode only)
@@ -801,6 +807,17 @@ interface SearchResultChunk {
   score: number;
 }
 ```
+
+### Response validation
+
+Both the client and the `createSearch` store check the response shape before handing it
+on. On a 2xx response, a JSON `null` body, an error page that happened to parse, or
+`results: null` from a custom endpoint is rejected as `Invalid search response` — an
+error state, not an empty result set. (A non-2xx response takes the earlier branch and
+surfaces the endpoint's own error message, or `Search failed`.) Either way the client
+throws and the store sets `search.error` and moves to `status: "error"`, rather than
+showing "no matches" for what is actually a broken endpoint. A rejected response is never
+written to the result cache.
 
 ## Accessibility
 
@@ -870,7 +887,8 @@ The search endpoint accepts JSON:
   q: string;                    // required — search query
   topK?: number;                // max results (default: 10, max: 100)
   groupBy?: "page" | "chunk";  // result grouping (default: "page")
-  pathPrefix?: string;          // filter by URL prefix
+  pathPrefix?: string;          // filter to this path segment and its subtree
+                                //   "/docs" matches /docs and /docs/api, not /docsmith
   tags?: string[];              // filter by tags (AND logic)
   filters?: Record<string, any>; // structured metadata filters
   maxSubResults?: number;       // chunks per page (default: 5, max: 20)
@@ -889,15 +907,20 @@ GET /api/search?q=getting+started&topK=5&groupBy=page&pathPrefix=/docs
 Returns backend health status:
 
 ```json
-{ "status": "ok" }
+{ "ok": true }
 ```
 
-### `GET /api/pages/<path>`
+An unhealthy backend answers `{ "ok": false, "details": "<category>" }` — a category, not
+the raw backend message, which can carry a credential.
 
-Retrieve indexed markdown for a specific page:
+### `GET /api/search/pages/<path>`
+
+Retrieve indexed markdown for a specific page. The route is nested under the
+configured `api.path`, so with the default `/api/search` it is
+`/api/search/pages/<path>`:
 
 ```
-GET /api/pages/docs/getting-started
+GET /api/search/pages/docs/getting-started
 ```
 
 Returns the page's indexed markdown with frontmatter.

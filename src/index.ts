@@ -52,8 +52,9 @@ export { INDEX_SCHEMA_VERSION } from "./vector/ids";
  * `createUpstashStore` is the supported way to obtain a store. The concrete
  * `UpstashSearchStore` class is no longer exported from the root: it was public
  * only by accident, and exposing it made its internals — batching, ID encoding,
- * scan strategy — part of the package's compatibility surface. Import it from
- * `searchsocket/dist/vector/upstash` if you genuinely need the class, and
- * expect it to change.
+ * scan strategy — part of the package's compatibility surface. There is no
+ * exported subpath for it and the bundler emits no separate file, so the class
+ * is not reachable from the published package at all. If you need it, work from
+ * the source in the repository and expect it to change.
  */
 export { createUpstashStore } from "./vector";

@@ -34,7 +34,8 @@ The playground has two parts: a **search interface** and a **ranking tuner**.
 - Expand results to see individual matching chunks with heading paths
 
 **Ranking tuner** (collapsible panel):
-- Adjust thresholds, boost toggles, weights, and aggregation via sliders
+- Adjust thresholds (`minScoreRatio`, `scoreGapThreshold`), the incoming-link and depth
+  boost toggles, and the `incomingLinks`, `depth` and `titleMatch` weights via sliders
 - Changes are applied to searches immediately — no restart needed
 - Modified parameters are highlighted so you can see what you've changed
 - Reset individual parameters or all at once
@@ -46,7 +47,15 @@ The playground has two parts: a **search interface** and a **ranking tuner**.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `minScoreRatio` | 0.70 | Drop results below this ratio of the best score |
-| `scoreGapThreshold` | 0.40 | Trim results more than this gap below the best |
+| `scoreGapThreshold` | 0.40 | Page mode only: cut the list at the first *adjacent* pair whose score drops by this fraction |
+
+`minScoreRatio` compares every result to the top one. `scoreGapThreshold` compares each
+result to the one immediately above it and truncates the list at the first cliff, so a
+long smooth tail survives it while a sudden drop does not. It applies to page mode only;
+chunk mode (`groupBy: "chunk"`) uses `minScoreRatio` alone. Both are relative: final
+scores include additive boosts and, in page mode, a `pageWeights` multiplier, so they are
+not confined to 0–1 and are not confidence values. Neither threshold can empty a
+non-empty result list — the top result always survives both.
 
 #### Boost toggles
 
@@ -62,6 +71,14 @@ The playground has two parts: a **search interface** and a **ranking tuner**.
 | `incomingLinks` | 0.05 | Weight for incoming link count boost |
 | `depth` | 0.03 | Weight for URL depth boost |
 | `titleMatch` | 0.15 | Weight for query-in-title boost |
+
+The title and anchor-text boosts compare Unicode letters and digits (`\p{L}`/`\p{N}`),
+not ASCII, so Japanese, Cyrillic, Greek and accented-Latin titles are matched instead of
+being folded away to nothing. Text is lowercased and NFC-normalized, which unifies the
+two spellings of a precomposed character (`é` versus `e` + combining acute). Accents are
+**preserved, not stripped**: a query for `cafe` does not get the title boost on a page
+called `café`. Accent-insensitive recall would need a script-aware policy, so it is
+deliberately not done here.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

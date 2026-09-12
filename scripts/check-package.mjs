@@ -86,6 +86,94 @@ function svelteSourceDependencies() {
   return [...found];
 }
 
+/**
+ * Entry points a browser bundler must be able to resolve, and the Node-only code
+ * that proves it cannot.
+ *
+ * `searchsocket/sveltekit` re-exports the server handle, the Vite plugin AND
+ * `searchsocketScrollToText` from one module, so a browser importing the scroll
+ * helper from there drags in `fs/promises`, `child_process` and the MCP SDK, and
+ * the Vite build fails on `createRequire` from `__vite-browser-external`.
+ * `searchsocket/scroll` and `searchsocket/client` exist so that import has a
+ * home, and this check is what keeps them clean.
+ *
+ * WHAT THIS PROVES, EXACTLY: the built ESM file for each browser subpath contains
+ * no import of a `node:`-prefixed specifier, no import of a bare Node builtin
+ * name, and no `createRequire`/`require(` call. Both entries are fully bundled
+ * by tsup, so a single-file scan covers their whole dependency graph.
+ *
+ * WHAT IT DOES NOT PROVE: it is a text scan, not a browser build. It cannot see
+ * a builtin reached through a bare dependency the bundle chose to externalise,
+ * and a matching string inside a comment or a string literal would be reported
+ * as a problem. It says nothing about the server entries, which are expected to
+ * be full of this.
+ */
+const BROWSER_SAFE_SUBPATHS = ["./client", "./scroll"];
+
+/** Bare builtin names, for the specifiers that omit the `node:` prefix. */
+const NODE_BUILTINS = [
+  "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants",
+  "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http",
+  "http2", "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process",
+  "punycode", "querystring", "readline", "repl", "sqlite", "stream", "string_decoder",
+  "test", "timers", "tls", "trace_events", "tty", "url", "util", "v8", "vm", "wasi",
+  "worker_threads", "zlib"
+];
+
+function browserEntryProblems() {
+  const problems = [];
+  const bare = NODE_BUILTINS.join("|");
+  // Anything `node:`-prefixed is a builtin by definition, so match that whole
+  // namespace rather than a name list; bare names still need the list. The
+  // trailing class allows the `fs/promises`, `stream/web`, `util/types` forms.
+  const patterns = [
+    [/(?:^|[\s;{(,])(?:from|import|require)\s*\(?\s*["'`]node:[a-z_/]+["'`]/g, null],
+    [new RegExp(`(?:^|[\\s;{(,])(?:from|import|require)\\s*\\(?\\s*["'\`](?:${bare})(?:/[a-z]+)?["'\`]`, "g"), null],
+    [/\bcreateRequire\b/g, "createRequire"],
+    [/\brequire\s*\(/g, "require("]
+  ];
+
+  for (const subpath of BROWSER_SAFE_SUBPATHS) {
+    const entry = pkg.exports?.[subpath];
+    if (!entry) {
+      problems.push(`missing browser entry: package.json "exports" has no ${subpath}`);
+      continue;
+    }
+
+    // Only the ESM build: a browser bundler never reaches the CJS one, and that
+    // file legitimately contains CommonJS plumbing.
+    const target = typeof entry.import === "string" ? entry.import : null;
+    if (!target) {
+      problems.push(`missing browser entry: ${subpath} declares no "import" condition`);
+      continue;
+    }
+
+    const file = target.replace(/^\.\//, "");
+    const abs = path.join(root, file);
+    if (!existsSync(abs)) {
+      // Absence is already reported by the packed-file check; do not double up.
+      continue;
+    }
+
+    const source = readFileSync(abs, "utf8");
+    const hits = new Set();
+    for (const [pattern, label] of patterns) {
+      for (const match of source.matchAll(pattern)) {
+        hits.add(label ?? match[0].trim().replace(/^[\s;{(,]+/, ""));
+      }
+    }
+
+    if (hits.size > 0) {
+      problems.push(
+        `${file} — the browser entry ${subpath} references Node-only code ` +
+          `(${[...hits].join(", ")}); a browser build of it will fail`
+      );
+    }
+  }
+
+  return problems;
+}
+
 function packedFiles() {
   // The file listing goes to stderr as `npm notice` lines, while the `prepare`
   // build hook writes to stdout — so `--json` is not parseable here and the
@@ -124,6 +212,8 @@ function main() {
     }
   }
 
+  problems.push(...browserEntryProblems());
+
   for (const file of svelteSourceDependencies()) {
     if (!packed.has(file)) {
       problems.push(
@@ -148,7 +238,10 @@ function main() {
     process.exit(1);
   }
 
-  console.log(`package check passed: ${packed.size} files, all exports resolvable`);
+  console.log(
+    `package check passed: ${packed.size} files, every "exports"/"bin" target packed, ` +
+      `browser entries (${BROWSER_SAFE_SUBPATHS.join(", ")}) free of Node builtins`
+  );
 }
 
 main();

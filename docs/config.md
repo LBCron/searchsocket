@@ -37,7 +37,7 @@ SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` fro
 - `source.build.discover` (default `false`) — crawl internal links to find pages
 - `source.build.seedUrls` (default `["/"]`) — starting URLs for discovery
 - `source.build.maxPages` (default `200`) — max pages to discover
-- `source.build.maxDepth` (default `5`) — max link depth from seed URLs
+- `source.build.maxDepth` (default `10`) — max link depth from seed URLs
 
 ### Crawl mode
 
@@ -97,32 +97,34 @@ SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` fro
 
 ## Embedding
 
-Upstash handles embedding server-side via the `data` field. These settings must match the embedding model configured on your Upstash Vector index.
+SearchSocket never embeds anything itself. It sends text in the `data` field and
+Upstash embeds it with the model the index was created with, so **the embedding
+model is chosen in the Upstash console when you create the index** — there is no
+SearchSocket setting for it. To change model, create a new index with that model
+and point `upstash.url`/`upstash.token` at it, then reindex.
 
-- `embedding.model` (default `bge-large-en-v1.5`) — embedding model name
-- `embedding.dimensions` (default `1024`) — vector dimensions
-- `embedding.taskType` (default `RETRIEVAL_DOCUMENT`) — embedding task type
-- `embedding.batchSize` — **removed in 0.8.** It never affected anything at
-  runtime. Use `upstash.batchSize`. Setting it now produces a migration error
-  rather than being silently ignored.
-- `embedding.images.enable` — **removed in 0.8.** SearchSocket is text-only.
-  Images are made searchable via their text descriptions
-  (`data-search-description`, `alt`, `figcaption`), never image embeddings.
+There is no `embedding` config section. Every key it once accepted was inert, and
+setting any of them now fails config loading with a migration error rather than
+being silently ignored:
+
+- `embedding.model` — a property of the Upstash index, never read here.
+- `embedding.dimensions` — follows from the index's model. SearchSocket never generates
+  an embedding itself: indexing sends text for Upstash to embed, and the only vector it
+  ever sends back is one it read out of the index (related-page lookup).
+- `embedding.taskType` — Upstash-hosted embedding takes no task-type parameter, and
+  SearchSocket never sent one.
+- `embedding.batchSize` — never affected anything at runtime. Use `upstash.batchSize`.
+- `embedding.images.enable` — SearchSocket is text-only. Images are made searchable
+  via their text descriptions (`data-search-description`, `alt`, `figcaption`),
+  never image embeddings.
 
 ### Non-English / multilingual sites
 
-The default `bge-large-en-v1.5` model is English-specific. For multilingual content, create your Upstash Vector index with a multilingual model and update your config to match:
-
-```ts
-export default {
-  embedding: {
-    model: "bge-m3",          // multilingual model
-    dimensions: 1024
-  }
-};
-```
-
-The model and dimensions must match what you selected when creating the Upstash Vector index. See [Upstash's embedding model list](https://upstash.com/docs/vector/features/embeddingmodels) for available options.
+`bge-large-en-v1.5` is English-specific. For multilingual content, create the Upstash
+Vector index with a multilingual model such as `bge-m3` and point SearchSocket at that
+index. Nothing changes in `searchsocket.config.ts`. See
+[Upstash's embedding model list](https://upstash.com/docs/vector/features/embeddingmodels)
+for the available options.
 
 ## Search
 
@@ -169,11 +171,24 @@ now produces a migration error. Tune ranking through `ranking.weights`.
 - `ranking.freshnessDecayRate` (default `0.001`) — decay rate for freshness boost
 - `ranking.enableAnchorTextBoost` (default `false`) — boost pages whose anchor text matches the query
 - `ranking.pageWeights` (default `{}`) — per-URL score multipliers (e.g.,
-  `{ "/docs": 1.15 }`). A page's own `searchsocket-weight` / frontmatter weight
-  takes precedence, except that a `0` from either source excludes the page.
+  `{ "/docs": 1.15 }`). The key is a URL *pattern*, not a raw prefix: `/docs` matches
+  only `/docs`, `/docs/*` matches one level down, and `/docs/**` matches the whole
+  subtree. A page's own `searchsocket-weight` / frontmatter weight takes precedence,
+  except that a `0` from either source excludes the page.
 - `ranking.minScoreRatio` (default `0.70`) — drop results scoring below this
   fraction of the best result
-- `ranking.scoreGapThreshold` (default `0.4`) — trim results below best score minus this threshold
+- `ranking.scoreGapThreshold` (default `0.4`) — **page mode only** (`groupBy: "page"`,
+  the default). Cuts the result list at the first *adjacent* pair whose score drops by at
+  least this fraction. Chunk mode applies `minScoreRatio` but never this. Walking down the
+  ranked list, if a result scores `0.4` (40%) or more below the result immediately
+  above it, that result and everything after it is dropped. It is a
+  neighbour-to-neighbour cliff detector, not a distance from the top result — that
+  is what `minScoreRatio` measures. Set to `0` to disable.
+
+Final scores are not confined to 0–1 and are not confidence values: the boosts above are
+additive, and in page mode `pageWeights` multiplies on top of them. Both thresholds are
+therefore relative — they compare scores within one result set and mean nothing as
+absolute numbers.
 
 #### API access policy
 
@@ -269,12 +284,14 @@ export default {
       hooks: {
         // Modify or skip pages before chunking
         transformPage: async (page) => {
-          // Skip draft pages
-          if (page.frontmatter?.draft) return null;
+          // `ExtractedPage` is flat — there is no `page.frontmatter`. Arbitrary
+          // per-page values arrive in `page.meta`, populated from `searchsocket.meta`
+          // in markdown frontmatter or `<meta name="searchsocket:KEY">` in HTML.
+          if (page.meta?.draft === true) return null;
 
-          // Inject custom tags from frontmatter
-          if (page.frontmatter?.tags) {
-            page.tags = [...(page.tags ?? []), ...page.frontmatter.tags];
+          // Add a tag of your own
+          if (page.url.startsWith("/blog/")) {
+            page.tags = [...page.tags, "blog"];
           }
 
           return page;
@@ -294,8 +311,13 @@ export default {
         },
 
         // Run after indexing completes
+        // Run after indexing completes. `IndexStats` uses flat counters —
+        // pagesProcessed, pagesChanged, pagesDeleted, chunksTotal, chunksChanged,
+        // documentsUpserted, deletes — not nested `pages`/`chunks` objects.
         afterIndex: async (stats) => {
-          console.log(`Indexed ${stats.chunks.total} chunks across ${stats.pages.total} pages`);
+          console.log(
+            `Indexed ${stats.chunksTotal} chunks across ${stats.pagesProcessed} pages`
+          );
         }
       }
     })
