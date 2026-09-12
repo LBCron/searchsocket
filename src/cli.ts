@@ -4,18 +4,19 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import { config as dotenvConfig } from "dotenv";
 import chokidar from "chokidar";
+import fg from "fast-glob";
 import { Command, Option } from "commander";
 import pkg from "../package.json";
 import { writeMinimalConfig, loadConfig, mergeConfig } from "./config/load";
 import { Logger } from "./core/logger";
 import { resolveScope } from "./core/scope";
-import { ensureStateDirs } from "./core/state";
+import { ensureStateDirs, removeStateDir } from "./core/state";
 import { SearchSocketError } from "./errors";
 import { IndexPipeline } from "./indexing/pipeline";
 import { runMcpServer } from "./mcp/server";
 import { runPlaygroundServer } from "./playground/server";
 import { SearchEngine } from "./search/engine";
-import { reciprocalRank, mrr } from "./search/quality-metrics";
+import { reciprocalRank, mrrReport, type MrrObservation } from "./search/quality-metrics";
 import { testFileSchema } from "./cli/test-schemas";
 import { createUpstashStore } from "./vector";
 import { sanitizeScopeName } from "./utils/text";
@@ -32,7 +33,13 @@ import {
 } from "./init-helpers";
 import { copyComponent, isValidComponent, listAvailableComponents } from "./add-helpers";
 import { INDEX_SCHEMA_VERSION } from "./vector/ids";
-import { parseRemoteBranches, selectStaleScopes, type PruneMatchMode } from "./cli/services/prune";
+import {
+  parseRemoteBranches,
+  selectStaleScopes,
+  summarizePruneDeletions,
+  type PruneDeletionResult,
+  type PruneMatchMode
+} from "./cli/services/prune";
 
 interface RootCommandOptions {
   cwd?: string;
@@ -104,30 +111,105 @@ function printIndexSummary(stats: IndexStats): void {
   }
 }
 
-function collectWatchPaths(config: ResolvedSearchSocketConfig, cwd: string): string[] {
-  const paths = ["src/routes/**"];
+interface WatchTarget {
+  /** Concrete file or directory handed to chokidar. Never a glob. */
+  root: string;
+  /**
+   * When true, an event under this root only counts if the path is part of the
+   * configured content-file glob membership. Unfiltered roots (routes, build
+   * output, the config file) count for every event.
+   */
+  filtered: boolean;
+}
+
+interface WatchPlan {
+  targets: WatchTarget[];
+  /** Present only in content-files mode; the input to the membership query. */
+  contentFiles?: { baseDir: string; globs: string[] };
+}
+
+/**
+ * Decide what the dev watcher subscribes to.
+ *
+ * Chokidar 4 removed glob support, so the globs that used to be handed to
+ * `chokidar.watch()` verbatim (and therefore watched as literal, non-existent
+ * paths) are turned into concrete roots here. `fg.generateTasks` supplies those
+ * roots so they agree with the indexer even when a glob is absolute or reaches
+ * outside `baseDir` with `../`.
+ */
+function collectWatchPlan(config: ResolvedSearchSocketConfig, cwd: string): WatchPlan {
+  // Unfiltered roots go first: if a content root resolves to the same directory,
+  // the dedup below keeps this one and the watcher errs towards indexing.
+  const targets: WatchTarget[] = [{ root: path.resolve(cwd, "src/routes"), filtered: false }];
+  let contentFiles: WatchPlan["contentFiles"];
 
   if (config.source.mode === "content-files" && config.source.contentFiles) {
-    for (const pattern of config.source.contentFiles.globs) {
-      paths.push(path.join(config.source.contentFiles.baseDir, pattern));
+    const baseDir = path.resolve(cwd, config.source.contentFiles.baseDir);
+    const globs = config.source.contentFiles.globs;
+    contentFiles = { baseDir, globs };
+
+    for (const task of fg.generateTasks(globs, { cwd: baseDir })) {
+      targets.push({ root: path.resolve(baseDir, task.base), filtered: true });
     }
   }
 
   if (config.source.mode === "static-output") {
-    paths.push(config.source.staticOutputDir);
+    targets.push({ root: path.resolve(cwd, config.source.staticOutputDir), filtered: false });
   }
 
   if (config.source.mode === "crawl") {
-    paths.push("searchsocket.config.ts");
+    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false });
   }
 
   if (config.source.mode === "build" && config.source.build) {
-    paths.push("searchsocket.config.ts");
-    paths.push(config.source.build.outputDir);
+    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false });
+    targets.push({ root: path.resolve(cwd, config.source.build.outputDir), filtered: false });
   }
 
-  return paths.map((value) => path.resolve(cwd, value));
+  const seen = new Set<string>();
+  return {
+    targets: targets.filter((target) => {
+      if (seen.has(target.root)) return false;
+      seen.add(target.root);
+      return true;
+    }),
+    contentFiles
+  };
 }
+
+function isInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  // `relative === ""` is the root itself (a watched config file). A name that
+  // merely starts with ".." — `..notes.md` — is inside; only the ".." segment
+  // is not.
+  if (relative === "") return true;
+  if (path.isAbsolute(relative)) return false;
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+/**
+ * The set of files the indexer would currently load, as absolute paths.
+ *
+ * Asking fast-glob — the same matcher `src/indexing/sources/content-files.ts`
+ * uses — is what keeps the watcher and the indexer from disagreeing about
+ * extglobs, brace ranges, dotfiles and negated patterns. Returns null when the
+ * query fails, which callers read as "unknown, so index anyway".
+ */
+function readContentMembership(plan: WatchPlan): Set<string> | null {
+  if (!plan.contentFiles) return new Set();
+
+  try {
+    const matches = fg.sync(plan.contentFiles.globs, {
+      cwd: plan.contentFiles.baseDir,
+      absolute: true,
+      onlyFiles: true
+    });
+    return new Set(matches.map((match) => path.resolve(match)));
+  } catch {
+    return null;
+  }
+}
+
 
 function ensureStateDir(cwd: string): string {
   const target = path.join(cwd, ".searchsocket");
@@ -631,10 +713,20 @@ program
     const cwd = path.resolve(rootOpts?.cwd ?? process.cwd());
 
     const config = await loadResolvedConfigForDev(cwd, rootOpts?.config);
-    const watchPaths = collectWatchPaths(config, cwd);
+    const plan = collectWatchPlan(config, cwd);
 
     process.stdout.write("starting searchsocket dev watcher...\n");
-    process.stdout.write(`watching:\n${watchPaths.map((entry) => `  - ${entry}`).join("\n")}\n`);
+    process.stdout.write(
+      `watching:\n${plan.targets
+        .map((target) => {
+          const missing = fs.existsSync(target.root) ? "" : " [not found yet]";
+          return `  - ${target.root}${missing}`;
+        })
+        .join("\n")}\n`
+    );
+    if (plan.contentFiles) {
+      process.stdout.write(`matching: ${plan.contentFiles.globs.join(", ")}\n`);
+    }
 
     const upstashUrl = config.upstash.url ?? process.env[config.upstash.urlEnv];
     const upstashToken = config.upstash.token ?? process.env[config.upstash.tokenEnv];
@@ -648,10 +740,11 @@ program
 
     let running = false;
     let pending = false;
+    let stopped = false;
     let timer: NodeJS.Timeout | null = null;
 
     const run = async (): Promise<void> => {
-      if (backendMissing) {
+      if (backendMissing || stopped) {
         return;
       }
 
@@ -678,6 +771,9 @@ program
         running = false;
         if (pending) {
           pending = false;
+          // Not after a shutdown: `run()` re-checks `stopped` for exactly this,
+          // otherwise a burst that arrived mid-index started a fresh index run
+          // against a closing process.
           await run();
         }
       }
@@ -685,20 +781,73 @@ program
 
     await run();
 
-    const watcher = chokidar.watch(watchPaths, {
-      ignoreInitial: true
-    });
+    // Only concrete roots are subscribed; relevance is decided per event below,
+    // so a file created after startup — in a directory that did not exist at
+    // startup — still triggers a reindex.
+    const watcher = chokidar.watch(
+      plan.targets.map((target) => target.root),
+      { ignoreInitial: true }
+    );
+
+    let membership = readContentMembership(plan);
+    let queued: Array<{ event: string; path: string; filtered: boolean }> = [];
+
+    // Coalesce a burst — an editor's atomic save is an unlink plus an add — into
+    // a single follow-up run.
+    const flush = (): void => {
+      timer = null;
+      if (stopped) return;
+
+      const events = queued;
+      queued = [];
+
+      const previous = membership;
+      if (events.some((entry) => entry.filtered)) {
+        membership = readContentMembership(plan);
+      }
+
+      const relevant = events.filter(
+        (entry) =>
+          !entry.filtered ||
+          previous === null ||
+          membership === null ||
+          previous.has(entry.path) ||
+          membership.has(entry.path)
+      );
+
+      if (relevant.length === 0) return;
+
+      for (const entry of relevant) {
+        process.stdout.write(`detected ${entry.event}: ${entry.path}\n`);
+      }
+      void run();
+    };
 
     watcher.on("all", (event, changedPath) => {
-      process.stdout.write(`detected ${event}: ${changedPath}\n`);
+      if (stopped) return;
+
+      const absolute = path.resolve(cwd, changedPath);
+      const unfiltered = plan.targets.some(
+        (target) => !target.filtered && isInside(target.root, absolute)
+      );
+      const filtered =
+        !unfiltered &&
+        plan.targets.some((target) => target.filtered && isInside(target.root, absolute));
+
+      if (!unfiltered && !filtered) return;
+
+      queued.push({ event, path: absolute, filtered });
 
       if (timer) {
         clearTimeout(timer);
       }
+      timer = setTimeout(flush, 350);
+    });
 
-      timer = setTimeout(() => {
-        void run();
-      }, 350);
+    // Chokidar walks the tree before it starts reporting; announcing readiness
+    // gives callers (and the test suite) something deterministic to wait for.
+    watcher.on("ready", () => {
+      process.stdout.write("watcher ready\n");
     });
 
     if (opts.mcp) {
@@ -731,8 +880,24 @@ program
       }
     }
 
+    // Only SIGINT: the MCP HTTP server started by --mcp installs its own SIGINT
+    // handler but nothing for SIGTERM, so intercepting SIGTERM here would
+    // suppress the default termination and leave that server holding the process
+    // open forever.
     await new Promise<void>((resolve) => {
       process.on("SIGINT", () => {
+        if (stopped) return;
+        stopped = true;
+
+        // A pending debounce keeps the event loop alive and would start an index
+        // run against a closing process.
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        pending = false;
+        queued = [];
+
         const cleanups = [watcher.close()];
         if (closePlayground) cleanups.push(closePlayground());
         void Promise.all(cleanups).then(() => resolve());
@@ -755,33 +920,67 @@ program
 
     const config = await loadConfig({ cwd, configPath: rootOpts?.config });
 
+    // Every option and confirmation is validated before anything is deleted.
+    // The local state removal used to run first, so a command that was about to
+    // be refused had already wiped local state on its way to the refusal.
     if (opts.allScopes && !opts.remote) {
       process.stderr.write("error: --all-scopes requires --remote\n");
       process.exitCode = EXIT_INVALID_USAGE;
       return;
     }
 
-    if (!opts.keepLocal) {
-      const statePath = path.join(cwd, config.state.dir);
-      await fsp.rm(statePath, { recursive: true, force: true });
-      process.stdout.write(`deleted local state directory: ${statePath}\n`);
-    }
-
-    if (!opts.remote) return;
-
     // --all-scopes is the only path that may touch scopes other than the one
     // named. Previously `clean --remote --scope foo` resolved the scope flag
     // and then dropped the entire project regardless.
-    if (opts.allScopes) {
-      if (opts.confirmProject !== config.project.id) {
+    if (opts.remote && opts.allScopes && opts.confirmProject !== config.project.id) {
+      process.stderr.write(
+        `error: --all-scopes deletes every scope in project "${config.project.id}". ` +
+          `Re-run with --confirm-project ${config.project.id} to acknowledge.\n`
+      );
+      process.exitCode = EXIT_DESTRUCTIVE_REFUSED;
+      return;
+    }
+
+    // resolveScope rejects a name that cannot be embedded in a record ID. It has
+    // to run before the local removal, or `clean --remote --scope bad/name`
+    // wipes local state on its way to failing.
+    let scope: Scope | undefined;
+    if (opts.remote && !opts.allScopes) {
+      try {
+        scope = resolveScope(config, opts.scope, cwd);
+      } catch (error) {
         process.stderr.write(
-          `error: --all-scopes deletes every scope in project "${config.project.id}". ` +
-            `Re-run with --confirm-project ${config.project.id} to acknowledge.\n`
+          `error: ${error instanceof Error ? error.message : String(error)}\n`
+        );
+        process.exitCode = EXIT_INVALID_USAGE;
+        return;
+      }
+    }
+
+    if (!opts.keepLocal) {
+      let removal: Awaited<ReturnType<typeof removeStateDir>>;
+      try {
+        removal = await removeStateDir(cwd, config.state.dir);
+      } catch (error) {
+        process.stderr.write(
+          `error: ${error instanceof Error ? error.message : String(error)}\n`
         );
         process.exitCode = EXIT_DESTRUCTIVE_REFUSED;
         return;
       }
 
+      if (removal.removed) {
+        process.stdout.write(`deleted local state directory: ${removal.statePath}\n`);
+      } else {
+        process.stdout.write(
+          `left local state directory alone: ${removal.statePath} (${removal.reason})\n`
+        );
+      }
+    }
+
+    if (!opts.remote) return;
+
+    if (opts.allScopes) {
       process.stdout.write(`plan: drop ALL scopes in project ${config.project.id}\n`);
       if (!opts.apply) {
         process.stdout.write("dry-run only. pass --apply to delete.\n");
@@ -794,9 +993,10 @@ program
       return;
     }
 
-    const scope = resolveScope(config, opts.scope, cwd);
+    // Resolved above, before anything was deleted.
+    const target = scope!;
     process.stdout.write(
-      `plan: delete remote records for project ${scope.projectId}, scope ${scope.scopeName}\n`
+      `plan: delete remote records for project ${target.projectId}, scope ${target.scopeName}\n`
     );
     if (!opts.apply) {
       process.stdout.write("dry-run only. pass --apply to delete.\n");
@@ -804,8 +1004,8 @@ program
     }
 
     const store = await createUpstashStore(config);
-    await store.deleteScope(scope);
-    process.stdout.write(`deleted remote records for scope ${scope.scopeName}\n`);
+    await store.deleteScope(target);
+    process.stdout.write(`deleted remote records for scope ${target.scopeName}\n`);
   });
 
 const migrate = program
@@ -1007,7 +1207,7 @@ program
       return;
     }
 
-    let deleted = 0;
+    const outcomes: PruneDeletionResult[] = [];
     for (const entry of stale) {
       const scope: Scope = {
         projectId: config.project.id,
@@ -1017,15 +1217,28 @@ program
 
       try {
         await store.deleteScope(scope);
-        deleted += 1;
+        outcomes.push({ scopeName: entry.scopeName });
       } catch (error) {
-        process.stdout.write(
-          `failed to delete scope ${entry.scopeName}: ${error instanceof Error ? error.message : String(error)}\n`
-        );
+        outcomes.push({
+          scopeName: entry.scopeName,
+          error: error instanceof Error ? error.message : String(error)
+        });
       }
     }
 
-    process.stdout.write(`deleted scopes: ${deleted}\n`);
+    const summary = summarizePruneDeletions(outcomes);
+    process.stdout.write(`deleted scopes: ${summary.deleted} of ${summary.attempted} attempted\n`);
+
+    if (summary.failed.length > 0) {
+      // Failures went to stdout and left the exit code at 0, so automation read
+      // a partial or total failure as a successful cleanup.
+      for (const failure of summary.failed) {
+        process.stderr.write(`error: failed to delete scope ${failure.scopeName}: ${failure.error}\n`);
+      }
+      process.stderr.write(`error: ${summary.failed.length} scope deletion(s) failed\n`);
+      process.exitCode = EXIT_OPERATIONAL_FAILURE;
+    }
+
     if (baseScope.scopeName === "main") {
       process.stdout.write("main scope retained\n");
     }
@@ -1270,7 +1483,10 @@ program
 
     let passed = 0;
     let failed = 0;
-    const mrrData: Array<{ results: SearchResult[]; relevant: string[] }> = [];
+    const mrrData: MrrObservation[] = [];
+    // Queries whose retrieval threw. They contribute no observation, so the MRR
+    // below describes a smaller sample than the test file and says so.
+    let retrievalErrors = 0;
 
     for (const tc of testCases) {
       let results: SearchResult[];
@@ -1285,14 +1501,23 @@ program
         const msg = error instanceof Error ? error.message : String(error);
         process.stdout.write(`FAIL "${tc.query}" → search error: ${msg}\n`);
         failed++;
+        retrievalErrors++;
         continue;
+      }
+
+      // One relevance observation per query, whatever mix of assertions the case
+      // carries. Pushing once per assertion let a case asserting both topResult
+      // and inTop5 count twice and skew the mean towards well-specified queries.
+      const relevantUrls = new Set<string>();
+      if (tc.expect.topResult !== undefined) relevantUrls.add(tc.expect.topResult);
+      for (const url of tc.expect.inTop5 ?? []) relevantUrls.add(url);
+      if (relevantUrls.size > 0) {
+        mrrData.push({ results, relevant: [...relevantUrls] });
       }
 
       if (tc.expect.topResult !== undefined) {
         const expectedUrl = tc.expect.topResult;
         const rank = results.findIndex((r) => r.url === expectedUrl) + 1;
-
-        mrrData.push({ results, relevant: [expectedUrl] });
 
         if (rank === 1) {
           process.stdout.write(`PASS "${tc.query}" → ${expectedUrl} at rank 1\n`);
@@ -1308,8 +1533,6 @@ program
         const expectedUrls = tc.expect.inTop5;
         const top5Urls = results.slice(0, 5).map((r) => r.url);
         const missing = expectedUrls.filter((url) => !top5Urls.includes(url));
-
-        mrrData.push({ results, relevant: expectedUrls });
 
         if (missing.length === 0) {
           process.stdout.write(`PASS "${tc.query}" → all expected URLs in top 5\n`);
@@ -1343,9 +1566,19 @@ program
     const total = passed + failed;
     process.stdout.write(`\nresults: ${passed} passed, ${failed} failed of ${total} assertions\n`);
 
-    if (mrrData.length > 0) {
-      const mrrValue = mrr(mrrData);
-      process.stdout.write(`MRR: ${mrrValue.toFixed(4)}\n`);
+    if (mrrData.length > 0 || retrievalErrors > 0) {
+      const report = mrrReport(mrrData, retrievalErrors);
+      const plural = (n: number): string => (n === 1 ? "query" : "queries");
+      process.stdout.write(`MRR: ${report.score.toFixed(4)} over ${report.scored} ${plural(report.scored)}\n`);
+      if (!report.complete) {
+        process.stdout.write(
+          `MRR incomplete: ${report.unscored} ${plural(report.unscored)} could not be retrieved and are excluded\n`
+        );
+        process.stderr.write(
+          `warning: MRR excludes ${report.unscored} ${plural(report.unscored)} whose search failed; ` +
+            `the score is not comparable to a clean run\n`
+        );
+      }
     }
 
     process.stdout.write(`pass rate: ${total > 0 ? ((passed / total) * 100).toFixed(1) : "0.0"}%\n`);
@@ -1418,6 +1651,31 @@ program
     process.stdout.write(`  globally or per instance via the style prop.\n`);
   });
 
+/**
+ * Load `.env` without letting dotenv write to stdout.
+ *
+ * dotenv 17 prints "injecting env (n) from .env" via console.log, and the MCP
+ * stdio transport requires stdout to carry protocol JSON only — this runs long
+ * before the MCP server installs its own redirect. `quiet: true` alone is not
+ * enough: dotenv re-reads DOTENV_CONFIG_QUIET/DOTENV_CONFIG_DEBUG from the
+ * environment *and* from the .env file it just loaded, either of which turns the
+ * logging back on. Pinning console output to stderr for the duration covers
+ * every one of those paths.
+ */
+function loadDotenvWithoutTouchingStdout(envPath: string): void {
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => {
+    originalError(...args);
+  };
+
+  try {
+    dotenvConfig({ path: envPath, quiet: true });
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 async function main(): Promise<void> {
   // Resolve --cwd before loading .env. Loading from process.cwd() first meant
   // `searchsocket --cwd ../site index` read the wrong directory's credentials —
@@ -1443,7 +1701,7 @@ async function main(): Promise<void> {
   }
   const envDir = cwdArg ? path.resolve(process.cwd(), cwdArg) : process.cwd();
 
-  dotenvConfig({ path: path.resolve(envDir, ".env") });
+  loadDotenvWithoutTouchingStdout(path.resolve(envDir, ".env"));
   await program.parseAsync(process.argv);
 }
 

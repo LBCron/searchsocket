@@ -206,7 +206,19 @@ export const searchSocketConfigSchema = z.object({
     .optional(),
   state: z
     .object({
-      dir: z.string().optional()
+      // `clean` deletes this directory recursively. Only the two spellings that
+      // are always a mistake are rejected here; containment is decided by
+      // resolveStateDir in core/state.ts, which knows the project root and can
+      // resolve symlinks. Note the value is NOT trimmed: on POSIX a trailing
+      // space names a different directory, and rewriting it would silently
+      // retarget the deletion.
+      dir: z
+        .string()
+        .refine((dir) => dir.trim() !== "", { message: "state.dir must not be empty" })
+        .refine((dir) => dir !== "." && dir !== "./", {
+          message: 'state.dir must not be the project directory itself (".")'
+        })
+        .optional()
     })
     .optional()
 });
