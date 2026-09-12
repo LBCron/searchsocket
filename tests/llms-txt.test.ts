@@ -204,6 +204,29 @@ describe("writeLlmsTxt", () => {
     expect(fullContent).toContain("Full content here.");
   });
 
+  it("keeps the two exports apart when outputPath has no .txt extension", async () => {
+    // A plain suffix swap left both writes pointing at the same file, so the
+    // full export silently clobbered the index export.
+    const config = makeConfig({ outputPath: "static/export", generateFull: true });
+    const pages = [makePage({ url: "/a", title: "Page A", markdown: "Full content here." })];
+
+    await writeLlmsTxt(pages, config, tmpDir, logger);
+
+    const index = await fs.readFile(path.join(tmpDir, "static/export"), "utf8");
+    const full = await fs.readFile(path.join(tmpDir, "static/export-full"), "utf8");
+    expect(index).toContain("## Pages");
+    expect(index).not.toContain("Full content here.");
+    expect(full).toContain("Full content here.");
+  });
+
+  it("preserves a non-txt extension on the full export", async () => {
+    const config = makeConfig({ outputPath: "static/llms.md", generateFull: true });
+
+    await writeLlmsTxt([makePage()], config, tmpDir, logger);
+
+    await expect(fs.access(path.join(tmpDir, "static/llms-full.md"))).resolves.toBeUndefined();
+  });
+
   it("does not write llms-full.txt when generateFull is false", async () => {
     const config = makeConfig({ outputPath: "static/llms.txt", generateFull: false });
 

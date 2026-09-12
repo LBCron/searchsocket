@@ -210,6 +210,55 @@ describe("indexing safety — incomplete runs never delete", () => {
     expect(stats.dangerousOperations.some((op) => op.startsWith("refused-large-deletion"))).toBe(true);
   });
 
+  it("a refused mass deletion stays refused however often it is repeated", async () => {
+    // Renaming the only page looks like a 100% deletion, which the guard
+    // refuses. Writing the replacement anyway used to enlarge the inventory,
+    // so the identical next run measured the same stale page as 50% of two
+    // pages and deleted it — an unaccepted plan approving itself by retrying.
+    const { cwd, config } = await createFixture({ "docs/alpha": "Alpha content here." });
+    const { store, pageHashes, chunkIds } = createStatefulMockStore();
+
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    const indexedPages = new Set(pageHashes.keys());
+    const indexedChunks = new Set(chunkIds);
+    expect(indexedPages).toEqual(new Set(["/docs/alpha"]));
+
+    await fs.rename(path.join(cwd, "build", "docs", "alpha"), path.join(cwd, "build", "docs", "renamed"));
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+      expect(stats.deletionEligible).toBe(false);
+      expect(stats.pagesDeleted).toBe(0);
+      expect(stats.dangerousOperations.some((op) => op.startsWith("refused-large-deletion"))).toBe(true);
+      // The accepted generation is still exactly what it was: the refused run
+      // added nothing that a later run could measure its deletion against.
+      expect(new Set(pageHashes.keys())).toEqual(indexedPages);
+      expect(new Set(chunkIds)).toEqual(indexedChunks);
+    }
+  });
+
+  it("a refused mass deletion writes no records at all", async () => {
+    const { stats, store } = await indexThenRerun(
+      THREE_PAGES,
+      { changedOnly: true },
+      async (cwd) => {
+        await fs.rm(path.join(cwd, "build", "docs", "beta"), { recursive: true, force: true });
+        await fs.rm(path.join(cwd, "build", "docs", "gamma"), { recursive: true, force: true });
+        await fs.writeFile(
+          path.join(cwd, "build", "docs", "alpha", "index.html"),
+          "<html><head><title>alpha</title></head><body><main><h1>alpha</h1><p>Rewritten alpha body.</p></main></body></html>",
+          "utf8"
+        );
+      }
+    );
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(store.upsertPages).not.toHaveBeenCalled();
+    expect(store.upsertChunks).not.toHaveBeenCalled();
+    expect(stats.documentsUpserted).toBe(0);
+  });
+
   it("a mass deletion proceeds with --accept-large-deletion", async () => {
     const { stats, store } = await indexThenRerun(
       THREE_PAGES,
@@ -721,5 +770,91 @@ describe("provenance transitions", () => {
 
     expect(written.length).toBeGreaterThan(0);
     expect(written.every((doc) => doc.metadata.custom === true)).toBe(true);
+  });
+});
+
+describe("indexing safety — published artifacts", () => {
+  /** Index a site with llms.txt generation on, then re-run and report the files. */
+  async function indexWithLlms(
+    rerun: Parameters<IndexPipeline["run"]>[0],
+    mutate?: (cwd: string) => Promise<void>
+  ) {
+    const { cwd, config } = await createFixture(THREE_PAGES);
+    config.llmsTxt.enable = true;
+    config.llmsTxt.generateFull = true;
+    const { store } = createStatefulMockStore();
+
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    const before = await fs.readFile(path.join(cwd, "static", "llms.txt"), "utf8");
+    const beforeFull = await fs.readFile(path.join(cwd, "static", "llms-full.txt"), "utf8");
+
+    if (mutate) await mutate(cwd);
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run(rerun);
+
+    return {
+      stats,
+      before,
+      beforeFull,
+      after: await fs.readFile(path.join(cwd, "static", "llms.txt"), "utf8"),
+      afterFull: await fs.readFile(path.join(cwd, "static", "llms-full.txt"), "utf8")
+    };
+  }
+
+  it("a truncated run leaves the last complete llms artifacts in place", async () => {
+    // The index is already protected from a partial run; the exported text
+    // files had weaker semantics and there is no second copy to recover from.
+    const { stats, before, beforeFull, after, afterFull } = await indexWithLlms({
+      changedOnly: true,
+      maxPages: 1
+    });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(after).toBe(before);
+    expect(afterFull).toBe(beforeFull);
+    expect(after).toContain("/docs/gamma");
+  });
+
+  it("a chunk limit does not freeze the artifacts", async () => {
+    // --max-chunks truncates chunks, not pages, so the exported page list is
+    // still complete and stale exports would be the wrong answer.
+    const { stats, after } = await indexWithLlms(
+      { changedOnly: true, maxChunks: 1000 },
+      async (cwd) => {
+        await fs.rm(path.join(cwd, "build", "docs", "beta"), { recursive: true, force: true });
+      }
+    );
+
+    expect(stats.warnings.some((w) => w.kind === "chunks-limited")).toBe(true);
+    expect(after).not.toContain("/docs/beta");
+  });
+
+  it("keeps the artifacts when the run was not told about retained custom records", async () => {
+    // The index still holds the custom record — deliberately, since a run
+    // without `customRecords` has no opinion on it — so an export built from
+    // this run's pages alone would silently drop it from the public list.
+    const { cwd, config } = await createFixture(THREE_PAGES);
+    config.llmsTxt.enable = true;
+    const { store } = createStatefulMockStore();
+
+    await (await IndexPipeline.create({ cwd, config, store })).run({
+      changedOnly: true,
+      customRecords: [{ url: "/from-cms/post", title: "CMS", content: "Body from the CMS." }]
+    });
+    const before = await fs.readFile(path.join(cwd, "static", "llms.txt"), "utf8");
+    expect(before).toContain("/from-cms/post");
+
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.deletionEligible).toBe(true);
+    expect(await fs.readFile(path.join(cwd, "static", "llms.txt"), "utf8")).toBe(before);
+  });
+
+  it("a complete run still refreshes the llms artifacts", async () => {
+    const { stats, after } = await indexWithLlms({ changedOnly: true }, async (cwd) => {
+      await fs.rm(path.join(cwd, "build", "docs", "beta"), { recursive: true, force: true });
+    });
+
+    expect(stats.deletionEligible).toBe(true);
+    expect(after).not.toContain("/docs/beta");
   });
 });

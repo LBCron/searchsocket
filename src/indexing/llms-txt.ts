@@ -100,6 +100,20 @@ export function generateLlmsFullTxt(
 }
 
 /**
+ * Derive the full-content export path from the index export path.
+ *
+ * A plain `.txt` suffix swap collapses whenever the configured output has some
+ * other extension or none at all — `static/export` produced `static/export`
+ * again, so the full export silently overwrote the index export.
+ */
+export function deriveFullOutputPath(outputPath: string): string {
+  const dir = path.dirname(outputPath);
+  const ext = path.extname(outputPath);
+  const base = path.basename(outputPath, ext);
+  return path.join(dir, `${base}-full${ext}`);
+}
+
+/**
  * Write llms.txt (and optionally llms-full.txt) to disk.
  */
 export async function writeLlmsTxt(
@@ -118,7 +132,7 @@ export async function writeLlmsTxt(
   logger.info(`Generated llms.txt at ${config.llmsTxt.outputPath}`);
 
   if (config.llmsTxt.generateFull) {
-    const fullPath = outputPath.replace(/\.txt$/, "-full.txt");
+    const fullPath = deriveFullOutputPath(outputPath);
     const fullContent = generateLlmsFullTxt(pages, config);
     await fs.writeFile(fullPath, fullContent, "utf8");
     const relativeFull = path.relative(cwd, fullPath);

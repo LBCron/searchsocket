@@ -277,7 +277,23 @@ export class IndexPipeline {
           }
         }
       } else if (sourceMode === "crawl" && this.config.source.crawl) {
-        robotsRules = await fetchRobotsTxt(this.config.source.crawl.baseUrl);
+        const robotsFetch = await fetchRobotsTxt(this.config.source.crawl.baseUrl);
+        if (robotsFetch.status === "rules") {
+          robotsRules = robotsFetch.rules;
+        } else if (robotsFetch.status === "unavailable") {
+          // An unreadable policy is not permission to index everything: a page
+          // the last readable robots.txt excluded would quietly become public.
+          // A run warning is the containment that already exists for this —
+          // it makes the run non-authoritative, so nothing is deleted and no
+          // artifacts are published from it.
+          this.logger.warn(
+            `Could not read robots.txt (${robotsFetch.reason}); treating the exclusion policy as unknown.`
+          );
+          runWarnings.push({
+            kind: "source-failure",
+            detail: `robots.txt unreadable: ${robotsFetch.reason}`
+          });
+        }
       }
 
       if (robotsRules) {
@@ -813,6 +829,15 @@ export class IndexPipeline {
     // `--allow-empty` is already an explicit statement that a total removal is
     // intended, so it satisfies the ratio guard for that case on its own.
     // Requiring `--accept-large-deletion` as well would contradict its help text.
+    //
+    // A refusal here also stops the run's *additions*. Withholding only the
+    // deletions left the replacement records written, which enlarges the
+    // inventory the ratio is measured against: an identical rerun then saw the
+    // same stale records as a smaller fraction and deleted them without
+    // `--accept-large-deletion` ever being supplied. Refusing the whole
+    // mutation is what keeps a refused plan refused however often it is
+    // repeated, and leaves the index exactly as it was last accepted.
+    let indexMutationRefused = false;
     const ratioGuardSatisfied =
       options.acceptLargeDeletion || (options.allowEmpty === true && siteSourceEmpty);
     if (deletionEligible && !ratioGuardSatisfied) {
@@ -826,10 +851,11 @@ export class IndexPipeline {
         const ratio = check.stale / check.existing;
         if (ratio > maxRatio) {
           deletionEligible = false;
+          indexMutationRefused = true;
           const detail =
             `would delete ${check.stale} of ${check.existing} ${check.label} ` +
             `(${Math.round(ratio * 100)}% > ${Math.round(maxRatio * 100)}% limit); ` +
-            "pass --accept-large-deletion to proceed";
+            "no records were written; pass --accept-large-deletion to proceed";
           this.logger.warn(`Refusing deletion: ${detail}`);
           runWarnings.push({ kind: "source-failure", detail });
           dangerousOperations.push(`refused-large-deletion: ${detail}`);
@@ -870,7 +896,15 @@ export class IndexPipeline {
     this.logger.info(`Page changes: ${pagesChanged} changed/new, ${pagesDeleted} deleted, ${pageRecords.length - changedPages.length} unchanged`);
     this.logger.info(`Changes detected: ${changedChunks.length} changed, ${deletes.length} deleted, ${chunks.length - changedChunks.length} unchanged`);
 
-    if (!options.dryRun) {
+    if (indexMutationRefused && !options.dryRun) {
+      this.logger.warn(
+        `Leaving the index untouched: ${changedPages.length} page change(s) and ` +
+          `${changedChunks.length} chunk change(s) were not written, because writing them ` +
+          "would make the refused deletion look acceptable on the next run."
+      );
+    }
+
+    if (!options.dryRun && !indexMutationRefused) {
       // Upsert before delete, in both force and incremental mode: a crash
       // between the two must leave the old generation searchable, never an
       // empty index. Page IDs are stable, so re-upserting overwrites in place
@@ -916,7 +950,7 @@ export class IndexPipeline {
     const upsertStart = stageStart();
     let documentsUpserted = 0;
 
-    if (!options.dryRun && changedChunks.length > 0) {
+    if (!options.dryRun && !indexMutationRefused && changedChunks.length > 0) {
       this.logger.info(`Upserting ${changedChunks.length} chunk${changedChunks.length === 1 ? "" : "s"} to Upstash Vector...`);
 
       const CHUNK_TEXT_MAX_CHARS = 30_000;
@@ -977,17 +1011,47 @@ export class IndexPipeline {
     }
 
     stageEnd("upsert", upsertStart);
-    if (changedChunks.length > 0) {
-      this.logger.info(`Upserted ${documentsUpserted} document${documentsUpserted === 1 ? "" : "s"} (${stageTimingsMs["upsert"]}ms)`);
-    } else {
-      this.logger.info("No chunks to upsert — all up to date");
+    // A refused run already reported that it wrote nothing; following that with
+    // an upsert count of zero would read as "nothing needed writing".
+    if (!indexMutationRefused) {
+      if (changedChunks.length > 0) {
+        this.logger.info(`Upserted ${documentsUpserted} document${documentsUpserted === 1 ? "" : "s"} (${stageTimingsMs["upsert"]}ms)`);
+      } else {
+        this.logger.info("No chunks to upsert — all up to date");
+      }
     }
 
-    // Generate llms.txt if enabled
+    // Generate llms.txt if enabled.
+    //
+    // These are published artifacts, so they get the same protection the index
+    // gets: only a run holding the complete page list may replace them. A
+    // truncated crawl, a failed extraction, or a refused deletion plan would
+    // otherwise overwrite a complete llms.txt with its partial page set, and
+    // unlike the index there is no second copy to recover it from.
+    //
+    // The predicate is about the *page list*, which is not quite the question
+    // the index asks. A chunk limit truncates no pages, so it must not freeze
+    // the exports; conversely a retained custom record this run was never told
+    // about is missing from `pages` even though it is still in the index, and
+    // publishing would quietly drop it from the public list.
+    const retainedCustomRecords =
+      options.customRecords === undefined &&
+      [...existingPageHashes.values()].some((entry) => entry.custom);
+    const pageSetComplete =
+      !indexMutationRefused &&
+      !retainedCustomRecords &&
+      runWarnings.every((warning) => warning.kind === "chunks-limited");
+
     if (this.config.llmsTxt.enable && !options.dryRun) {
-      const llmsStart = stageStart();
-      await writeLlmsTxt(pages, this.config, this.cwd, this.logger);
-      stageEnd("llms_txt", llmsStart);
+      if (pageSetComplete) {
+        const llmsStart = stageStart();
+        await writeLlmsTxt(pages, this.config, this.cwd, this.logger);
+        stageEnd("llms_txt", llmsStart);
+      } else {
+        this.logger.warn(
+          "Keeping the existing llms.txt: this run's page list may be incomplete."
+        );
+      }
     }
 
     this.logger.info("Done.");
