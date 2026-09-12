@@ -44,9 +44,11 @@ the extra cost is one-off:
   run is not passed `customRecords`, those pages are missing from the run's page list
   and the exports are **not** refreshed — the warning now says so, and names
   `customRecords` as the fix. Passing `customRecords: []` asserts there are none.
-- **`pathPrefix` is now a segment prefix.** `/docs` matches `/docs` and `/docs/api` and
-  no longer matches `/docsmith`. This is a behaviour change for any prefix that was
-  relying on raw string matching.
+- **`pathPrefix` is now a segment prefix in search.** `/docs` matches `/docs` and
+  `/docs/api` and no longer matches `/docsmith`. This is a behaviour change for any
+  prefix that was relying on raw string matching. Note the scope: this covers the
+  search and section-retrieval paths. Administrative page listing still matches on a
+  raw string prefix, so `listPages` with `/docs` continues to return `/docsmith`.
 - **`results: null` from a search endpoint is an error, not an empty result set.** The
   client and the `createSearch` store validate the response shape; on a 2xx response a
   `null` body, a parseable error page, or `results: null` raises `Invalid search

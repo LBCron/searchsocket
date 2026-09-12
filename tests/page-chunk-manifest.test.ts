@@ -384,15 +384,18 @@ describe("a reader whose page snapshot went stale is not failed for it", () => {
     expect(fake.counts.chunkRange).toBeGreaterThan(0);
   });
 
-  it("returns an empty page when the chunks namespace has never been written", async () => {
+  it("reports loss, not emptiness, when a listed page's chunk namespace is gone", async () => {
+    // A page that lists chunks is evidence that sections are expected. A
+    // vanished namespace is loss; answering with an empty page would serve a
+    // silently sectionless document as a success.
     const fake = createFakeIndex(corpus(0, { manifest: true }));
     fake.chunksNs.fetch.mockImplementation(async () => {
       throw new Error("Namespace chunks not found");
     });
 
-    const page = await createStore(fake.index).getPage("/guide", alpha);
-
-    expect(page?.markdown).toBe("");
+    await expect(createStore(fake.index).getPage("/guide", alpha)).rejects.toThrow(
+      SearchSocketError
+    );
   });
 });
 

@@ -99,10 +99,13 @@ function svelteSourceDependencies() {
  *
  * WHAT THIS PROVES, EXACTLY: the built ESM file for each browser subpath contains
  * no import of a `node:`-prefixed specifier, no import of a bare Node builtin
- * name, and no `createRequire`/`require(` call. Both entries are fully bundled
- * by tsup, so a single-file scan covers their whole dependency graph.
+ * name, and no `createRequire`/`require(` call. Both entries are bundled into a
+ * single file by the current tsup config, so today that scan reaches everything
+ * they pull in.
  *
- * WHAT IT DOES NOT PROVE: it is a text scan, not a browser build. It cannot see
+ * WHAT IT DOES NOT PROVE: it is a text scan, not a browser build. Nothing here
+ * enforces that the entries stay bundled, so a future externalised dependency
+ * would move code out of the file and out of this check's reach; it cannot see
  * a builtin reached through a bare dependency the bundle chose to externalise,
  * and a matching string inside a comment or a string literal would be reported
  * as a problem. It says nothing about the server entries, which are expected to
@@ -127,8 +130,10 @@ function browserEntryProblems() {
   // namespace rather than a name list; bare names still need the list. The
   // trailing class allows the `fs/promises`, `stream/web`, `util/types` forms.
   const patterns = [
-    [/(?:^|[\s;{(,])(?:from|import|require)\s*\(?\s*["'`]node:[a-z_/]+["'`]/g, null],
-    [new RegExp(`(?:^|[\\s;{(,])(?:from|import|require)\\s*\\(?\\s*["'\`](?:${bare})(?:/[a-z]+)?["'\`]`, "g"), null],
+    // Digits belong in builtin names (`node:v8`, `node:http2`); a letters-only
+    // class silently let both through.
+    [/(?:^|[\s;{(,])(?:from|import|require)\s*\(?\s*["'`]node:[a-z0-9_/]+["'`]/g, null],
+    [new RegExp(`(?:^|[\\s;{(,])(?:from|import|require)\\s*\\(?\\s*["'\`](?:${bare})(?:/[a-z0-9]+)?["'\`]`, "g"), null],
     [/\bcreateRequire\b/g, "createRequire"],
     [/\brequire\s*\(/g, "require("]
   ];

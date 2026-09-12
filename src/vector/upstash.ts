@@ -1458,9 +1458,18 @@ export class UpstashSearchStore {
         );
       } catch (error) {
         // A namespace that has never been written to holds no chunks for any
-        // page, which is the same empty answer the scan path returns. It is not
-        // the partial-loss case the missing-key report below is for.
-        if (isMissingNamespaceError(error)) return { chunks: [], missing: [], listed: 0 };
+        // page, which is the same empty answer the scan path returns.
+        //
+        // But a page that lists chunks is evidence that sections are expected,
+        // so a vanished namespace is loss, not emptiness. Reporting zero here
+        // would hand back a silently sectionless page as a success — the exact
+        // "truncated result presented as complete" this manifest exists to
+        // avoid. Every listed key is missing.
+        if (isMissingNamespaceError(error)) {
+          return keys.length === 0
+            ? { chunks: [], missing: [], listed: 0 }
+            : { chunks: [], missing: [...keys], listed: keys.length };
+        }
         throw toStorageError("fetch page chunks", error);
       }
 
