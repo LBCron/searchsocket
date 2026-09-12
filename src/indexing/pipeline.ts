@@ -197,7 +197,9 @@ export class IndexPipeline {
     } else if (sourceMode === "build") {
       sourceLoad = await loadBuildPages(this.cwd, this.config, options.maxPages);
     } else {
-      sourceLoad = await loadContentFilesPages(this.cwd, this.config, options.maxPages);
+      // Pass the run's logger so the loader's exclusion warnings honour the
+      // run's JSON and verbosity settings rather than falling back to a default.
+      sourceLoad = await loadContentFilesPages(this.cwd, this.config, options.maxPages, this.logger);
     }
     const sourcePages = sourceLoad.records;
     stageEnd("source", sourceStart);
