@@ -49,13 +49,46 @@ export const handle = searchsocketHandle();`;
 export const HOOKS_SEQUENCE_SNIPPET = `import { sequence } from "@sveltejs/kit/hooks";
 import { searchsocketHandle } from "searchsocket/sveltekit";
 
-// Compose with your existing handle:
-export const handle = sequence(searchsocketHandle(), yourExistingHandle);`;
+// Compose with your existing handle. Keep yours first: searchsocketHandle()
+// answers its own endpoints without calling resolve(), so anything sequenced
+// after it never sees those requests. Your handle stays outer, and search is
+// reached through its resolve() — which also means a handle that blocks a
+// request (auth, maintenance mode) blocks search, MCP, CORS preflight and
+// llms.txt too. Exempt those paths in your own handle if that is not what
+// you want.
+export const handle = sequence(yourExistingHandle, searchsocketHandle());`;
 
 export const VITE_PLUGIN_SNIPPET = `import { searchsocketVitePlugin } from "searchsocket/sveltekit";
 
 // Add to your Vite config plugins array:
 // plugins: [sveltekit(), searchsocketVitePlugin()]`;
+
+/**
+ * True when the file exports a handle in a shape magicast's `exports` view
+ * cannot see: `export { handle } from "./auth"`, `export { authHandle as
+ * handle }`, or a star re-export that may forward one.
+ *
+ * Adding `export const handle` beside any of those is worse than doing
+ * nothing: the named forms become a duplicate export (a syntax error) and a
+ * star re-export silently shadows the app's real handle, disabling its
+ * middleware for every route rather than only the search ones.
+ */
+function hasUnreachableHandleExport(program: unknown): boolean {
+  const body = (program as { body?: unknown }).body;
+  if (!Array.isArray(body)) return false;
+
+  return body.some((node: { type?: string; specifiers?: unknown }) => {
+    if (node.type === "ExportAllDeclaration") {
+      return true;
+    }
+    if (node.type !== "ExportNamedDeclaration" || !Array.isArray(node.specifiers)) {
+      return false;
+    }
+    return node.specifiers.some(
+      (specifier: { exported?: { name?: string } }) => specifier.exported?.name === "handle"
+    );
+  });
+}
 
 /**
  * Inject searchsocketHandle into src/hooks.server.ts using AST manipulation.
@@ -85,6 +118,10 @@ export function injectHooksServerTs(cwd: string): HookInjectionResult {
   try {
     const mod = parseModule(original);
 
+    if (!mod.exports.handle && hasUnreachableHandleExport(mod.$ast)) {
+      return "fallback";
+    }
+
     // Add the searchsocketHandle import
     mod.imports.$append({
       from: "searchsocket/sveltekit",
@@ -98,11 +135,18 @@ export function injectHooksServerTs(cwd: string): HookInjectionResult {
         imported: "sequence",
       });
 
+      // The app's own handle goes first. Under `sequence`, each handler's
+      // `resolve` invokes the next one, and searchsocketHandle() returns its
+      // endpoint responses without ever calling `resolve` — so putting it
+      // first would skip the app's auth, logging and header middleware for
+      // every SearchSocket route. Outer-first keeps that middleware in the
+      // path; a handler that short-circuits now blocks search as well, which
+      // is the behaviour an authenticated site actually asked for.
       const existingHandle = mod.exports.handle;
       mod.exports.handle = builders.functionCall(
         "sequence",
-        builders.functionCall("searchsocketHandle"),
         existingHandle,
+        builders.functionCall("searchsocketHandle"),
       );
 
       const { code } = generateCode(mod);
