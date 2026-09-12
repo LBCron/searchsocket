@@ -15,17 +15,32 @@ const tempDirs: string[] = [];
  */
 function createStatefulMockStore(): {
   store: UpstashSearchStore;
-  getChunkHashes: () => Map<string, string>;
-  getPageHashes: () => Map<string, { contentHash: string; custom: boolean }>;
+  getChunkHashes: () => Map<string, { contentHash: string; metadataHash?: string }>;
+  getPageHashes: () => Map<string, { contentHash: string; metadataHash?: string; custom: boolean }>;
 } {
-  const chunkHashes = new Map<string, string>();
-  const pageHashes = new Map<string, { contentHash: string; custom: boolean }>();
+  const chunkHashes = new Map<string, { contentHash: string; metadataHash?: string }>();
+  const pageHashes = new Map<string, { contentHash: string; metadataHash?: string; custom: boolean }>();
 
   const store = {
-    upsertChunks: vi.fn().mockImplementation(async (chunks: Array<{ id: string; metadata: { contentHash: string } }>) => {
+    upsertChunks: vi.fn().mockImplementation(async (chunks: Array<{ id: string; metadata: { contentHash: string; metadataHash?: string } }>) => {
       for (const chunk of chunks) {
-        chunkHashes.set(chunk.id, chunk.metadata.contentHash);
+        chunkHashes.set(chunk.id, {
+          contentHash: chunk.metadata.contentHash,
+          metadataHash: chunk.metadata.metadataHash
+        });
       }
+    }),
+    updateChunkMetadata: vi.fn().mockImplementation(async (items: Array<{ id: string; metadata: { metadataHash?: string } }>) => {
+      const missing: string[] = [];
+      for (const item of items) {
+        const existing = chunkHashes.get(item.id);
+        if (!existing) {
+          missing.push(item.id);
+          continue;
+        }
+        chunkHashes.set(item.id, { ...existing, metadataHash: item.metadata.metadataHash });
+      }
+      return missing;
     }),
     search: vi.fn().mockResolvedValue([]),
     deleteByIds: vi.fn().mockImplementation(async (ids: string[]) => {
@@ -37,7 +52,7 @@ function createStatefulMockStore(): {
     listScopes: vi.fn().mockResolvedValue([]),
     getContentHashes: vi.fn().mockImplementation(async () => new Map(chunkHashes)),
     fetchContentHashesForKeys: vi.fn().mockImplementation(async (keys: string[]) => {
-      const filtered = new Map<string, string>();
+      const filtered = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const k of keys) {
         const v = chunkHashes.get(k);
         if (v) filtered.set(k, v);
@@ -49,9 +64,28 @@ function createStatefulMockStore(): {
       for (const page of pages) {
         const contentHash = page.metadata.contentHash as string;
         if (contentHash) {
-          pageHashes.set(page.id, { contentHash, custom: page.metadata.custom === true });
+          pageHashes.set(page.id, {
+            contentHash,
+            metadataHash: page.metadata.metadataHash as string | undefined,
+            custom: page.metadata.custom === true
+          });
         }
       }
+    }),
+    updatePageMetadata: vi.fn().mockImplementation(async (items: Array<{ id: string; metadata: Record<string, unknown> }>) => {
+      const missing: string[] = [];
+      for (const item of items) {
+        const existing = pageHashes.get(item.id);
+        if (!existing) {
+          missing.push(item.id);
+          continue;
+        }
+        pageHashes.set(item.id, {
+          ...existing,
+          metadataHash: item.metadata.metadataHash as string | undefined
+        });
+      }
+      return missing;
     }),
     getPage: vi.fn().mockResolvedValue(null),
     deletePages: vi.fn().mockImplementation(async () => {

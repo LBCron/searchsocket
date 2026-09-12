@@ -303,6 +303,33 @@ function provenanceTag(page: { custom?: boolean }): string {
   return page.custom ? "|custom" : "|site";
 }
 
+/**
+ * Fingerprint of everything that decides the *embedding* of a chunk.
+ *
+ * Deliberately kept byte-identical to the hash this module has always written,
+ * so upgrading does not re-embed an index that has not actually changed. It
+ * covers the normalized embedding text, the structured meta block, and
+ * provenance — the last because provenance is persisted and decides whether a
+ * site-only run may delete the record, so a page moving between
+ * custom-supplied and site-owned must re-upsert even when its text is
+ * identical.
+ *
+ * Everything else that is persisted is covered by the *metadata* fingerprint
+ * the pipeline computes from the final payload; see buildChunkMetadataHash().
+ * The split is what lets a tag edit refresh metadata without paying to
+ * re-embed unchanged prose.
+ *
+ * Takes a Chunk rather than a page so it can be recomputed after
+ * `transformChunk`/`beforeIndex` have had their say: hooks may rewrite the very
+ * text that is embedded, and a hash taken before they run describes a payload
+ * that is never stored.
+ */
+export function buildChunkEmbeddingHash(chunk: Chunk, prependTitle: boolean): string {
+  const embeddingText = buildEmbeddingText(chunk, prependTitle);
+  const metaSuffix = chunk.meta ? JSON.stringify(chunk.meta, Object.keys(chunk.meta).sort()) : "";
+  return sha256(normalizeText(embeddingText) + metaSuffix + provenanceTag(chunk));
+}
+
 export function buildEmbeddingTitle(chunk: Chunk): string | undefined {
   if (!chunk.sectionTitle || chunk.headingLevel === undefined) return undefined;
 
@@ -336,17 +363,30 @@ export function chunkPage(
 
   const chunks: Chunk[] = [];
 
+  // Counts identical (heading path, text) pairs within one page so a repeated
+  // section still gets distinct keys.
+  const collisionCounts = new Map<string, number>();
+
   if (config.chunking.pageSummaryChunk) {
     const summaryText = buildSummaryChunkText(page);
     // Scope is no longer part of the logical key: isolation now lives in the
     // physical record ID (see src/vector/ids.ts), so the same page in two
     // scopes produces the same logical key and different records.
-    const summaryChunkKey = chunkLogicalKey({
+    const summaryIdentity = {
       url: page.url,
       headingPath: ["__summary__"],
       text: "__summary__",
       collisionOrdinal: 0
-    });
+    };
+    const summaryChunkKey = chunkLogicalKey(summaryIdentity);
+
+    // The summary's synthetic identity is not reserved: a page can genuinely
+    // contain a section whose heading and body are both `__summary__`, and it
+    // would hash to the same key. Claim the slot so such a body chunk is
+    // counted as a collision and gets the next ordinal, rather than two records
+    // fighting over one ID. Claimed rather than renamed because the summary's
+    // key is a stored record ID that must not change under existing indexes.
+    collisionCounts.set(chunkIdentityBase(summaryIdentity), 1);
 
     const summaryChunk: Chunk = {
       chunkKey: summaryChunkKey,
@@ -371,24 +411,14 @@ export function chunkPage(
       meta: page.meta
     };
 
-    const embeddingText = buildEmbeddingText(summaryChunk, config.chunking.prependTitle);
-    const metaSuffix = page.meta ? JSON.stringify(page.meta, Object.keys(page.meta).sort()) : "";
-    // Provenance is stored on the record and decides whether a site-only run
-    // may delete it, so a page changing between custom-supplied and site-owned
-    // must re-upsert its chunks even when the text is identical. Otherwise the
-    // stored flag stays stale: site→custom chunks stay deletable, and
-    // custom→site chunks stay protected after the page itself is gone.
-    summaryChunk.contentHash = sha256(
-      normalizeText(embeddingText) + metaSuffix + provenanceTag(page)
-    );
+    // Provisional: the pipeline recomputes this from the final post-hook
+    // payload. Set here so callers that chunk a page directly still get a
+    // usable fingerprint.
+    summaryChunk.contentHash = buildChunkEmbeddingHash(summaryChunk, config.chunking.prependTitle);
     chunks.push(summaryChunk);
   }
 
   const ordinalOffset = config.chunking.pageSummaryChunk ? 1 : 0;
-
-  // Counts identical (heading path, text) pairs within one page so a repeated
-  // section still gets distinct keys.
-  const collisionCounts = new Map<string, number>();
 
   for (let index = 0; index < rawChunks.length; index++) {
     const entry = rawChunks[index]!;
@@ -439,11 +469,7 @@ export function chunkPage(
       meta: page.meta
     };
 
-    const embeddingText = buildEmbeddingText(chunk, config.chunking.prependTitle);
-    const chunkMetaSuffix = page.meta ? JSON.stringify(page.meta, Object.keys(page.meta).sort()) : "";
-    chunk.contentHash = sha256(
-      normalizeText(embeddingText) + chunkMetaSuffix + provenanceTag(page)
-    );
+    chunk.contentHash = buildChunkEmbeddingHash(chunk, config.chunking.prependTitle);
     chunks.push(chunk);
   }
 

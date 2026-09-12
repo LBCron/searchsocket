@@ -34,6 +34,12 @@ const DEFAULT_BATCH_SIZE = 90;
  */
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BASE_MS = 200;
+/**
+ * Metadata-only updates go one record per request — Upstash's `update` takes a
+ * single vector, unlike `upsert`. Overlapping a few keeps a large refresh from
+ * being one serial round trip per record without burying the endpoint.
+ */
+const METADATA_UPDATE_CONCURRENCY = 8;
 
 /** Coerce an untrusted numeric option to a finite integer inside [min, max]. */
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -75,7 +81,20 @@ interface ChunkVectorMetadata {
 /** One entry of the page inventory returned by `getPageHashes`. */
 export interface PageHashEntry {
   contentHash: string;
+  /**
+   * Fingerprint of the persisted metadata projection. Absent on records written
+   * before the two fingerprints were split, which callers must read as "the
+   * metadata needs refreshing once" rather than as "the text changed".
+   */
+  metadataHash?: string;
   custom: boolean;
+}
+
+/** One entry of the chunk inventory returned by `fetchContentHashesForKeys`. */
+export interface ChunkHashEntry {
+  contentHash: string;
+  /** Absent on pre-split records; see PageHashEntry.metadataHash. */
+  metadataHash?: string;
 }
 
 interface PageVectorMetadata {
@@ -344,6 +363,89 @@ export class UpstashSearchStore {
         }))
       ));
     }
+  }
+
+  /**
+   * Replace a record's metadata without re-sending the text it was embedded
+   * from.
+   *
+   * The point of the separate metadata fingerprint: a tag edit, a moved route
+   * file or a reordered section changes what is stored but not what should be
+   * embedded, and `upsert` would re-embed all of it. `OVERWRITE` rather than
+   * `PATCH` because the caller passes the complete projection, so a field that
+   * has been removed must genuinely disappear rather than linger.
+   *
+   * Returns the logical keys of records the backend reported no update for —
+   * i.e. records that no longer exist. Those cannot be patched into existence,
+   * so the caller re-upserts them rather than leaving the page short a section.
+   */
+  async updateChunkMetadata(
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    scope: Scope
+  ): Promise<string[]> {
+    return this.updateMetadata(this.chunksNs, "update chunk metadata", items, (item) => ({
+      recordId: chunkId(scope, item.id),
+      metadata: {
+        ...item.metadata,
+        chunkKey: item.id,
+        projectId: scope.projectId,
+        scopeName: scope.scopeName,
+        schemaVersion: INDEX_SCHEMA_VERSION,
+        type: (item.metadata.type as string) || "chunk"
+      }
+    }));
+  }
+
+  /** Page-record counterpart of `updateChunkMetadata`; `id` is the page URL. */
+  async updatePageMetadata(
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    scope: Scope
+  ): Promise<string[]> {
+    return this.updateMetadata(this.pagesNs, "update page metadata", items, (item) => ({
+      recordId: pageId(scope, item.id),
+      metadata: {
+        ...item.metadata,
+        projectId: scope.projectId,
+        scopeName: scope.scopeName,
+        schemaVersion: INDEX_SCHEMA_VERSION,
+        type: "page"
+      }
+    }));
+  }
+
+  private async updateMetadata(
+    ns: ReturnType<Index["namespace"]>,
+    operation: string,
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    toRecord: (item: { id: string; metadata: Record<string, unknown> }) => {
+      recordId: string;
+      metadata: Record<string, unknown>;
+    }
+  ): Promise<string[]> {
+    if (items.length === 0) return [];
+
+    const missing: string[] = [];
+    for (let i = 0; i < items.length; i += METADATA_UPDATE_CONCURRENCY) {
+      const window = items.slice(i, i + METADATA_UPDATE_CONCURRENCY);
+      const results = await Promise.all(
+        window.map(async (item) => {
+          const record = toRecord(item);
+          const result = await this.withRetry(operation, () =>
+            ns.update({
+              id: record.recordId,
+              metadata: record.metadata,
+              metadataUpdateMode: "OVERWRITE"
+            })
+          );
+          return result.updated > 0;
+        })
+      );
+      results.forEach((updated, offset) => {
+        if (!updated) missing.push(window[offset]!.id);
+      });
+    }
+
+    return missing;
   }
 
   async search(
@@ -684,8 +786,8 @@ export class UpstashSearchStore {
    * instead of range(). This avoids potential issues with range() returning
    * vectors from the wrong namespace on hybrid indexes.
    */
-  async fetchContentHashesForKeys(keys: string[], scope: Scope): Promise<Map<string, string>> {
-    const map = new Map<string, string>();
+  async fetchContentHashesForKeys(keys: string[], scope: Scope): Promise<Map<string, ChunkHashEntry>> {
+    const map = new Map<string, ChunkHashEntry>();
     if (keys.length === 0) return map;
 
     const BATCH_SIZE = this.batchSize;
@@ -701,7 +803,13 @@ export class UpstashSearchStore {
           // explicitly rather than trusting the ID.
           if (doc && recordBelongsToScope(doc.metadata, scope) && doc.metadata?.contentHash) {
             const key = logicalKeyFromId(String(doc.id), scope, "chunk");
-            if (key !== null) map.set(key, doc.metadata.contentHash);
+            if (key !== null) {
+              map.set(key, {
+                contentHash: doc.metadata.contentHash,
+                metadataHash:
+                  typeof doc.metadata.metadataHash === "string" ? doc.metadata.metadataHash : undefined
+              });
+            }
           }
         }
       } catch (error) {
@@ -878,6 +986,7 @@ export class UpstashSearchStore {
           if (url) {
             map.set(url, {
               contentHash: doc.metadata.contentHash,
+              metadataHash: typeof doc.metadata.metadataHash === "string" ? doc.metadata.metadataHash : undefined,
               custom: doc.metadata.custom === true
             });
           }

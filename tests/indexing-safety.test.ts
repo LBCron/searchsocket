@@ -28,22 +28,42 @@ afterEach(async () => {
 
 /** A store that remembers what was written, so run 2 sees run 1's records. */
 function createStatefulMockStore() {
-  const pageHashes = new Map<string, { contentHash: string; custom: boolean }>();
+  const pageHashes = new Map<string, { contentHash: string; metadataHash?: string; custom: boolean }>();
   const chunkIds = new Set<string>();
-  const chunkHashes = new Map<string, string>();
+  // Both fingerprints, exactly as the real store returns them: the embedding
+  // hash decides whether the text must be re-embedded, the metadata hash
+  // whether the stored projection needs refreshing.
+  const chunkHashes = new Map<string, { contentHash: string; metadataHash?: string }>();
   // Provenance per chunk, so the store mock can answer the same question the
   // real one does — otherwise the custom-chunk protection is never exercised.
   const chunkCustom = new Map<string, boolean>();
 
   const store = {
     getPageHashes: vi.fn(async () => new Map(pageHashes)),
-    upsertPages: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; custom?: boolean } }>) => {
+    upsertPages: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean } }>) => {
       for (const doc of docs) {
         pageHashes.set(doc.id, {
           contentHash: doc.metadata.contentHash ?? "",
+          metadataHash: doc.metadata.metadataHash,
           custom: doc.metadata.custom === true
         });
       }
+    }),
+    updatePageMetadata: vi.fn(async (items: Array<{ id: string; metadata: { metadataHash?: string; custom?: boolean } }>) => {
+      const missing: string[] = [];
+      for (const item of items) {
+        const existing = pageHashes.get(item.id);
+        if (!existing) {
+          missing.push(item.id);
+          continue;
+        }
+        pageHashes.set(item.id, {
+          contentHash: existing.contentHash,
+          metadataHash: item.metadata.metadataHash,
+          custom: item.metadata.custom === true
+        });
+      }
+      return missing;
     }),
     deletePagesByIds: vi.fn(async (ids: string[]) => {
       for (const id of ids) pageHashes.delete(id);
@@ -51,19 +71,38 @@ function createStatefulMockStore() {
     deletePages: vi.fn(async () => pageHashes.clear()),
     scanChunkIds: vi.fn(async () => new Map([...chunkIds].map((k) => [k, chunkCustom.get(k) === true]))),
     fetchContentHashesForKeys: vi.fn(async (keys: string[]) => {
-      const out = new Map<string, string>();
+      const out = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const key of keys) {
-        const hash = chunkHashes.get(key);
-        if (hash !== undefined) out.set(key, hash);
+        const entry = chunkHashes.get(key);
+        if (entry !== undefined) out.set(key, entry);
       }
       return out;
     }),
-    upsertChunks: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; custom?: boolean } }>) => {
+    upsertChunks: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean } }>) => {
       for (const doc of docs) {
         chunkIds.add(doc.id);
-        chunkHashes.set(doc.id, doc.metadata.contentHash ?? "");
+        chunkHashes.set(doc.id, {
+          contentHash: doc.metadata.contentHash ?? "",
+          metadataHash: doc.metadata.metadataHash
+        });
         chunkCustom.set(doc.id, doc.metadata.custom === true);
       }
+    }),
+    updateChunkMetadata: vi.fn(async (items: Array<{ id: string; metadata: { metadataHash?: string; custom?: boolean } }>) => {
+      const missing: string[] = [];
+      for (const item of items) {
+        const existing = chunkHashes.get(item.id);
+        if (!existing) {
+          missing.push(item.id);
+          continue;
+        }
+        chunkHashes.set(item.id, {
+          contentHash: existing.contentHash,
+          metadataHash: item.metadata.metadataHash
+        });
+        chunkCustom.set(item.id, item.metadata.custom === true);
+      }
+      return missing;
     }),
     deleteByIds: vi.fn(async (ids: string[]) => {
       for (const id of ids) {

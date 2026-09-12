@@ -9,7 +9,7 @@ import type { UpstashSearchStore } from "../src/vector/upstash";
 const tempDirs: string[] = [];
 
 function createMockStore(
-  existingHashes: Map<string, string>,
+  existingHashes: Map<string, { contentHash: string; metadataHash?: string }>,
   upsertSpy?: ReturnType<typeof vi.fn>
 ): UpstashSearchStore {
   return {
@@ -20,7 +20,7 @@ function createMockStore(
     listScopes: vi.fn().mockResolvedValue([]),
     getContentHashes: vi.fn().mockResolvedValue(existingHashes),
     fetchContentHashesForKeys: vi.fn().mockImplementation(async (keys: string[]) => {
-      const filtered = new Map<string, string>();
+      const filtered = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const k of keys) {
         const v = existingHashes.get(k);
         if (v) filtered.set(k, v);
@@ -106,11 +106,14 @@ describe("IndexPipeline single-source-of-truth resync", () => {
     expect(firstStats.chunksChanged).toBeGreaterThan(0);
 
     // Collect the hashes from the upserted chunks
-    const existingHashes = new Map<string, string>();
+    const existingHashes = new Map<string, { contentHash: string; metadataHash?: string }>();
     for (const call of firstUpsertSpy.mock.calls) {
       const chunks = call[0];
       for (const chunk of chunks) {
-        existingHashes.set(chunk.id, chunk.metadata.contentHash);
+        existingHashes.set(chunk.id, {
+          contentHash: chunk.metadata.contentHash,
+          metadataHash: chunk.metadata.metadataHash
+        });
       }
     }
 

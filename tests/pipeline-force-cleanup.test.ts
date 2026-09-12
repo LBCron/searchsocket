@@ -15,14 +15,17 @@ const tempDirs: string[] = [];
  */
 function createStatefulMockStore(): {
   store: UpstashSearchStore;
-  getHashes: () => Map<string, string>;
+  getHashes: () => Map<string, { contentHash: string; metadataHash?: string }>;
 } {
-  const hashes = new Map<string, string>();
+  const hashes = new Map<string, { contentHash: string; metadataHash?: string }>();
 
   const store = {
-    upsertChunks: vi.fn().mockImplementation(async (chunks: Array<{ id: string; metadata: { contentHash: string } }>) => {
+    upsertChunks: vi.fn().mockImplementation(async (chunks: Array<{ id: string; metadata: { contentHash: string; metadataHash?: string } }>) => {
       for (const chunk of chunks) {
-        hashes.set(chunk.id, chunk.metadata.contentHash);
+        hashes.set(chunk.id, {
+          contentHash: chunk.metadata.contentHash,
+          metadataHash: chunk.metadata.metadataHash
+        });
       }
     }),
     search: vi.fn().mockResolvedValue([]),
@@ -35,7 +38,7 @@ function createStatefulMockStore(): {
     listScopes: vi.fn().mockResolvedValue([]),
     getContentHashes: vi.fn().mockImplementation(async () => new Map(hashes)),
     fetchContentHashesForKeys: vi.fn().mockImplementation(async (keys: string[]) => {
-      const filtered = new Map<string, string>();
+      const filtered = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const k of keys) {
         const v = hashes.get(k);
         if (v) filtered.set(k, v);
