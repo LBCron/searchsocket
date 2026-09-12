@@ -5,7 +5,7 @@ import { ensureStateDirs } from "../core/state";
 import { SearchSocketError } from "../errors";
 import { createUpstashStore } from "../vector";
 import type { ChunkHashEntry } from "../vector/upstash";
-import { UpstashSearchStore } from "../vector/upstash";
+import { PAGE_CHUNK_KEYS_FIELD, UpstashSearchStore } from "../vector/upstash";
 import { buildChunkEmbeddingHash, buildEmbeddingText, chunkPage } from "./chunker";
 import { extractFromHtmlResult, extractFromMarkdownResult } from "./extractor";
 import { buildRoutePatterns, mapUrlToRoute } from "./route-mapper";
@@ -208,6 +208,9 @@ function copyStoredMeta(
  * drift: any field added here is fingerprinted by construction. The store adds
  * the scope/identity fields (`projectId`, `scopeName`, `schemaVersion`,
  * `type`) on top; those are constants of the record's address, not content.
+ *
+ * The one field this does NOT produce is the chunk manifest; see
+ * withChunkManifest() below for why it has to be attached in a second step.
  */
 function buildPageMetadata(record: PageRecord): Record<string, unknown> {
   return {
@@ -236,6 +239,37 @@ function buildPageMetadata(record: PageRecord): Record<string, unknown> {
     custom: record.custom ?? false,
     ...(record.meta && Object.keys(record.meta).length > 0 ? { meta: copyStoredMeta(record.meta) } : {})
   };
+}
+
+/**
+ * The second half of the page projection: the page's chunk manifest.
+ *
+ * `chunkKeys` is the ordered list of logical keys of the chunks this run
+ * intends the page to have. `getChunksForPage` reads it to fetch those records
+ * by ID, so retrieving a page costs its own chunk count rather than a scan of
+ * every chunk in the scope.
+ *
+ * It is attached separately, and deliberately so. The base projection has to be
+ * snapshotted BEFORE the chunk hooks run — it copies the very arrays an
+ * IndexedPage shares with its chunks, and a hook mutating one of those
+ * afterwards would change a payload that had already been measured and
+ * fingerprinted. The manifest, conversely, is not knowable UNTIL those hooks
+ * have run and the final chunk set exists. Two moments, one projection.
+ *
+ * A `null` list means this run cannot state the page's chunk set with certainty
+ * (see `--max-chunks`), and then no field is written at all rather than a short
+ * one: a manifest that omits sections while looking complete would silently
+ * drop them from `get_page`. Because the field is part of the persisted
+ * projection it joins the metadata fingerprint by construction, so a page whose
+ * sections change without its text changing gets a metadata-only refresh rather
+ * than a re-embed.
+ */
+function withChunkManifest(
+  metadata: Record<string, unknown>,
+  chunkKeys: string[] | null
+): Record<string, unknown> {
+  if (!chunkKeys) return metadata;
+  return { ...metadata, [PAGE_CHUNK_KEYS_FIELD]: [...chunkKeys] };
 }
 
 /**
@@ -325,6 +359,21 @@ const TRIMMABLE_METADATA_FIELD: Record<WriteKind, string> = {
   page: "summary"
 };
 
+/**
+ * Fields a record may lose *whole*, in order, before anything is shortened.
+ *
+ * The chunk-key manifest is the only one: it is a retrieval shortcut rather
+ * than content, so dropping it costs the page a range scan when it is read and
+ * nothing else, whereas trimming the summary changes what a reader is shown.
+ * Shortening it is not on the table — a key list that omits sections while
+ * looking complete would make `get_page` drop them without saying so, so the
+ * choice is the whole manifest or none of it.
+ */
+const OMITTABLE_METADATA_FIELDS: Record<WriteKind, string[]> = {
+  chunk: [],
+  page: [PAGE_CHUNK_KEYS_FIELD]
+};
+
 /** Context a planned write needs in order to be measured against the budget. */
 interface WriteBudget {
   kind: WriteKind;
@@ -378,15 +427,32 @@ function fitMetadataToBudget(
   let size = measure(metadata);
   if (size <= METADATA_BYTE_BUDGET) return metadata;
 
+  let fitted = metadata;
+
+  // Drop what is purely derived before shortening what is content.
+  for (const omittable of OMITTABLE_METADATA_FIELDS[budget.kind]) {
+    if (size <= METADATA_BYTE_BUDGET) break;
+    if (!(omittable in fitted)) continue;
+    const { [omittable]: dropped, ...rest } = fitted;
+    fitted = rest;
+    size = measure(fitted);
+    budget.logger.warn(
+      `Omitted "${omittable}" from ${budget.kind} ${id} (${budget.url}): ` +
+        `${Array.isArray(dropped) ? `${dropped.length} entries` : "it"} would not fit the ` +
+        `${METADATA_BYTE_BUDGET}-byte metadata limit. The page still reads correctly; ` +
+        "retrieving it falls back to scanning the scope for its chunks."
+    );
+  }
+  if (size <= METADATA_BYTE_BUDGET) return fitted;
+
   const field = TRIMMABLE_METADATA_FIELD[budget.kind];
   const originalBytes = utf8ByteLength(
-    typeof metadata[field] === "string" ? (metadata[field] as string) : ""
+    typeof fitted[field] === "string" ? (fitted[field] as string) : ""
   );
 
   // Removing N UTF-8 bytes from the field removes at least N from the
   // serialized payload — escaping only ever inflates — so one pass converges.
   // The loop is a guard against that reasoning being wrong, not an algorithm.
-  let fitted = metadata;
   for (let attempt = 0; attempt < 4 && size > METADATA_BYTE_BUDGET; attempt += 1) {
     const current = typeof fitted[field] === "string" ? (fitted[field] as string) : "";
     if (current.length === 0) break;
@@ -993,51 +1059,12 @@ export class IndexPipeline {
       };
     });
 
-    // Plan every page write up front, fingerprinting the metadata that will
-    // actually be persisted rather than a hand-picked subset of it.
-    const pageWrites = pageRecords.map((r) =>
-      planWrite(r.url, r.summary ?? r.title, buildPageMetadata(r), {
-        kind: "page",
-        url: r.url,
-        scope,
-        logger: this.logger
-      })
-    );
-
-    // Determine changed and stale pages.
-    //
-    // Two independent verdicts. A different embedding fingerprint means the
-    // summary that gets embedded has changed, so the record must be re-upserted.
-    // A different metadata fingerprint alone — a moved route file, a new
-    // incoming-link count — only needs the stored metadata replaced, which
-    // costs no embedding.
-    const currentPageUrls = new Set(pageRecords.map((r) => r.url));
-    const changedPageWrites: PlannedWrite[] = [];
-    const metadataOnlyPageWrites: PlannedWrite[] = [];
-    for (const write of pageWrites) {
-      const stored = options.force ? undefined : existingPageHashes.get(write.id);
-      if (!stored || stored.contentHash !== write.contentHash) {
-        changedPageWrites.push(write);
-      } else if (stored.metadataHash !== write.metadataHash) {
-        // Records written before metadata fingerprints existed carry no
-        // metadataHash at all. Treating that as a metadata change refreshes
-        // them once, cheaply; treating it as a text change would re-embed an
-        // index that has not changed.
-        metadataOnlyPageWrites.push(write);
-      }
-    }
-    const staleCandidateUrls = [...existingPageHashes.entries()]
-      .filter(([url, entry]) => {
-        if (currentPageUrls.has(url)) return false;
-        // A run that was not told about custom records has no opinion on them.
-        // Without this, indexing the site without passing `customRecords`
-        // deleted every custom record as "no longer present" — and a provider
-        // that merely failed to run once would take its content with it.
-        // Passing `customRecords: []` explicitly asserts there are none.
-        if (entry.custom && options.customRecords === undefined) return false;
-        return true;
-      })
-      .map(([url]) => url);
+    // Snapshot each page's metadata projection here, before a single chunk hook
+    // has run: it copies arrays the pages share with their chunks, and a hook
+    // mutating one of those later must not reach a payload that has already
+    // been measured. The manifest is attached, and the write planned, once the
+    // chunk set is final.
+    const pageMetadataBases = new Map(pageRecords.map((r) => [r.url, buildPageMetadata(r)]));
 
     stageEnd("pages", pagesStart);
     this.logger.info(`Indexed ${pages.length} page${pages.length === 1 ? "" : "s"} (${routeExact} exact, ${routeBestEffort} best-effort) (${stageTimingsMs["pages"]}ms)`);
@@ -1164,6 +1191,104 @@ export class IndexPipeline {
     for (const chunk of chunks) {
       currentChunkMap.set(chunk.chunkKey, chunk);
     }
+
+    // The ordered chunk-key manifest each page record carries, so retrieving
+    // one page costs that page's own chunk count instead of a scan of the whole
+    // scope. Built from the FINAL chunk set — after every hook, after
+    // provenance was re-asserted and after duplicate keys were dropped —
+    // because a manifest naming a chunk this run never writes would make the
+    // page unreadable rather than merely slow.
+    //
+    // Two conditions make the run unable to state any page's chunk set, and
+    // both withhold every manifest for the run:
+    //
+    //  - `--max-chunks` truncates the chunk array, so the page at the boundary
+    //    keeps chunks in the index that no manifest would list.
+    //  - A hook failure — a chunk pointed at an unindexed page, or a duplicate
+    //    key — drops chunks from the run's plan while leaving the records they
+    //    replaced in the index, because a run with warnings deletes nothing.
+    //    A manifest built from the survivors would name fewer sections than the
+    //    index actually holds for that page, and `getPage` would then serve a
+    //    short page as a whole one. Falling back to the scan returns the
+    //    retained sections, which is what the reader should see.
+    //
+    // Withholding is not merely "write nothing": the field's absence changes
+    // the page's metadata fingerprint, so an existing manifest is *removed* by
+    // a metadata-only refresh and restored by the next clean run.
+    //
+    // Deliberately not gated on the other warning kinds. A truncated source or
+    // a failed extraction changes which pages exist, not which chunks belong to
+    // a page that this run did chunk successfully.
+    const chunkSetIncomplete = runWarnings.some(
+      (warning) => warning.kind === "chunks-limited" || warning.kind === "hook-failure"
+    );
+    const manifestsTrustworthy = !chunkSetIncomplete;
+    const chunkKeysByUrl = new Map<string, string[]>();
+    if (manifestsTrustworthy) {
+      // Sorted by ordinal so the list is the page's own reading order even if a
+      // hook returned the chunks in some other order.
+      for (const chunk of [...chunks].sort((a, b) => a.ordinal - b.ordinal)) {
+        const keys = chunkKeysByUrl.get(chunk.url);
+        if (keys) keys.push(chunk.chunkKey);
+        else chunkKeysByUrl.set(chunk.url, [chunk.chunkKey]);
+      }
+    }
+
+    // Page writes are planned here rather than alongside the page records
+    // because the manifest is part of the metadata that gets fingerprinted, and
+    // it is not known until the chunk set is final. The projection itself was
+    // snapshotted before the hooks ran; only the manifest is added now.
+    const pageWrites = pageRecords.map((r) =>
+      planWrite(
+        r.url,
+        r.summary ?? r.title,
+        withChunkManifest(
+          pageMetadataBases.get(r.url) ?? buildPageMetadata(r),
+          manifestsTrustworthy ? chunkKeysByUrl.get(r.url) ?? [] : null
+        ),
+        {
+          kind: "page",
+          url: r.url,
+          scope,
+          logger: this.logger
+        }
+      )
+    );
+
+    // Determine changed and stale pages.
+    //
+    // Two independent verdicts. A different embedding fingerprint means the
+    // summary that gets embedded has changed, so the record must be re-upserted.
+    // A different metadata fingerprint alone — a moved route file, a new
+    // incoming-link count, a manifest this version writes and the last did not
+    // — only needs the stored metadata replaced, which costs no embedding.
+    const currentPageUrls = new Set(pageRecords.map((r) => r.url));
+    const changedPageWrites: PlannedWrite[] = [];
+    const metadataOnlyPageWrites: PlannedWrite[] = [];
+    for (const write of pageWrites) {
+      const stored = options.force ? undefined : existingPageHashes.get(write.id);
+      if (!stored || stored.contentHash !== write.contentHash) {
+        changedPageWrites.push(write);
+      } else if (stored.metadataHash !== write.metadataHash) {
+        // Records written before metadata fingerprints existed carry no
+        // metadataHash at all. Treating that as a metadata change refreshes
+        // them once, cheaply; treating it as a text change would re-embed an
+        // index that has not changed.
+        metadataOnlyPageWrites.push(write);
+      }
+    }
+    const staleCandidateUrls = [...existingPageHashes.entries()]
+      .filter(([url, entry]) => {
+        if (currentPageUrls.has(url)) return false;
+        // A run that was not told about custom records has no opinion on them.
+        // Without this, indexing the site without passing `customRecords`
+        // deleted every custom record as "no longer present" — and a provider
+        // that merely failed to run once would take its content with it.
+        // Passing `customRecords: []` explicitly asserts there are none.
+        if (entry.custom && options.customRecords === undefined) return false;
+        return true;
+      })
+      .map(([url]) => url);
 
     // Fingerprint the FINAL payload — after every hook and after provenance has
     // been re-asserted. Hashing the chunker's output instead meant a hook that
@@ -1363,47 +1488,6 @@ export class IndexPipeline {
     let pageMetadataRefreshed = 0;
     let chunkMetadataRefreshed = 0;
 
-    if (!options.dryRun && !writesBlocked) {
-      // Upsert before delete, in both force and incremental mode: a crash
-      // between the two must leave the old generation searchable, never an
-      // empty index. Page IDs are stable, so re-upserting overwrites in place
-      // and the delete only removes records this run did not write.
-      const pageUpserts = [...changedPageWrites];
-
-      if (metadataOnlyPageWrites.length > 0) {
-        this.logger.info(
-          `Refreshing metadata for ${metadataOnlyPageWrites.length} page${metadataOnlyPageWrites.length === 1 ? "" : "s"} (no re-embedding)...`
-        );
-        // A record that disappeared between the diff and this write cannot be
-        // patched, and dropping it silently would leave the page missing until
-        // its text happened to change. Recreate it with a full upsert instead.
-        const missing = await this.store.updatePageMetadata(
-          metadataOnlyPageWrites.map((w) => ({ id: w.id, metadata: w.metadata })),
-          scope
-        );
-        pageMetadataRefreshed += metadataOnlyPageWrites.length - missing.length;
-        this.logger.debug(`Refreshed metadata for ${pageMetadataRefreshed} page record(s)`);
-        for (const id of missing) {
-          const write = metadataOnlyPageWrites.find((w) => w.id === id);
-          if (write) pageUpserts.push(write);
-        }
-      }
-
-      if (pageUpserts.length > 0 || deletedPageUrls.length > 0) {
-        this.logger.info(`Upserting ${pageUpserts.length} page summar${pageUpserts.length === 1 ? "y" : "ies"}...`);
-        if (pageUpserts.length > 0) {
-          await this.store.upsertPages(
-            pageUpserts.map((w) => ({ id: w.id, data: w.data, metadata: w.metadata })),
-            scope
-          );
-        }
-        // Page deletion is deferred until after the chunks are written. Deleting
-        // here meant a chunk-write failure left the index with fresh pages, the
-        // old pages already removed, and stale chunks — a state no run produced
-        // deliberately. Every upsert now precedes every delete.
-      }
-    }
-
     // Upsert changed chunks to Upstash Vector (embedding handled server-side)
     const upsertStart = stageStart();
     let documentsUpserted = 0;
@@ -1447,6 +1531,48 @@ export class IndexPipeline {
       }
 
       documentsUpserted = chunkUpserts.length + chunkMetadataRefreshed;
+    }
+
+    // --- Page records, after their chunks have landed ---
+    // Pages are written last of the upserts because a page record now names its
+    // chunks. Writing the page first opened a window in which its manifest
+    // pointed at records that did not exist yet, and a chunk-write failure left
+    // that window open indefinitely. In this order the page's manifest is only
+    // ever published once every chunk it names is readable, and a failure part
+    // way leaves the previous, self-consistent generation in place.
+    if (!options.dryRun && !writesBlocked) {
+      // Upsert before delete, in both force and incremental mode: a crash
+      // between the two must leave the old generation searchable, never an
+      // empty index. Page IDs are stable, so re-upserting overwrites in place
+      // and the delete only removes records this run did not write.
+      const pageUpserts = [...changedPageWrites];
+
+      if (metadataOnlyPageWrites.length > 0) {
+        this.logger.info(
+          `Refreshing metadata for ${metadataOnlyPageWrites.length} page${metadataOnlyPageWrites.length === 1 ? "" : "s"} (no re-embedding)...`
+        );
+        // A record that disappeared between the diff and this write cannot be
+        // patched, and dropping it silently would leave the page missing until
+        // its text happened to change. Recreate it with a full upsert instead.
+        const missing = await this.store.updatePageMetadata(
+          metadataOnlyPageWrites.map((w) => ({ id: w.id, metadata: w.metadata })),
+          scope
+        );
+        pageMetadataRefreshed += metadataOnlyPageWrites.length - missing.length;
+        this.logger.debug(`Refreshed metadata for ${pageMetadataRefreshed} page record(s)`);
+        for (const id of missing) {
+          const write = metadataOnlyPageWrites.find((w) => w.id === id);
+          if (write) pageUpserts.push(write);
+        }
+      }
+
+      if (pageUpserts.length > 0) {
+        this.logger.info(`Upserting ${pageUpserts.length} page summar${pageUpserts.length === 1 ? "y" : "ies"}...`);
+        await this.store.upsertPages(
+          pageUpserts.map((w) => ({ id: w.id, data: w.data, metadata: w.metadata })),
+          scope
+        );
+      }
     }
 
     // --- Deletions, after every upsert has landed ---
