@@ -3,6 +3,7 @@ import type { Request, Response } from "express";
 import type { AddressInfo } from "node:net";
 import { SearchEngine } from "../search/engine";
 import { loadConfig } from "../config/load";
+import { SearchSocketError } from "../errors";
 import type { ResolvedSearchSocketConfig } from "../types";
 import playgroundHtml from "./playground.html";
 
@@ -79,7 +80,7 @@ export async function runPlaygroundServer(
       res.json(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Internal server error";
-      const status = (error as { statusCode?: number }).statusCode ?? 500;
+      const status = error instanceof SearchSocketError ? error.status : 500;
       res.status(status).json({ error: message });
     }
   });

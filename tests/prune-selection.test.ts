@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseRemoteBranches, selectStaleScopes } from "../src/cli/services/prune";
+import {
+  parseRemoteBranches,
+  selectStaleScopes,
+  summarizePruneDeletions
+} from "../src/cli/services/prune";
 import type { ScopeInfo } from "../src/types";
 
 /**
@@ -180,5 +184,33 @@ describe("parseRemoteBranches", () => {
   it("keeps branch names containing slashes", () => {
     const result = parseRemoteBranches("origin/feature/nested\n", ["origin"]);
     expect(result).toEqual(new Set(["feature/nested"]));
+  });
+});
+
+describe("summarizePruneDeletions", () => {
+  it("counts a clean run as fully deleted", () => {
+    const summary = summarizePruneDeletions([{ scopeName: "a" }, { scopeName: "b" }]);
+    expect(summary).toEqual({ attempted: 2, deleted: 2, failed: [] });
+  });
+
+  it("separates failures so the caller can exit non-zero", () => {
+    const summary = summarizePruneDeletions([
+      { scopeName: "a" },
+      { scopeName: "b", error: "429 too many requests" }
+    ]);
+
+    expect(summary.attempted).toBe(2);
+    expect(summary.deleted).toBe(1);
+    expect(summary.failed).toEqual([{ scopeName: "b", error: "429 too many requests" }]);
+  });
+
+  it("reports zero deletions when every scope failed", () => {
+    const summary = summarizePruneDeletions([
+      { scopeName: "a", error: "boom" },
+      { scopeName: "b", error: "boom" }
+    ]);
+
+    expect(summary.deleted).toBe(0);
+    expect(summary.failed).toHaveLength(2);
   });
 });

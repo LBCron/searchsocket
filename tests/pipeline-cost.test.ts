@@ -9,7 +9,7 @@ import type { ResolvedSearchSocketConfig } from "../src/types";
 
 const tempDirs: string[] = [];
 
-function createMockStore(existingHashes = new Map<string, string>()): UpstashSearchStore {
+function createMockStore(existingHashes = new Map<string, { contentHash: string; metadataHash?: string }>()): UpstashSearchStore {
   return {
     upsertChunks: vi.fn().mockResolvedValue(undefined),
     search: vi.fn().mockResolvedValue([]),
@@ -18,7 +18,7 @@ function createMockStore(existingHashes = new Map<string, string>()): UpstashSea
     listScopes: vi.fn().mockResolvedValue([]),
     getContentHashes: vi.fn().mockResolvedValue(existingHashes),
     fetchContentHashesForKeys: vi.fn().mockImplementation(async (keys: string[]) => {
-      const filtered = new Map<string, string>();
+      const filtered = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const k of keys) {
         const v = existingHashes.get(k);
         if (v) filtered.set(k, v);

@@ -128,3 +128,73 @@ export function buildMetaFilterString(
 
   return clauses.join(" AND ");
 }
+
+/**
+ * Serialized-metadata budget for a single vector record, in UTF-8 bytes.
+ *
+ * Upstash documents a 48 KB metadata limit per vector. That is a documented
+ * figure rather than one this project has confirmed against a live index,
+ * which is precisely why it is a named constant: if the real limit turns out
+ * to differ, or a caller wants a safety margin, one edit moves every user of
+ * it instead of a magic number scattered through the write path.
+ */
+export const METADATA_BYTE_BUDGET = 48 * 1024;
+
+/**
+ * `TextEncoder` rather than `Buffer.byteLength`: this module is reachable from
+ * the browser bundle (SearchSocket.svelte imports it) where `Buffer` does not
+ * exist. It is stateless, so a module-level instance is safe to share.
+ */
+const TEXT_ENCODER = new TextEncoder();
+
+/** Length of a string once encoded as UTF-8, in bytes. */
+export function utf8ByteLength(text: string): number {
+  return TEXT_ENCODER.encode(text).length;
+}
+
+/**
+ * Size of a metadata object as it will actually go over the wire.
+ *
+ * Measured from `JSON.stringify` output, not from the field values: JSON
+ * escaping inflates newlines, quotes and control characters, and the braces,
+ * commas and key names are part of the payload the backend counts.
+ */
+export function metadataByteSize(metadata: Record<string, unknown>): number {
+  return utf8ByteLength(JSON.stringify(metadata));
+}
+
+/**
+ * Truncate `text` to at most `maxBytes` UTF-8 bytes, never mid-character.
+ *
+ * Slicing by JavaScript characters is what this replaces: a `.slice()` bounds
+ * UTF-16 code units, so 30,000 CJK characters still weigh ~90,000 bytes. Here
+ * the string is walked a code point at a time, accumulating the UTF-8 width of
+ * each, and the cut lands on a code-point boundary — so a multi-byte character
+ * is kept whole or dropped whole, and an astral character (a surrogate pair in
+ * UTF-16, one four-byte sequence in UTF-8) can never be left half-written.
+ *
+ * The result is a `slice` of the original rather than an encode/decode round
+ * trip, which is not lossless: decoding would silently replace a lone surrogate
+ * with U+FFFD and eat a leading byte-order mark, both of which would change
+ * text the caller never asked to have changed.
+ */
+export function truncateToUtf8Bytes(text: string, maxBytes: number): string {
+  // Floored: a fractional limit would otherwise let the boundary check pass on
+  // a character whose last byte sits past it.
+  const limit = Math.floor(maxBytes);
+  if (limit <= 0) return "";
+
+  let used = 0;
+  let end = 0;
+  // `for...of` iterates code points, so a surrogate pair arrives as one unit.
+  for (const char of text) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    // Matches TextEncoder, which emits the 3-byte replacement character for an
+    // unpaired surrogate — so this stays consistent with utf8ByteLength().
+    const width = codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+    if (used + width > limit) break;
+    used += width;
+    end += char.length;
+  }
+  return end === text.length ? text : text.slice(0, end);
+}

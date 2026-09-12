@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rankHits, findPageWeight } from "../src/search/ranking";
+import { rankHits, rankPageHits, findPageWeight } from "../src/search/ranking";
 import { createDefaultConfig } from "../src/config/defaults";
 import type { PageHit, VectorHit } from "../src/types";
 import type { RankedHit } from "../src/search/ranking";
@@ -376,3 +376,133 @@ function makePageHit(url: string, score: number, overrides?: Partial<PageHit>): 
   };
 }
 
+
+describe("non-ASCII lexical normalization", () => {
+  function boostedConfig() {
+    const config = createDefaultConfig("test");
+    config.ranking.enableAnchorTextBoost = true;
+    return config;
+  }
+
+  // Each case pairs a lower-scoring hit whose title matches with a
+  // higher-scoring hit that does not: the title boost is the only thing that
+  // can flip the order, so it fires only if normalization kept the letters.
+  const titleCases: Array<{ script: string; title: string; query: string }> = [
+    { script: "Japanese", title: "認証ガイド", query: "認証" },
+    { script: "Chinese", title: "身份验证指南", query: "身份验证" },
+    { script: "Cyrillic", title: "Руководство по установке", query: "руководство по установке" },
+    { script: "Greek", title: "Οδηγός Εγκατάστασης", query: "οδηγός" },
+    { script: "Arabic", title: "دليل التثبيت", query: "دليل" },
+    { script: "Hebrew", title: "מדריך התקנה", query: "מדריך" },
+    { script: "accented Latin", title: "Café & Menü!", query: "café menü" }
+  ];
+
+  for (const { script, title, query } of titleCases) {
+    it(`boosts a ${script} title that matches the query`, () => {
+      const hits = [
+        makeHit({ score: 0.7, url: "/match", title }),
+        makeHit({ score: 0.75, url: "/other", title: "About Us" })
+      ];
+
+      const ranked = rankHits(hits, createDefaultConfig("test"), query);
+      expect(ranked[0]?.hit.metadata.url).toBe("/match");
+    });
+  }
+
+  it("still withholds the boost from a non-ASCII title that does not match", () => {
+    const hits = [
+      makeHit({ score: 0.7, url: "/match", title: "認証ガイド" }),
+      makeHit({ score: 0.75, url: "/other", title: "About Us" })
+    ];
+
+    const ranked = rankHits(hits, createDefaultConfig("test"), "料金");
+    expect(ranked[0]?.hit.metadata.url).toBe("/other");
+  });
+
+  it("boosts a Cyrillic anchor text that matches the query", () => {
+    const hits = [
+      makeHit({ score: 0.7, url: "/install", incomingAnchorText: "Установка" }),
+      makeHit({ score: 0.75, url: "/other" })
+    ];
+
+    const ranked = rankHits(hits, boostedConfig(), "установка пакетов");
+    expect(ranked[0]?.hit.metadata.url).toBe("/install");
+  });
+
+  it("matches the composed and decomposed spellings of an accented title", () => {
+    // "Café" written as a precomposed é vs "e" + U+0301 combining acute.
+    const composed = "Caf\u00e9 Guide";
+    const decomposed = "Cafe\u0301 guide";
+    expect(decomposed).not.toBe(decomposed.normalize("NFC"));
+    expect(composed.toLowerCase()).toBe(decomposed.normalize("NFC").toLowerCase());
+
+    const hits = [
+      makeHit({ score: 0.7, url: "/cafe", title: composed }),
+      makeHit({ score: 0.75, url: "/other", title: "About Us" })
+    ];
+
+    const ranked = rankHits(hits, createDefaultConfig("test"), decomposed);
+    expect(ranked[0]?.hit.metadata.url).toBe("/cafe");
+  });
+
+  it("keeps stripping ASCII punctuation, symbols and emoji", () => {
+    const hits = [
+      // The emoji sits between words the query has to span, so a surviving
+      // symbol — or a surviving variation selector — would break the match.
+      makeHit({ score: 0.7, url: "/guide", title: "C++ & Rust ❤️ A Guide: v2" }),
+      makeHit({ score: 0.75, url: "/other", title: "About Us" })
+    ];
+
+    const ranked = rankHits(hits, createDefaultConfig("test"), "c rust a guide v2");
+    expect(ranked[0]?.hit.metadata.url).toBe("/guide");
+  });
+
+  it("no longer boosts a query that only matched the ASCII wreckage of a title", () => {
+    // "Über" used to normalize to "ber", which "cyber security" contains.
+    const hits = [
+      makeHit({ score: 0.7, url: "/uber", title: "Über" }),
+      makeHit({ score: 0.75, url: "/security", title: "About Us" })
+    ];
+
+    const ranked = rankHits(hits, createDefaultConfig("test"), "cyber security");
+    expect(ranked[0]?.hit.metadata.url).toBe("/security");
+  });
+
+  it("folds both spellings of a dakuten kana but keeps it distinct from the plain kana", () => {
+    const composed = "ガイド";
+    const decomposed = "ガイド";
+    expect(decomposed).not.toBe(composed);
+    expect(decomposed.normalize("NFC")).toBe(composed);
+
+    const hits = [
+      makeHit({ score: 0.7, url: "/guide-ja", title: composed }),
+      makeHit({ score: 0.75, url: "/other", title: "About Us" })
+    ];
+
+    const config = createDefaultConfig("test");
+    expect(rankHits(hits, config, decomposed)[0]?.hit.metadata.url).toBe("/guide-ja");
+    // カイド is a different word: folding the dakuten away would match it.
+    expect(rankHits(hits, config, "カイド")[0]?.hit.metadata.url).toBe("/other");
+  });
+
+  it("keeps the combining marks that distinguish Devanagari words", () => {
+    // Both sides collapse to दन if marks are stripped, and the wrong page wins.
+    const hits = [
+      makeHit({ score: 0.7, url: "/din", title: "दिन" }),
+      makeHit({ score: 0.75, url: "/other", title: "About Us" })
+    ];
+
+    const ranked = rankHits(hits, createDefaultConfig("test"), "दान");
+    expect(ranked[0]?.hit.metadata.url).toBe("/other");
+  });
+
+  it("applies the same normalization on the page-first path", () => {
+    const pageHits = [
+      makePageHit("/match", 0.7, { title: "認証ガイド" }),
+      makePageHit("/other", 0.75, { title: "About Us" })
+    ];
+
+    const ranked = rankPageHits(pageHits, createDefaultConfig("test"), "認証");
+    expect(ranked[0]?.url).toBe("/match");
+  });
+});

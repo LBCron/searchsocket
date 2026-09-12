@@ -99,3 +99,31 @@ export function parseRemoteBranches(rawOutput: string, remotes: string[]): Set<s
 
   return names.length === 0 ? null : new Set(names);
 }
+
+/** Outcome of one scope deletion. `error` is set when the backend rejected it. */
+export interface PruneDeletionResult {
+  scopeName: string;
+  error?: string;
+}
+
+export interface PruneDeletionSummary {
+  attempted: number;
+  deleted: number;
+  failed: PruneDeletionResult[];
+}
+
+/**
+ * Fold per-scope deletion outcomes into the counts `prune --apply` reports and
+ * exits on.
+ *
+ * Split out from the command so the "exit 0 even though every deletion failed"
+ * regression is testable without a live backend.
+ */
+export function summarizePruneDeletions(results: PruneDeletionResult[]): PruneDeletionSummary {
+  const failed = results.filter((entry) => entry.error !== undefined);
+  return {
+    attempted: results.length,
+    deleted: results.length - failed.length,
+    failed
+  };
+}

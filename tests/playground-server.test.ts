@@ -77,6 +77,7 @@ vi.mock("../src/playground/playground.html", () => ({
 }));
 
 import { runPlaygroundServer } from "../src/playground/server";
+import { SearchSocketError } from "../src/errors";
 
 describe("runPlaygroundServer", () => {
   it("starts server and registers routes", async () => {
@@ -133,6 +134,44 @@ describe("runPlaygroundServer", () => {
 
     expect(res.status).toHaveBeenCalledWith(400);
     expect(errorJsonFn).toHaveBeenCalledWith({ error: "Missing or empty 'q' field" });
+  });
+
+  it("POST /_searchsocket/search uses SearchSocketError.status, not 500", async () => {
+    // `SearchSocketError` exposes `status`; the handler used to read `statusCode`,
+    // which is undefined on it, so every intended 4xx was reported as a 500.
+    mocks.searchFn.mockRejectedValueOnce(
+      new SearchSocketError("INVALID_REQUEST", "Scope not selectable", 403)
+    );
+
+    await runPlaygroundServer({ cwd: "/tmp", port: 3337 });
+
+    const postHandler = mocks.app.post.mock.calls.find(
+      (call: unknown[]) => call[0] === "/_searchsocket/search"
+    )?.[1] as (req: { body: Record<string, unknown> }, res: { json: (d: unknown) => void; status: (n: number) => { json: (d: unknown) => void } }) => Promise<void>;
+
+    const errorJsonFn = vi.fn();
+    const res = { json: vi.fn(), status: vi.fn(() => ({ json: errorJsonFn })) };
+    await postHandler({ body: { q: "test" } }, res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(errorJsonFn).toHaveBeenCalledWith({ error: "Scope not selectable" });
+  });
+
+  it("POST /_searchsocket/search falls back to 500 for a plain Error", async () => {
+    mocks.searchFn.mockRejectedValueOnce(new Error("boom"));
+
+    await runPlaygroundServer({ cwd: "/tmp", port: 3337 });
+
+    const postHandler = mocks.app.post.mock.calls.find(
+      (call: unknown[]) => call[0] === "/_searchsocket/search"
+    )?.[1] as (req: { body: Record<string, unknown> }, res: { json: (d: unknown) => void; status: (n: number) => { json: (d: unknown) => void } }) => Promise<void>;
+
+    const errorJsonFn = vi.fn();
+    const res = { json: vi.fn(), status: vi.fn(() => ({ json: errorJsonFn })) };
+    await postHandler({ body: { q: "test" } }, res);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(errorJsonFn).toHaveBeenCalledWith({ error: "boom" });
   });
 
   it("GET /_searchsocket/config returns tunable ranking parameters", async () => {

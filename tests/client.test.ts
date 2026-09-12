@@ -146,4 +146,109 @@ describe("createSearchClient", () => {
     expect(body.tags).toEqual(["guides"]);
     expect(body.groupBy).toBe("page");
   });
+
+  it("rejects a JSON null response body", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => null
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
+
+  it("rejects a response whose results is not an array", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: null,
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
+
+  it("rejects a result row that is missing its required fields", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: [{ title: "No url", snippet: "x", score: 1 }],
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
+
+  it("accepts a result row that omits only optional fields", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: [{ url: "/a", title: "A", snippet: "", score: 0 }],
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).resolves.toMatchObject({
+      results: [{ url: "/a" }]
+    });
+  });
+
+  it("rejects a result row that is missing snippet", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: [{ url: "/a", title: "A", score: 1 }],
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    // buildResultUrl() feeds snippet straight into string normalization.
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
+
+  it("rejects a present optional field of the wrong type", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: [{ url: "/a", title: "A", snippet: "x", score: 1, sectionTitle: 42 }],
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
+
+  it("rejects a response missing its envelope fields", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ results: [] })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+  });
 });

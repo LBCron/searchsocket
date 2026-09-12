@@ -10,7 +10,7 @@
 
 3. **Check the Upstash dashboard.** Log into [console.upstash.com](https://console.upstash.com) and verify your Vector index has documents in the correct namespace (`chunks` and `pages`).
 
-4. **Try a broader query.** If you're getting results for some queries but not others, the `minScoreRatio` threshold (default 0.70) may be filtering out low-confidence matches. Lower it temporarily to test:
+4. **Try a broader query.** If a query returns *too few* results rather than none, the `minScoreRatio` threshold (default 0.70) may be trimming the tail. (It cannot produce an empty list: the top-scoring result always survives it.) Lower it temporarily to test:
    ```ts
    ranking: {
      minScoreRatio: 0.5
@@ -41,7 +41,7 @@
   ```svelte
   <script>
     import { afterNavigate } from '$app/navigation';
-    import { searchsocketScrollToText } from 'searchsocket/sveltekit';
+    import { searchsocketScrollToText } from 'searchsocket/scroll';
     afterNavigate(searchsocketScrollToText);
   </script>
   ```
@@ -61,7 +61,7 @@ If you see errors like `Cannot find module 'searchsocket'` during SSR, mark Sear
 export default defineConfig({
   plugins: [sveltekit()],
   ssr: {
-    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client"]
+    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client", "searchsocket/scroll"]
   }
 });
 ```

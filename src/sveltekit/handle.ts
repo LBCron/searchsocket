@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import nodePath from "node:path";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { createDefaultConfig } from "../config/defaults";
 import { loadConfig, mergeConfig } from "../config/load";
+import { Logger } from "../core/logger";
 import { isServerless } from "../core/serverless";
 import { SearchSocketError, toErrorPayload } from "../errors";
 import { createServer as createMcpServer, verifyApiKey } from "../mcp/server";
@@ -14,29 +16,105 @@ interface RateBucket {
   resetAt: number;
 }
 
-class InMemoryRateLimiter {
-  private readonly buckets = new Map<string, RateBucket>();
+/**
+ * Ceiling on distinct client keys the optional in-memory limiter will track.
+ * 10k buckets is a few hundred kilobytes — enough that a real site never hits
+ * it, small enough that a flood of unique addresses cannot grow without bound.
+ */
+const DEFAULT_MAX_RATE_LIMIT_BUCKETS = 10_000;
 
-  constructor(private readonly windowMs: number, private readonly max: number) {}
+/**
+ * Per-process request counter for non-serverless deployments.
+ *
+ * Buckets used to be replaced only when the *same* key came back, so a one-time
+ * visitor's window stayed in the map for the life of the process. Expiry is now
+ * swept once a window and the map has a hard ceiling, because this thing lives
+ * inside a long-running Node server that never gets a chance to forget.
+ *
+ * Deliberately timer-free: a `setInterval` here would hold the event loop open
+ * and would be dead weight on the serverless deployments where the limiter is
+ * disabled anyway.
+ *
+ * Exported for tests only — `src/sveltekit.ts` does not re-export it, so it is
+ * not part of the package's public surface.
+ */
+export class InMemoryRateLimiter {
+  private readonly buckets = new Map<string, RateBucket>();
+  private readonly maxBuckets: number;
+  private lastSweepAt = Date.now();
+
+  constructor(private readonly windowMs: number, private readonly max: number, maxBuckets?: number) {
+    // A non-positive or non-finite ceiling would disable eviction entirely
+    // (every comparison against NaN is false), which is the one thing this
+    // class exists to prevent.
+    this.maxBuckets =
+      typeof maxBuckets === "number" && Number.isFinite(maxBuckets) && maxBuckets >= 1
+        ? Math.floor(maxBuckets)
+        : DEFAULT_MAX_RATE_LIMIT_BUCKETS;
+  }
 
   check(key: string): boolean {
     const now = Date.now();
+
+    if (now - this.lastSweepAt >= this.windowMs) {
+      this.sweep(now);
+    }
+
     const existing = this.buckets.get(key);
 
-    if (!existing || existing.resetAt <= now) {
-      this.buckets.set(key, {
-        count: 1,
-        resetAt: now + this.windowMs
-      });
+    if (existing && existing.resetAt > now) {
+      if (existing.count >= this.max) {
+        return false;
+      }
+
+      existing.count += 1;
       return true;
     }
 
-    if (existing.count >= this.max) {
-      return false;
+    if (existing) {
+      // Re-`set` on an existing key keeps its original position, which would
+      // leave a freshly started window sitting at the head of the eviction
+      // order. Delete first so insertion order stays window-start order.
+      this.buckets.delete(key);
+    } else {
+      this.makeRoom();
     }
 
-    existing.count += 1;
+    this.buckets.set(key, {
+      count: 1,
+      resetAt: now + this.windowMs
+    });
     return true;
+  }
+
+  /** Test/introspection hook: how many client windows are currently held. */
+  get size(): number {
+    return this.buckets.size;
+  }
+
+  private sweep(now: number): void {
+    this.lastSweepAt = now;
+
+    for (const [key, bucket] of this.buckets) {
+      if (bucket.resetAt <= now) {
+        this.buckets.delete(key);
+      }
+    }
+  }
+
+  private makeRoom(): void {
+    // A Map iterates in insertion order and `check` keeps that order equal to
+    // window-start order, so the head is the oldest window — already expired if
+    // anything in the map is. Dropping from the head therefore reclaims dead
+    // buckets before live ones without scanning, which matters because this
+    // runs on every new client once the map is full. Evicting a live window
+    // hands that client a fresh allowance: the honest trade for refusing to
+    // grow, and why this limiter is best-effort rather than authoritative.
+    while (this.buckets.size >= this.maxBuckets) {
+      const oldest = this.buckets.keys().next();
+      if (oldest.done) break;
+      this.buckets.delete(oldest.value);
+    }
   }
 }
 
@@ -45,14 +123,29 @@ export interface SearchSocketHandleOptions {
   cwd?: string;
   path?: string;
   maxBodyBytes?: number;
+  /** Ceiling on tracked clients for the optional in-memory rate limiter. */
+  maxRateLimitBuckets?: number;
   config?: ResolvedSearchSocketConfig;
   rawConfig?: SearchSocketConfig;
 }
 
+/**
+ * The route this hook owns when the deployment does not name one. Taken from
+ * the packaged defaults rather than spelled out again, so the path the hook
+ * claims before the config loads cannot drift from the path the resolved
+ * config would have given it.
+ */
+const DEFAULT_API_PATH = createDefaultConfig("searchsocket").api.path;
+
 export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
   let enginePromise: Promise<SearchEngine> | null = null;
   let configPromise: Promise<ResolvedSearchSocketConfig> | null = null;
-  let apiPath = options.path;
+  // A config supplied inline already names its own api path, so ownership is
+  // exact from the first request rather than falling back to the packaged
+  // default. A path that only a disk load would reveal stays unknowable until
+  // that load succeeds; deployments that move the route should pass
+  // `options.path` so the hook can claim it even when the config is broken.
+  let apiPath = options.path ?? options.config?.api.path ?? options.rawConfig?.api?.path;
   let llmsServePath: string | null = null;
   let serveMarkdownVariants = false;
   let mcpPath: string | undefined;
@@ -61,6 +154,8 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
   let mcpEnableJsonResponse = true;
   let rateLimiter: InMemoryRateLimiter | null = null;
   let notConfigured = false;
+  let configFailureLogged = false;
+  const logger = new Logger({ stderrOnly: true });
 
   const getConfig = async (): Promise<ResolvedSearchSocketConfig> => {
     if (!configPromise) {
@@ -78,7 +173,7 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
         });
       }
 
-      configPromise = configP.then((config) => {
+      const tracked: Promise<ResolvedSearchSocketConfig> = configP.then((config) => {
         apiPath = apiPath ?? config.api.path;
         // `mcp.enable` was documented as the switch for this endpoint but was
         // never read, so the MCP route was mounted regardless — including on
@@ -99,11 +194,29 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
         }
 
         if (config.api.rateLimit && !isServerless()) {
-          rateLimiter = new InMemoryRateLimiter(config.api.rateLimit.windowMs, config.api.rateLimit.max);
+          rateLimiter = new InMemoryRateLimiter(
+            config.api.rateLimit.windowMs,
+            config.api.rateLimit.max,
+            options.maxRateLimitBuckets
+          );
         }
 
         return config;
       });
+
+      // A rejected load must not be memoized for the life of the process: the
+      // usual causes are transient (a config file not deployed yet, a source
+      // directory the next build creates), and the site would stay dark until
+      // it restarted. `getEngine` below already resets itself this way.
+      const retryable: Promise<ResolvedSearchSocketConfig> = tracked.catch((error) => {
+        // Guarded on identity so a later attempt already in flight is not
+        // discarded by an older one failing.
+        if (configPromise === retryable) configPromise = null;
+        throw error;
+      });
+
+      configPromise = retryable;
+      return retryable;
     }
 
     return configPromise;
@@ -143,47 +256,41 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
   const bodyLimit = options.maxBodyBytes ?? 64 * 1024;
 
   return async ({ event, resolve }: { event: any; resolve: (event: any) => Promise<Response> }) => {
-    if (apiPath && !isApiPath(event.url.pathname, apiPath) && event.url.pathname !== llmsServePath) {
-      const isMarkdownVariant = event.request.method === "GET" && event.url.pathname.endsWith(".md");
+    const pathname: string = event.url.pathname;
+    const method: string = event.request.method;
 
-      if (mcpPath && event.url.pathname === mcpPath) {
-        return handleMcpRequest(event, mcpAccess, mcpApiKey, mcpEnableJsonResponse, bodyLimit, getEngine);
-      }
-      if (mcpPath) {
-        // Config loaded and path matches neither endpoint
-        if (serveMarkdownVariants && isMarkdownVariant) {
-          // fall through to main body for markdown variant handling
-        } else {
-          return resolve(event);
-        }
-      } else {
-        // Config not yet loaded, so the MCP path is not known yet. Load it —
-        // getConfig() memoizes, so only the first request pays.
-        //
-        // This used to run only when a config object had been supplied inline.
-        // A deployment that passed just `{ path }` and let the config load from
-        // disk therefore never learned mcpPath, and every MCP request fell
-        // through to the app as an unhandled route.
-        try {
-          await getConfig();
-        } catch {
-          // No usable config: this request is not ours to handle.
-          return resolve(event);
-        }
+    // Ownership of the search API is decided from `options.path` or the
+    // packaged default, so it is known before any configuration is loaded.
+    // This is what keeps a broken config search-scoped: the hook runs in front
+    // of the entire application, and it used to await `getConfig()` on the way
+    // to *every* route, so a project whose config could not be resolved lost
+    // `GET /` along with its search endpoint.
+    const ownsSearchPath = isApiPath(pathname, apiPath ?? DEFAULT_API_PATH);
 
-        if (mcpPath && event.url.pathname === mcpPath) {
-          return handleMcpRequest(event, mcpAccess, mcpApiKey, mcpEnableJsonResponse, bodyLimit, getEngine);
-        }
-        if (!(serveMarkdownVariants && isMarkdownVariant)) {
-          return resolve(event);
-        }
+    let config: ResolvedSearchSocketConfig;
+    try {
+      config = await getConfig();
+    } catch (error) {
+      if (!configFailureLogged) {
+        configFailureLogged = true;
+        logger.warn(
+          `SearchSocket config could not be loaded; search routes will report unavailable: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
       }
+
+      // Every other route — including MCP and markdown variants, whose paths
+      // are only knowable from a config — belongs to the application.
+      if (!ownsSearchPath) {
+        return resolve(event);
+      }
+
+      return searchUnavailableResponse();
     }
 
-    const config = await getConfig();
-
     // Serve llms.txt if enabled and the file exists
-    if (llmsServePath && event.request.method === "GET" && event.url.pathname === llmsServePath) {
+    if (llmsServePath && method === "GET" && pathname === llmsServePath) {
       const cwd = options.cwd ?? process.cwd();
       const filePath = nodePath.resolve(cwd, config.llmsTxt.outputPath);
       try {
@@ -197,11 +304,66 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
       }
     }
 
+    const targetPath = apiPath ?? config.api.path;
+    const isMcpRoute = mcpPath !== undefined && pathname === mcpPath;
+    const isMarkdownVariant = serveMarkdownVariants && method === "GET" && pathname.endsWith(".md");
+    const isApiRoute = isApiPath(pathname, targetPath);
+
+    if (!isMcpRoute && !isMarkdownVariant && !isApiRoute) {
+      return resolve(event);
+    }
+
+    // Preflights are cheap and must succeed for the limited request that
+    // follows to be judged on its own, so they stay ahead of the limiter.
+    if (method === "OPTIONS" && isApiRoute && !isMcpRoute) {
+      return new Response(null, {
+        status: 204,
+        headers: buildCorsHeaders(event.request, config)
+      });
+    }
+
+    // The optional in-memory limiter now covers every route this hook answers
+    // itself — the browser API, the MCP endpoint and the markdown variants —
+    // because all three can make an anonymous caller's request turn into
+    // backend retrieval work. Previously it guarded the browser API alone, so
+    // the two surfaces that are reachable without a key were the two that were
+    // not counted.
+    //
+    // `llms.txt` is deliberately left out: it is one static file read, no more
+    // expensive than any asset the application already serves, and it exists
+    // precisely so that crawlers and agents fetch it.
+    //
+    // The markdown surface is counted before we know whether the page is
+    // indexed, so a `.md` route the application serves itself can be refused
+    // once the limit is reached. That is the deliberate trade: with
+    // `serveMarkdownVariants` on, every `.md` GET already costs an engine
+    // lookup, and leaving the one anonymous surface that does retrieval work
+    // uncounted is worse than occasionally 429-ing a shared path.
+    if (rateLimiter && !rateLimiter.check(clientKey(event))) {
+      if (isMcpRoute) {
+        return mcpErrorResponse(429, -32000, "Rate limit exceeded");
+      }
+
+      return withCors(
+        new Response(
+          JSON.stringify(toErrorPayload(new SearchSocketError("RATE_LIMITED", "Rate limit exceeded", 429))),
+          {
+            status: 429,
+            headers: {
+              "content-type": "application/json"
+            }
+          }
+        ),
+        event.request,
+        config
+      );
+    }
+
     // Serve markdown variant of indexed pages (e.g. /docs/api.md → markdown for /docs/api)
-    if (serveMarkdownVariants && event.request.method === "GET" && event.url.pathname.endsWith(".md")) {
+    if (isMarkdownVariant) {
       let rawPath: string;
       try {
-        rawPath = decodeURIComponent(event.url.pathname.slice(0, -3));
+        rawPath = decodeURIComponent(pathname.slice(0, -3));
       } catch {
         return resolve(event);
       }
@@ -227,47 +389,11 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
     }
 
     // MCP endpoint handling
-    if (mcpPath && event.url.pathname === mcpPath) {
+    if (isMcpRoute) {
       return handleMcpRequest(event, mcpAccess, mcpApiKey, mcpEnableJsonResponse, bodyLimit, getEngine);
     }
-    const targetPath = apiPath ?? config.api.path;
 
-    if (!isApiPath(event.url.pathname, targetPath)) {
-      return resolve(event);
-    }
-
-    const subPath = event.url.pathname.slice(targetPath.length); // "" | "/health" | "/pages/..."
-    const method = event.request.method;
-
-    if (method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: buildCorsHeaders(event.request, config)
-      });
-    }
-
-    if (rateLimiter) {
-      const ip =
-        event.getClientAddress?.() ??
-        event.request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-        "unknown";
-
-      if (!rateLimiter.check(ip)) {
-        return withCors(
-          new Response(
-            JSON.stringify(toErrorPayload(new SearchSocketError("RATE_LIMITED", "Rate limit exceeded", 429))),
-            {
-              status: 429,
-              headers: {
-                "content-type": "application/json"
-              }
-            }
-          ),
-          event.request,
-          config
-        );
-      }
-    }
+    const subPath = pathname.slice(targetPath.length); // "" | "/health" | "/pages/..."
 
     try {
       if (method === "GET") {
@@ -348,6 +474,146 @@ function resolveRequestedScope(
 
 function isApiPath(pathname: string, apiPath: string): boolean {
   return pathname === apiPath || pathname.startsWith(apiPath + "/");
+}
+
+function clientKey(event: any): string {
+  return (
+    event.getClientAddress?.() ??
+    event.request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    "unknown"
+  );
+}
+
+/**
+ * The answer a search route gives when the configuration could not be loaded.
+ *
+ * Fixed wording on purpose: a config failure carries filesystem paths and
+ * environment-variable names, and this route is reachable anonymously. CORS
+ * headers are omitted because the policy that would allow them lives in the
+ * config we just failed to read.
+ */
+function searchUnavailableResponse(): Response {
+  const failure = new SearchSocketError(
+    "SEARCH_NOT_CONFIGURED",
+    "Search is unavailable: the SearchSocket configuration could not be loaded.",
+    503
+  );
+
+  return new Response(JSON.stringify(toErrorPayload(failure)), {
+    status: 503,
+    headers: { "content-type": "application/json", "cache-control": "no-store" }
+  });
+}
+
+function mcpErrorResponse(status: number, code: number, message: string): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code, message },
+      id: null
+    }),
+    { status, headers: { "content-type": "application/json" } }
+  );
+}
+
+/**
+ * Read a request body as JSON without ever holding more than `bodyLimit` bytes.
+ *
+ * A declared `Content-Length` is only a hint: it can be absent (chunked
+ * transfer) or simply untrue, and both cases used to sail past the size check.
+ * So the stream is pulled a chunk at a time and abandoned the moment the byte
+ * count crosses the limit — the bytes already in flight are the most an
+ * oversized request can cost us. Counting bytes rather than characters is what
+ * lets a valid multi-byte UTF-8 body right up against the limit through.
+ *
+ * The fallback exists for request objects that expose no stream — SvelteKit
+ * adapters and test doubles both produce them — where measuring after the fact
+ * is the only option available.
+ */
+async function readBoundedJsonBody(request: any, bodyLimit: number): Promise<unknown> {
+  const tooLarge = () => new SearchSocketError("INVALID_REQUEST", "Request body too large", 413);
+  const malformed = () => new SearchSocketError("INVALID_REQUEST", "Malformed JSON request body", 400);
+
+  const declaredLength = Number(request.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declaredLength) && declaredLength > bodyLimit) {
+    throw tooLarge();
+  }
+
+  const stream: ReadableStream<Uint8Array> | null | undefined = request.body;
+
+  if (stream && typeof stream.getReader === "function") {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let seen = 0;
+    let text = "";
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+
+        seen += value.byteLength;
+        if (seen > bodyLimit) {
+          throw tooLarge();
+        }
+
+        text += decoder.decode(value, { stream: true });
+      }
+
+      text += decoder.decode();
+    } finally {
+      // Whether we finished, gave up on the size, or the client went away, the
+      // stream is done with: cancel discards anything still queued and the
+      // release lets the runtime tear the request down.
+      try {
+        await reader.cancel();
+      } catch {
+        // A stream that already errored or closed cannot be cancelled; nothing
+        // to release in that case either.
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already released.
+      }
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw malformed();
+    }
+  }
+
+  if (typeof request.text === "function") {
+    const rawBody: string = await request.text();
+    if (Buffer.byteLength(rawBody, "utf8") > bodyLimit) {
+      throw tooLarge();
+    }
+
+    try {
+      return JSON.parse(rawBody);
+    } catch {
+      throw malformed();
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = await request.json();
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw malformed();
+    }
+    throw error;
+  }
+
+  if (Buffer.byteLength(JSON.stringify(parsed) ?? "", "utf8") > bodyLimit) {
+    throw tooLarge();
+  }
+
+  return parsed;
 }
 
 async function handleGetSearch(
@@ -481,37 +747,9 @@ async function handlePostSearch(
     );
   }
 
-  const contentLength = Number(event.request.headers.get("content-length") ?? 0);
-  if (contentLength > bodyLimit) {
-    throw new SearchSocketError("INVALID_REQUEST", "Request body too large", 413);
-  }
-
-  let rawBody: string;
-  if (typeof event.request.text === "function") {
-    rawBody = await event.request.text();
-  } else {
-    let parsedFallback: unknown;
-    try {
-      parsedFallback = await event.request.json();
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        throw new SearchSocketError("INVALID_REQUEST", "Malformed JSON request body", 400);
-      }
-      throw error;
-    }
-    rawBody = JSON.stringify(parsedFallback);
-  }
-
-  if (Buffer.byteLength(rawBody, "utf8") > bodyLimit) {
-    throw new SearchSocketError("INVALID_REQUEST", "Request body too large", 413);
-  }
-
-  let body: unknown;
-  try {
-    body = JSON.parse(rawBody);
-  } catch {
-    throw new SearchSocketError("INVALID_REQUEST", "Malformed JSON request body", 400);
-  }
+  // Bounded read: the body used to be buffered in full and only then measured,
+  // so an oversized POST was allocated before it was refused.
+  const body = await readBoundedJsonBody(event.request, bodyLimit);
 
   // Reject a non-object body before touching its fields. `null` is valid JSON,
   // and reading `.scope` off it threw a TypeError that surfaced as a 500 where
@@ -654,23 +892,35 @@ async function handleMcpRequest(
   // the checks above turned a private deployment's 503 into a 413 and told an
   // unauthenticated caller the configured threshold.
   //
-  // The transport owns the body stream — reading it here to measure it would
-  // leave nothing for `handleRequest` — so this bounds the declared length
-  // only, the same first check `handlePostSearch` makes. A client that omits
-  // content-length is not stopped by it; platform limits are the real backstop.
-  // Worth having anyway: until now every caller here had presented a key.
-  const declaredLength = Number(event.request.headers.get("content-length") ?? 0);
-  if (declaredLength > bodyLimit) {
-    return new Response(
-      JSON.stringify({
-        jsonrpc: "2.0",
+  // The transport used to own the body stream, so this could only bound the
+  // *declared* length — a client that omitted content-length was not stopped at
+  // all. The SDK accepts a pre-parsed body (`HandleRequestOptions.parsedBody`,
+  // the same hook Express body-parser middleware uses), so we read the stream
+  // ourselves under a hard byte ceiling and hand the parsed message on. The
+  // transport still sees the original Request for its Accept, Content-Type,
+  // session and protocol-version checks; it simply does not re-read the body.
+  let parsedBody: unknown;
+  // Deliberately the same loose substring test the transport applies, not the
+  // stricter media-type parse `handlePostSearch` uses. Anything narrower leaves
+  // a hole: a content type the transport accepts but we decline to pre-read
+  // (`application/json-patch+json`, say) would go straight to `handleRequest`,
+  // which reads the body itself and is bounded by nothing.
+  const contentType = (event.request.headers.get("content-type") ?? "").toLowerCase();
+
+  // A body the transport will not read either is left to it: it answers a
+  // non-JSON content type with its own 415 before it looks at the body.
+  if (method === "POST" && contentType.includes("application/json")) {
+    try {
+      parsedBody = await readBoundedJsonBody(event.request, bodyLimit);
+    } catch (error) {
+      if (error instanceof SearchSocketError && error.status === 413) {
         // Implementation-defined server error, as used by the 405s above. The
         // request is a structurally valid one, so -32600 would misreport it.
-        error: { code: -32000, message: "Request body too large" },
-        id: null
-      }),
-      { status: 413, headers: { "content-type": "application/json" } }
-    );
+        return mcpErrorResponse(413, -32000, "Request body too large");
+      }
+      // Matches the transport's own wording for an unparseable body.
+      return mcpErrorResponse(400, -32700, "Parse error: Invalid JSON");
+    }
   }
 
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -685,7 +935,10 @@ async function handleMcpRequest(
     server = createMcpServer(engine, { redact: isAnonymous });
 
     await (server as ReturnType<typeof createMcpServer>).connect(transport);
-    const response = await transport.handleRequest(event.request);
+    const response = await transport.handleRequest(
+      event.request,
+      parsedBody === undefined ? undefined : { parsedBody }
+    );
 
     if (enableJsonResponse) {
       // JSON mode: response is complete, clean up immediately

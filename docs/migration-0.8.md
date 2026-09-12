@@ -33,7 +33,7 @@ pnpm searchsocket index --force
 
 # 2. Confirm the new generation is complete and searching correctly.
 pnpm searchsocket status
-pnpm searchsocket search "a query you know the answer to"
+pnpm searchsocket search --q "a query you know the answer to"
 
 # 3. Inspect what the old generation still holds.
 pnpm searchsocket migrate cleanup-legacy
@@ -63,12 +63,13 @@ re-embedded. This is why the migration cannot reuse existing chunk records.
 **Per-page weights now outrank config patterns, and actually affect ranking.**
 A page declaring `searchsocket-weight` (HTML meta) or `searchsocket.weight`
 (frontmatter) uses that value; otherwise `ranking.pageWeights` patterns apply.
-Previously indexing used exactly this precedence but ranking used *only* the
-config patterns, so the two disagreed: a page with `searchsocket-weight="1"`
-matched by a `pageWeights` pattern of `0` was indexed and then hidden at query
-time. It is now returned, consistently with having been indexed. If you were
-relying on `pageWeights` to suppress such pages, set the weight on the page
-itself, or remove the page-level weight so the pattern applies.
+Previously indexing used a per-page precedence but ranking used *only* the
+config patterns, so the two disagreed. They now agree, and they agree on a
+**zero veto**: a `0` from *either* source suppresses the page, at index time and
+at query time alike. A config `pageWeights` pattern of `0` is an operator-level
+veto that page markup cannot override, so `searchsocket-weight="1"` does not
+rescue a page a `0` pattern matches. Above zero, the page's own weight is the
+more specific statement and wins.
 
 For the same reason, a non-zero per-page weight now changes ranking. It was read
 at index time only to drop zero-weight pages, so a page asking to rank higher
@@ -98,6 +99,19 @@ replacement rather than being silently ignored:
 
 The same keys are also rejected in `rankingOverrides` on a search request, which
 previously stripped them silently.
+
+**Removed after 0.8 — the rest of the `embedding` section.** These went the same way,
+in a later release, and produce the same migration error (which links here). There is
+now no `embedding` config section at all:
+
+| Removed | Use instead |
+| --- | --- |
+| `embedding.model` | nothing — the model belongs to the Upstash index and is chosen when you create it |
+| `embedding.dimensions` | nothing — dimensions follow from that model; SearchSocket never generates an embedding itself |
+| `embedding.taskType` | nothing — Upstash-hosted embedding takes no task-type parameter |
+
+To change embedding model, create a new Upstash Vector index with it, point
+`upstash.url`/`upstash.token` at that index, and reindex.
 
 **The MCP endpoint now requires an API key, and `mcp.enable` is honoured.**
 Two changes, both of which can take a working deployment offline if ignored:

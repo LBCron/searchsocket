@@ -233,3 +233,140 @@ describe("route mapper - deeply nested", () => {
     );
   });
 });
+
+describe("route mapper - root routes", () => {
+  it("maps / to the root page exactly, not via the fallback", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/+page.svelte",
+      "src/routes/docs/+page.svelte"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/", patterns)).toEqual({
+      routeFile: "src/routes/+page.svelte",
+      routeResolution: "exact"
+    });
+  });
+
+  it("maps / to a grouped root page exactly", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/(marketing)/+page.svelte",
+      "src/routes/(app)/dashboard/+page.svelte"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/", patterns)).toEqual({
+      routeFile: "src/routes/(marketing)/+page.svelte",
+      routeResolution: "exact"
+    });
+    expect(mapUrlToRoute("/dashboard", patterns)).toEqual({
+      routeFile: "src/routes/(app)/dashboard/+page.svelte",
+      routeResolution: "exact"
+    });
+  });
+
+  it("still classifies unmatched urls as best-effort against the root file", async () => {
+    const cwd = await makeTempProject(["src/routes/+page.svelte"]);
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/docs/orphan", patterns)).toEqual({
+      routeFile: "src/routes/+page.svelte",
+      routeResolution: "best-effort"
+    });
+  });
+
+  it("falls back to a grouped root file when nothing matches", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/(marketing)/+page.svelte",
+      "src/routes/about/+page.svelte"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/docs/orphan", patterns)).toEqual({
+      routeFile: "src/routes/(marketing)/+page.svelte",
+      routeResolution: "best-effort"
+    });
+  });
+});
+
+describe("route mapper - markdown page routes", () => {
+  it("discovers mdsvex +page.md and +page.svx routes", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/+page.svelte",
+      "src/routes/guides/intro/+page.md",
+      "src/routes/notes/+page.svx"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/guides/intro", patterns)).toEqual({
+      routeFile: "src/routes/guides/intro/+page.md",
+      routeResolution: "exact"
+    });
+    expect(mapUrlToRoute("/notes", patterns)).toEqual({
+      routeFile: "src/routes/notes/+page.svx",
+      routeResolution: "exact"
+    });
+  });
+
+  it("maps a markdown root page exactly", async () => {
+    const cwd = await makeTempProject(["src/routes/+page.md"]);
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/", patterns)).toEqual({
+      routeFile: "src/routes/+page.md",
+      routeResolution: "exact"
+    });
+  });
+
+  it("prefers a svelte root over a grouped markdown root", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/+page.svelte",
+      "src/routes/(marketing)/+page.md"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/", patterns)).toEqual({
+      routeFile: "src/routes/+page.svelte",
+      routeResolution: "exact"
+    });
+    expect(mapUrlToRoute("/orphan", patterns)).toEqual({
+      routeFile: "src/routes/+page.svelte",
+      routeResolution: "best-effort"
+    });
+  });
+
+  it("prefers +page.svelte when a directory holds both page files", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/docs/+page.svelte",
+      "src/routes/docs/+page.md"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    expect(mapUrlToRoute("/docs", patterns)).toEqual({
+      routeFile: "src/routes/docs/+page.svelte",
+      routeResolution: "exact"
+    });
+  });
+});
+
+describe("route mapper - classification of param routes", () => {
+  it("classifies optional and rest routes as exact, not best-effort", async () => {
+    const cwd = await makeTempProject([
+      "src/routes/+page.svelte",
+      "src/routes/lang/[[locale]]/+page.svelte",
+      "src/routes/files/[...rest]/+page.svelte"
+    ]);
+
+    const patterns = await buildRoutePatterns(cwd);
+
+    for (const url of ["/", "/lang", "/lang/en", "/files/a/b/c"]) {
+      expect(mapUrlToRoute(url, patterns).routeResolution).toBe("exact");
+    }
+  });
+});

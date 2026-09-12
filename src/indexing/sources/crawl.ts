@@ -3,8 +3,15 @@ import { load as cheerioLoad } from "cheerio";
 import pLimit from "p-limit";
 import { Logger } from "../../core/logger";
 import type { PageSourceRecord, ResolvedSearchSocketConfig } from "../../types";
+import { boundedFetch, DEFAULT_MAX_RESPONSE_BYTES } from "../../utils/fetch";
 import { ensureLeadingSlash, joinUrl, normalizeUrlPath } from "../../utils/path";
-import { applyMaxPages, sourceResult, type SourceFailure, type SourceLoadResult } from "./result";
+import {
+  applyMaxPages,
+  sourceResult,
+  type SourceFailure,
+  type SourceLimitReason,
+  type SourceLoadResult
+} from "./result";
 
 const logger = new Logger();
 
@@ -25,122 +32,18 @@ function isSitemapIndex(xml: string): boolean {
   return $("sitemapindex").length > 0;
 }
 
-
-/** Wall-clock limit for a single request, so a hung server cannot stall a run. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** Largest response body accepted, so one huge document cannot exhaust memory. */
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 /** Bounds a sitemap-index fan-out, including a maliciously deep or wide one. */
 const MAX_SITEMAPS = 50;
 
-const USER_AGENT = "Searchsocket";
-
-/**
- * Fetch with a timeout, a size cap, and a same-origin redirect policy.
- *
- * Plain `fetch()` follows redirects anywhere, so a sitemap entry — content the
- * crawler does not control — could redirect the crawl to an internal address
- * and have the response indexed. Redirects are followed manually and only
- * within the site's own origin.
- */
-/**
- * Read a response body, aborting as soon as it exceeds the size cap.
- *
- * Buffering the whole body first and checking afterwards means an unbounded
- * response is fully allocated before it is rejected.
- */
-async function readBounded(response: Response, url: string): Promise<Buffer> {
-  if (!response.body) return Buffer.from(await response.arrayBuffer());
-
-  const reader = response.body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) {
-        throw new Error(`Response from ${url} exceeds ${MAX_RESPONSE_BYTES} bytes`);
-      }
-      chunks.push(Buffer.from(value));
-    }
-  } finally {
-    reader.releaseLock();
-    await response.body.cancel().catch(() => {});
-  }
-
-  return Buffer.concat(chunks, total);
-}
-
-async function safeFetch(
-  url: string,
-  allowedOrigin: string,
-  accept: string
-): Promise<{ body: Buffer; contentType: string }> {
-  let current = url;
-
-  for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const target = new URL(current);
-    if (target.origin !== allowedOrigin) {
-      throw new Error(`Refusing to fetch ${target.origin}: outside the configured crawl origin`);
-    }
-    if (target.protocol !== "http:" && target.protocol !== "https:") {
-      throw new Error(`Unsupported scheme ${target.protocol}`);
-    }
-
-    const controller = new AbortController();
-    // The timer stays armed until the body has been read. Clearing it as soon
-    // as headers arrived meant a server could answer within the timeout and
-    // then trickle the body forever, stalling the run indefinitely.
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-    try {
-      const response = await fetch(current, {
-        redirect: "manual",
-        signal: controller.signal,
-        headers: { "user-agent": USER_AGENT, accept }
-      });
-
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get("location");
-        // Discard the redirect body rather than leaving the socket open.
-        await response.body?.cancel();
-        if (!location) throw new Error(`Redirect from ${current} had no Location header`);
-        current = new URL(location, current).href;
-        continue;
-      }
-
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new Error(`Failed to fetch ${current}: ${response.status} ${response.statusText}`);
-      }
-
-      // An early rejection for honest servers only; Content-Length is supplied
-      // by the peer and may be absent or wrong, so it is not the real bound.
-      const declaredLength = Number(response.headers.get("content-length") ?? 0);
-      if (declaredLength > MAX_RESPONSE_BYTES) {
-        await response.body?.cancel();
-        throw new Error(`Response from ${current} exceeds ${MAX_RESPONSE_BYTES} bytes`);
-      }
-
-      const body = await readBounded(response, current);
-      return { body, contentType: response.headers.get("content-type") ?? "" };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  throw new Error(`Too many redirects fetching ${url}`);
-}
-
 async function fetchSitemapXml(url: string, allowedOrigin: string): Promise<string> {
-  const { body } = await safeFetch(url, allowedOrigin, "application/xml,text/xml");
+  const { body } = await boundedFetch(url, {
+    allowedOrigin,
+    accept: "application/xml,text/xml"
+  });
 
   if (url.endsWith(".gz")) {
     // Without an output cap a sub-10MB gzip sitemap can expand without bound.
-    return gunzipSync(body, { maxOutputLength: MAX_RESPONSE_BYTES }).toString("utf8");
+    return gunzipSync(body, { maxOutputLength: DEFAULT_MAX_RESPONSE_BYTES }).toString("utf8");
   }
 
   return body.toString("utf8");
@@ -150,48 +53,103 @@ function resolveSitemapUrl(baseUrl: string, candidate: string): string {
   return candidate.startsWith("http") ? candidate : joinUrl(baseUrl, candidate);
 }
 
-async function parseSitemap(xml: string, baseUrl: string, visitedSitemaps: Set<string>): Promise<string[]> {
+/**
+ * A sitemap traversal's routes plus every reason it fell short of the full
+ * inventory.
+ *
+ * The recursion used to return a bare `string[]`, so a fan-out stopped by
+ * `MAX_SITEMAPS` was indistinguishable from a genuinely small site: the run
+ * reported `complete: true` and the pipeline deleted every page past the cap.
+ */
+interface SitemapTraversal {
+  routes: string[];
+  limitedBy?: SourceLimitReason;
+  failures: SourceFailure[];
+}
+
+async function parseSitemap(
+  xml: string,
+  baseUrl: string,
+  visitedSitemaps: Set<string>
+): Promise<SitemapTraversal> {
   if (isSitemapIndex(xml)) {
     const childUrls = extractLocs(xml);
     const routes: string[] = [];
+    const failures: SourceFailure[] = [];
+    let limitedBy: SourceLimitReason | undefined;
 
     for (const childUrl of childUrls) {
-      const childRoutes = await parseSitemapFromUrl(childUrl, baseUrl, visitedSitemaps);
-      routes.push(...childRoutes);
+      let child: SitemapTraversal;
+      try {
+        child = await parseSitemapFromUrl(childUrl, baseUrl, visitedSitemaps);
+      } catch (error) {
+        // A child sitemap we could not read covers an unknown slice of the
+        // site, not an empty one. Aborting the whole run is too harsh and
+        // dropping it silently would present a shrunken inventory as
+        // authoritative, so record it and keep going.
+        const reason = error instanceof Error ? error.message : String(error);
+        failures.push({ target: resolveSitemapUrl(baseUrl, childUrl), reason });
+        logger.warn(`Skipping child sitemap ${childUrl}: ${reason}`);
+        continue;
+      }
+
+      routes.push(...child.routes);
+      failures.push(...child.failures);
+      limitedBy ??= child.limitedBy;
     }
 
-    return [...new Set(routes)];
+    return {
+      routes: [...new Set(routes)],
+      failures,
+      ...(limitedBy ? { limitedBy } : {})
+    };
   }
 
   const locs = extractLocs(xml);
   const routes: string[] = [];
+  const failures: SourceFailure[] = [];
 
   for (const loc of locs) {
+    let parsed: URL;
     try {
-      const parsed = loc.startsWith("http://") || loc.startsWith("https://")
+      parsed = loc.startsWith("http://") || loc.startsWith("https://")
         ? new URL(loc)
         : new URL(loc, baseUrl);
-      if (!["http:", "https:"].includes(parsed.protocol)) {
-        continue;
-      }
-      routes.push(normalizeUrlPath(parsed.pathname));
     } catch {
-      // ignore invalid entry
+      // An entry we cannot parse names a page we cannot rule out, so it is a
+      // hole in the inventory rather than something to drop quietly.
+      failures.push({ target: loc, reason: "Unparseable sitemap <loc> entry" });
+      continue;
     }
+
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      // A mailto:/ftp: entry is not an indexable page of this site, so its
+      // absence is a deliberate skip and not a gap in the inventory.
+      logger.debug(`Ignoring non-http(s) sitemap entry ${loc}`);
+      continue;
+    }
+
+    routes.push(normalizeUrlPath(parsed.pathname));
   }
 
-  return [...new Set(routes)];
+  return { routes: [...new Set(routes)], failures };
 }
 
-async function parseSitemapFromUrl(url: string, baseUrl: string, visitedSitemaps: Set<string>): Promise<string[]> {
+async function parseSitemapFromUrl(
+  url: string,
+  baseUrl: string,
+  visitedSitemaps: Set<string>
+): Promise<SitemapTraversal> {
   const resolved = resolveSitemapUrl(baseUrl, url);
   if (visitedSitemaps.has(resolved)) {
-    return [];
+    return { routes: [], failures: [] };
   }
 
   if (visitedSitemaps.size >= MAX_SITEMAPS) {
+    // The cap counts the root index too, so a root listing 50 children reaches
+    // only 49 of them. Whatever is behind the skipped sitemaps was never seen.
     logger.warn(`Sitemap limit of ${MAX_SITEMAPS} reached; skipping ${resolved}`);
-    return [];
+    return { routes: [], failures: [], limitedBy: "max-sitemaps" };
   }
 
   visitedSitemaps.add(resolved);
@@ -199,20 +157,25 @@ async function parseSitemapFromUrl(url: string, baseUrl: string, visitedSitemaps
   return parseSitemap(xml, baseUrl, visitedSitemaps);
 }
 
-async function resolveRoutes(config: ResolvedSearchSocketConfig): Promise<string[]> {
+async function resolveRoutes(config: ResolvedSearchSocketConfig): Promise<SitemapTraversal> {
   const crawlConfig = config.source.crawl;
   if (!crawlConfig) {
-    return [];
+    return { routes: [], failures: [] };
   }
 
   if (crawlConfig.routes.length > 0) {
-    return [...new Set(crawlConfig.routes.map((route) => normalizeUrlPath(ensureLeadingSlash(route))))];
+    return {
+      routes: [...new Set(crawlConfig.routes.map((route) => normalizeUrlPath(ensureLeadingSlash(route))))],
+      failures: []
+    };
   }
 
   if (!crawlConfig.sitemapUrl) {
-    return ["/"];
+    return { routes: ["/"], failures: [] };
   }
 
+  // The configured root sitemap is the run's whole inventory: if it cannot be
+  // read there is nothing to fall back to, so that failure still propagates.
   return parseSitemapFromUrl(crawlConfig.sitemapUrl, crawlConfig.baseUrl, new Set<string>());
 }
 
@@ -226,17 +189,24 @@ export async function loadCrawledPages(
   }
 
   const baseOrigin = new URL(crawlConfig.baseUrl).origin;
-  const routes = await resolveRoutes(config);
+  const discovery = await resolveRoutes(config);
+  const routes = discovery.routes;
   // Deterministic order before limiting — see static-output for why.
   routes.sort();
-  const { selected, limitedBy } = applyMaxPages(routes, maxPages);
+  const { selected, limitedBy: pageLimit } = applyMaxPages(routes, maxPages);
+  // Discovery truncation outranks --max-pages: it means `discoveredCount` may
+  // itself understate the site, which is the more useful thing to report.
+  const limitedBy = discovery.limitedBy ?? pageLimit;
 
   const concurrencyLimit = pLimit(8);
   const results = await Promise.allSettled(
     selected.map((route) =>
       concurrencyLimit(async (): Promise<PageSourceRecord> => {
         const url = joinUrl(crawlConfig.baseUrl, route);
-        const { body, contentType } = await safeFetch(url, baseOrigin, "text/html");
+        const { body, contentType } = await boundedFetch(url, {
+          allowedOrigin: baseOrigin,
+          accept: "text/html"
+        });
 
         const mediaType = contentType.split(";")[0]!.trim().toLowerCase();
         if (mediaType && mediaType !== "text/html" && mediaType !== "application/xhtml+xml") {
@@ -254,7 +224,7 @@ export async function loadCrawledPages(
   );
 
   const pages: PageSourceRecord[] = [];
-  const failures: SourceFailure[] = [];
+  const failures: SourceFailure[] = [...discovery.failures];
   for (let i = 0; i < results.length; i += 1) {
     const result = results[i];
     if (!result) continue;

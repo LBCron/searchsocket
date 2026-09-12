@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { reciprocalRank, mrr } from "../src/search/quality-metrics";
+import { reciprocalRank, mrr, mrrReport } from "../src/search/quality-metrics";
 import { testCaseSchema, testFileSchema } from "../src/cli/test-schemas";
 import type { SearchResult } from "../src/types";
 
@@ -196,24 +196,64 @@ describe("MRR computation", () => {
     // inTop5 test — contributes to MRR
     mrrData.push({ results: [makeResult("/x"), makeResult("/y")], relevant: ["/y"] });
 
-    // maxResults test — NOT pushed (CLI only pushes topResult and inTop5)
+    // maxResults test — NOT pushed: a case with no URL expectation carries no
+    // relevance observation.
 
     const mrrValue = mrr(mrrData);
     expect(mrrValue).toBe(0.75);
   });
 
-  it("handles a test case with both topResult and inTop5 as two MRR entries", () => {
+  it("folds a case asserting both topResult and inTop5 into one entry", () => {
     const mrrData: Array<{ results: SearchResult[]; relevant: string[] }> = [];
     const results = [makeResult("/a"), makeResult("/b"), makeResult("/c")];
 
-    // topResult assertion
-    mrrData.push({ results, relevant: ["/a"] });
+    // The CLI used to push one entry per assertion here, which weighted this
+    // single query twice. It now pushes the union once.
+    mrrData.push({ results, relevant: ["/a", "/b", "/c"] });
 
-    // inTop5 assertion
-    mrrData.push({ results, relevant: ["/b", "/c"] });
+    expect(mrr(mrrData)).toBe(1);
+  });
+});
 
-    const mrrValue = mrr(mrrData);
-    // (1/1 + 1/2) / 2 = 0.75
-    expect(mrrValue).toBe(0.75);
+// ── MRR aggregation semantics (the `test` command's reporting) ──────────────
+
+describe("mrrReport", () => {
+  it("weights every query once, however many assertions it carries", () => {
+    // The audit's worked example: a case asserting both topResult and inTop5 on
+    // one query used to push two observations, giving (1 + 1 + 0.1) / 3 = 0.70.
+    const bothAssertions = [makeResult("/a"), makeResult("/b")];
+    const tenth = Array.from({ length: 10 }, (_, i) => makeResult(`/x${i}`));
+    tenth[9] = makeResult("/target");
+
+    const report = mrrReport([
+      { results: bothAssertions, relevant: ["/a", "/b"] },
+      { results: tenth, relevant: ["/target"] }
+    ]);
+
+    expect(report.scored).toBe(2);
+    expect(report.score).toBeCloseTo((1 + 0.1) / 2, 10);
+  });
+
+  it("scores a combined assertion by its best-ranked expected URL", () => {
+    const results = [makeResult("/a"), makeResult("/b"), makeResult("/c")];
+    expect(mrrReport([{ results, relevant: ["/c", "/b"] }]).score).toBe(0.5);
+  });
+
+  it("is complete when every query was retrieved", () => {
+    const report = mrrReport([{ results: [makeResult("/a")], relevant: ["/a"] }]);
+    expect(report).toEqual({ score: 1, scored: 1, unscored: 0, complete: true });
+  });
+
+  it("marks the aggregate incomplete rather than letting errors inflate it", () => {
+    const report = mrrReport([{ results: [makeResult("/a")], relevant: ["/a"] }], 3);
+
+    expect(report.score).toBe(1);
+    expect(report.scored).toBe(1);
+    expect(report.unscored).toBe(3);
+    expect(report.complete).toBe(false);
+  });
+
+  it("reports a zero score for an empty sample", () => {
+    expect(mrrReport([], 2)).toEqual({ score: 0, scored: 0, unscored: 2, complete: false });
   });
 });

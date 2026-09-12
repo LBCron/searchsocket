@@ -133,7 +133,8 @@ Parameters:
 - `query` (string, required) — search query
 - `scope` (string) — index scope
 - `topK` (number, 1-100) — max results
-- `pathPrefix` (string) — filter by URL prefix (e.g. `"/docs"`)
+- `pathPrefix` (string) — filter to a path segment and its subtree (e.g. `"/docs"`, which
+  matches `/docs` and `/docs/api` but not `/docsmith`)
 - `tags` (string[]) — filter by tags
 - `filters` (object) — structured metadata filters (e.g. `{"version": 2}`).
   Values may not contain a quote or backslash; Upstash's filter syntax defines

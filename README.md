@@ -22,11 +22,11 @@ SearchSocket extracts content from your SvelteKit site, converts it to markdown,
 
 ## Features
 
-- **Semantic + keyword search** — Upstash Vector handles hybrid search with built-in reranking and input enrichment
+- **Semantic + keyword search** — an Upstash Vector hybrid index runs the dense and sparse queries and fuses their rankings with DBSF. There is no separate reranking model and no query-enrichment step
 - **Page-first search** — pages are ranked first, then the best-matching sections within the top pages are attached as sub-results
 - **Scroll-to-text** — auto-scroll to the matching section when a user clicks a search result, with CSS Highlight API and Text Fragment support
 - **SvelteKit integration** — server hook for the search API, Vite plugin for build-triggered indexing
-- **Svelte 5 components** — reactive `createSearch` store and `<SearchSocket>` metadata component
+- **Svelte 5 components** — reactive `createSearch` store and `<SearchSocket>` metadata component (Svelte 5.20 or newer)
 - **MCP server** — three tools for Claude Code, Claude Desktop, and other MCP clients (stdio + HTTP)
 - **llms.txt generation** — auto-generate LLM-friendly site indexes during indexing
 - **Four source modes** — index from static output, build manifest, a running server, or raw markdown files
@@ -87,6 +87,36 @@ export const handle = searchsocketHandle();
 
 This exposes `POST /api/search`, `GET /api/search/health`, the MCP endpoint at `/api/mcp`, and page retrieval routes.
 
+`searchsocket/sveltekit` is **server-only**. It pulls in the indexing pipeline, the MCP
+SDK, and Node builtins (`fs/promises`, `child_process`, `crypto`, `net`, `zlib`), so
+importing it from browser code fails the Vite browser build on `createRequire`. The
+browser-safe entry points are `searchsocket/client` (the search client) and
+`searchsocket/scroll` (`searchsocketScrollToText`); neither imports a Node builtin.
+
+If your app already exports a `handle`, compose the two with `sequence()` and keep
+**your** handle first:
+
+```ts
+// src/hooks.server.ts
+import { sequence } from "@sveltejs/kit/hooks";
+import { searchsocketHandle } from "searchsocket/sveltekit";
+
+export const handle = sequence(yourExistingHandle, searchsocketHandle());
+```
+
+Order matters. `searchsocketHandle()` answers its own endpoints without calling
+`resolve()`, so anything sequenced after it never sees those requests. With your
+handle outer, every SearchSocket route passes through your auth, logging and header
+middleware first — which also means a handle that short-circuits a request blocks
+the search API, the MCP endpoint, CORS preflight, `GET /api/search/health` and
+`llms.txt` along with it. Exempt those paths in your own handle if that is not what
+you want.
+
+`searchsocket init` writes this composition for a fresh install. On an existing
+install it does **not**: if `hooks.server.ts` already mentions `searchsocketHandle`
+it reports "already present" and changes nothing, so an install that has the two
+handles in the wrong order has to be reordered by hand.
+
 If you run into SSR bundling issues, mark SearchSocket as external in your Vite config:
 
 ```ts
@@ -94,7 +124,7 @@ If you run into SSR bundling issues, mark SearchSocket as external in your Vite 
 export default defineConfig({
   plugins: [sveltekit()],
   ssr: {
-    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client"]
+    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client", "searchsocket/scroll"]
   }
 });
 ```
@@ -105,15 +135,17 @@ Copy the search dialog template into your project:
 
 ```bash
 pnpm searchsocket add search-dialog
+pnpm searchsocket add search-trigger
 ```
 
-This copies a styled Svelte 5 command palette into `src/lib/components/search/`, alongside its stylesheet and helpers. It needs no CSS framework — Tailwind optional — and follows your app's light/dark theme by default. Import it in your layout and add the scroll-to-text handler:
+`add` copies one component per invocation, so the trigger button used below needs its
+own command. This copies a styled Svelte 5 command palette (the templates use `$props.id()`, so they need Svelte 5.20 or newer) into `src/lib/components/search/`, alongside its stylesheet and helpers. It needs no CSS framework — Tailwind optional — and follows your app's light/dark theme by default. Import it in your layout and add the scroll-to-text handler:
 
 ```svelte
 <!-- src/routes/+layout.svelte -->
 <script>
   import { afterNavigate } from "$app/navigation";
-  import { searchsocketScrollToText } from "searchsocket/sveltekit";
+  import { searchsocketScrollToText } from "searchsocket/scroll";
   import SearchDialog from "$lib/components/search/SearchDialog.svelte";
   import SearchTrigger from "$lib/components/search/SearchTrigger.svelte";
 
@@ -309,6 +341,22 @@ export default {
 };
 ```
 
+Raw `.svelte` files are read as source, never rendered, so exclusion signals are read
+statically. A `<SearchSocket noindex />`, an `ignore` attribute, or `weight={0}` with a
+literal value is honoured. When a recognised protective signal is present but
+**not** statically decidable — the value is an expression, the element sits inside an
+`{#if}`, or the props are spread over an element the scanner can tie to a protective
+attribute — the page is **withheld** and a warning is logged. Reading an undecidable
+protective signal as "false" would publish a page someone asked to hold back, so the
+strict direction is deliberate.
+
+Known gaps, all pinned by tests: content inside `{@html}` and `{@render}` is not
+extracted; signals in a `+layout.svelte` do not propagate to the pages beneath it; a
+conditional or expression-valued `data-search-ignore` drops that subtree without
+withholding the page; and a spread that hides a protective attribute the scanner cannot
+see in the source text is not detected. Use the `static-output` or `build` source mode
+when a page's exclusion depends on anything computed at runtime.
+
 ## Client Library
 
 ### `createSearchClient(options?)`
@@ -459,7 +507,7 @@ Add the scroll handler to your root layout:
 <!-- src/routes/+layout.svelte -->
 <script>
   import { afterNavigate } from '$app/navigation';
-  import { searchsocketScrollToText } from 'searchsocket/sveltekit';
+  import { searchsocketScrollToText } from 'searchsocket/scroll';
 
   afterNavigate(searchsocketScrollToText);
 </script>
@@ -477,7 +525,7 @@ Add the scroll handler to your root layout:
 The highlight fades after 2 seconds. Customize with CSS:
 
 ```css
-::highlight(ssk-highlight) {
+::highlight(ssk-search-match) {
   background-color: rgba(250, 204, 21, 0.4);
 }
 ```
@@ -513,14 +561,17 @@ export default {
     enableFreshnessBoost: false,      // boost recently published content
     enableAnchorTextBoost: false,     // boost pages whose link text matches the query
 
-    pageWeights: {                    // per-URL score multipliers (prefix matching)
+    pageWeights: {                    // per-URL score multipliers. Patterns, not raw
+                                      // prefixes: "/docs" is an exact match, "/docs/*"
+                                      // is one level down, "/docs/**" is the subtree
       "/": 0.95,
       "/docs": 1.15,
       "/download": 1.05
     },
 
-    minScoreRatio: 0.70,             // drop results below 70% of best score
-    scoreGapThreshold: 0.4,          // trim results >40% below best
+    minScoreRatio: 0.70,             // drop results scoring below 70% of the top result
+    scoreGapThreshold: 0.4,          // page mode only: cut the list at the first
+                                     // adjacent pair whose score drops 40% or more
 
     weights: {
       incomingLinks: 0.05,
@@ -553,6 +604,20 @@ export default {
     })
   ]
 };
+```
+
+By default the plugin skips indexing with a warning when no Upstash credentials are
+configured, so a contributor without secrets can still run a build. On a deploy build
+that is usually the wrong trade — the site ships with a stale index and nothing fails.
+Pass `allowUnconfigured: false` to turn the missing backend into a build failure. It only
+bites when auto-indexing actually runs — the SSR build pass, with `enabled: true` or
+`SEARCHSOCKET_AUTO_INDEX` set — so a deploy build usually wants both:
+
+```ts
+searchsocketVitePlugin({
+  enabled: true,             // or set SEARCHSOCKET_AUTO_INDEX=1 in the deploy env
+  allowUnconfigured: false   // fail the build instead of skipping indexing
+})
 ```
 
 ### Vercel / Cloudflare / Netlify
@@ -751,7 +816,19 @@ export default {
 };
 ```
 
-After indexing, `llms.txt` (page index with links) and `llms-full.txt` (full content) are written to your static directory and served by `searchsocketHandle()`.
+After indexing, `llms.txt` (page index with links) and `llms-full.txt` (full content) are written to your static directory. `searchsocketHandle()` serves the file at `llmsTxt.outputPath` directly; `llms-full.txt` has no handler of its own and is served as a static asset, so it has to be in the deployed output. If your adapter copies `static/` before indexing runs, generate these ahead of the adapter step or serve them from your own route.
+
+These are published artifacts with no second copy to recover from, so they are only
+replaced by a run that held the **complete** page list. A truncated crawl, a failed
+extraction, or a refused deletion plan leaves the existing files alone and logs the
+reason. A chunk limit does not freeze them — it truncates no pages.
+
+There is one sharp edge worth knowing about. If the index holds custom records and a
+run is not passed `customRecords`, those pages are absent from the run's page list even
+though they are still in the index, so publishing would silently drop them from the
+public list. The exports are therefore left as they are, and the warning says exactly
+that: pass `customRecords` to refresh them. Passing `customRecords: []` explicitly
+asserts there are none.
 
 ## CLI Commands
 
@@ -774,7 +851,7 @@ pnpm searchsocket index --force            # full re-index
 pnpm searchsocket index --source build     # override source mode
 pnpm searchsocket index --scope staging    # override scope
 pnpm searchsocket index --dry-run          # preview without writing
-pnpm searchsocket index --max-pages 10     # limit for testing (never deletes)
+pnpm searchsocket index --max-pages 10     # limit for testing (no deletions when it truncates)
 pnpm searchsocket index --verbose          # detailed output
 pnpm searchsocket index --json             # machine-readable output
 ```
@@ -797,6 +874,38 @@ pnpm searchsocket index --allow-empty
 # The run would remove more than indexing.maxDeletionRatio (default 50%)
 pnpm searchsocket index --accept-large-deletion
 ```
+
+When the **ratio** guard refuses a run, the run writes **nothing** — not the deletions
+and not the additions either. Withholding only the deletions used to leave
+the replacement records written, which enlarged the inventory the ratio is measured
+against; an identical rerun then saw the same stale records as a smaller fraction and
+deleted them without `--accept-large-deletion` ever being supplied. Refusing the whole
+mutation is what keeps a refused plan refused however often you repeat it, and leaves
+the index exactly as it was last accepted. The empty-source guard is narrower: it stops
+deletions but still writes the run's additions, because an empty site source is a source
+problem rather than a plan whose arithmetic a retry could game.
+
+An unreadable `robots.txt` blocks index writes, in **`crawl` mode with
+`respectRobotsTxt` on** — the only mode that fetches it over the network. If the fetch
+times out, returns a server error, or exceeds the 512 KiB size cap, the run cannot tell
+which pages the site means to exclude, so it writes nothing rather than risk publishing
+a page that was meant to stay out. A 404 or 410 is not unreadable: that is how a site
+says "no rules here", and indexing proceeds. (`static-output` and `build` read
+`robots.txt` from the build directory and treat an unreadable file as absent;
+`content-files` does not consult it at all.)
+
+Rule matching follows RFC 9309 for the parts that matter in practice: `*` wildcards, the
+`$` end-anchor, group merging across consecutive `User-agent` lines, and
+longest-rule-wins specificity with `Allow` beating an equally long `Disallow`. It is not
+a certified-complete implementation — percent-encoded paths are compared as written
+rather than canonicalised, so `Disallow: /admin` does not also block `/%61dmin`.
+
+Chunk and page metadata is budgeted in **UTF-8 bytes** against Upstash's 48 KB
+per-record limit, measured on the exact JSON that will be sent. The one trimmable
+field (the record's text) is truncated to fit, with a warning naming the record. If
+the required fields alone still do not fit, the run fails with the page URL and the
+name and size of the largest offending field, rather than letting the backend reject
+one item in the middle of a half-written batch.
 
 `searchsocket index` exits 5 when no vector backend is configured. Pass
 `--allow-unconfigured` to skip indexing without failing (the Vite plugin already
@@ -916,7 +1025,7 @@ pnpm searchsocket mcp --access public --api-key SECRET   # public with auth
 
 ### `searchsocket add`
 
-Copy Svelte 5 search UI template components into your project.
+Copy Svelte 5 search UI template components into your project. They require Svelte 5.20 or newer.
 
 ```bash
 pnpm searchsocket add search-dialog
@@ -1028,7 +1137,7 @@ export const handle = searchsocketHandle({
 <!-- src/routes/+layout.svelte -->
 <script>
   import { afterNavigate } from "$app/navigation";
-  import { searchsocketScrollToText } from "searchsocket/sveltekit";
+  import { searchsocketScrollToText } from "searchsocket/scroll";
 
   afterNavigate(searchsocketScrollToText);
 </script>
@@ -1097,7 +1206,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [sveltekit()],
   ssr: {
-    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client"]
+    external: ["searchsocket", "searchsocket/sveltekit", "searchsocket/client", "searchsocket/scroll"]
   }
 });
 ```

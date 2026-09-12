@@ -34,6 +34,111 @@ const DEFAULT_BATCH_SIZE = 90;
  */
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BASE_MS = 200;
+/**
+ * Metadata-only updates go one record per request — Upstash's `update` takes a
+ * single vector, unlike `upsert`. Overlapping a few keeps a large refresh from
+ * being one serial round trip per record without burying the endpoint.
+ */
+const METADATA_UPDATE_CONCURRENCY = 8;
+
+/**
+ * Characters GLOB reads as pattern syntax. Upstash documents no escape sequence
+ * for them, so a path prefix containing one cannot be turned into a pattern
+ * that provably means what the caller wrote — the same reason
+ * `filterStringLiteral` rejects quotes instead of guessing an escape. Such a
+ * prefix is simply not pushed down; the caller re-checks it locally.
+ */
+const GLOB_METACHARS = /[*?[\]]/;
+
+/**
+ * Caller-supplied retrieval constraints the backend can apply itself, instead
+ * of the caller trimming an already-cut global candidate window.
+ *
+ * Deliberately a typed option rather than more text folded into `filter`:
+ * ownership clauses and caller constraints stay separate expressions, so no
+ * caller value can widen what a query is allowed to see.
+ *
+ * These narrow the candidate set; they are not a guarantee. A value the filter
+ * grammar cannot express is not sent at all — `planRetrievalConstraints`
+ * reports that as `complete: false` — so the caller remains responsible for
+ * enforcing the constraint on the records it gets back, with
+ * `matchesPathPrefix` and `matchesTags`. Ownership isolation is the store's
+ * job and is never delegated this way.
+ */
+export interface RetrievalConstraints {
+  /** Segment prefix on `url`: `/docs` selects `/docs` and `/docs/...`, not `/docsmith`. */
+  pathPrefix?: string;
+  /** Every tag must be present on the record — AND across tags, not OR. */
+  tags?: string[];
+}
+
+/** Does `url` sit at or under `prefix`, counting whole path segments? */
+export function matchesPathPrefix(url: string, prefix: string): boolean {
+  if (prefix === "/") return true;
+  return url === prefix || url.startsWith(`${prefix}/`);
+}
+
+/** Does a record carry every requested tag? */
+export function matchesTags(recordTags: string[], tags: string[]): boolean {
+  return tags.every((tag) => recordTags.includes(tag));
+}
+
+function pathPrefixClause(prefix: string): string | null {
+  if (GLOB_METACHARS.test(prefix)) return null;
+  try {
+    // Parenthesised because it contains an OR: AND binds tighter than OR in
+    // Upstash's grammar, so a bare disjunction here would escape the scope
+    // clauses it is joined to and match every project.
+    return (
+      `(url = ${filterStringLiteral(prefix, "path prefix")}` +
+      ` OR url GLOB ${filterStringLiteral(`${prefix}/*`, "path prefix")})`
+    );
+  } catch {
+    // A quote or backslash in the prefix; not expressible, not an error.
+    return null;
+  }
+}
+
+/**
+ * Translate retrieval constraints into backend filter clauses.
+ *
+ * `complete` is false when a constraint could not be expressed, which tells the
+ * caller the backend result is still a superset and that recall depends on a
+ * bounded overfetch. `matchesPathPrefix`/`matchesTags` above and the clauses
+ * here describe exactly the same sets: a filter that means one thing in the
+ * backend and another in JS would be worse than no pushdown at all.
+ */
+export function planRetrievalConstraints(constraints: RetrievalConstraints): {
+  clauses: string[];
+  complete: boolean;
+} {
+  const clauses: string[] = [];
+  let complete = true;
+
+  const prefix = constraints.pathPrefix;
+  // "/" constrains nothing, so it needs no clause and is never incomplete.
+  if (prefix !== undefined && prefix !== "/") {
+    const clause = pathPrefixClause(prefix);
+    if (clause) {
+      clauses.push(clause);
+    } else {
+      complete = false;
+    }
+  }
+
+  for (const tag of constraints.tags ?? []) {
+    // `tags` is stored as a string[], and CONTAINS tests array membership.
+    try {
+      clauses.push(`tags CONTAINS ${filterStringLiteral(tag, "tag")}`);
+    } catch {
+      // A quote or backslash in the tag; the caller's local predicate still
+      // enforces it.
+      complete = false;
+    }
+  }
+
+  return { clauses, complete };
+}
 
 /** Coerce an untrusted numeric option to a finite integer inside [min, max]. */
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -75,7 +180,20 @@ interface ChunkVectorMetadata {
 /** One entry of the page inventory returned by `getPageHashes`. */
 export interface PageHashEntry {
   contentHash: string;
+  /**
+   * Fingerprint of the persisted metadata projection. Absent on records written
+   * before the two fingerprints were split, which callers must read as "the
+   * metadata needs refreshing once" rather than as "the text changed".
+   */
+  metadataHash?: string;
   custom: boolean;
+}
+
+/** One entry of the chunk inventory returned by `fetchContentHashesForKeys`. */
+export interface ChunkHashEntry {
+  contentHash: string;
+  /** Absent on pre-split records; see PageHashEntry.metadataHash. */
+  metadataHash?: string;
 }
 
 interface PageVectorMetadata {
@@ -102,7 +220,94 @@ interface PageVectorMetadata {
   indexedAt: string;
   contentHash: string;
   publishedAt?: number | null;
+  /**
+   * Ordered logical keys of this page's chunks; see PAGE_CHUNK_KEYS_FIELD.
+   * Absent on records written before the manifest existed, and on a page whose
+   * manifest did not fit the metadata byte budget.
+   */
+  chunkKeys?: string[];
   [key: string]: unknown;
+}
+
+/**
+ * The page-metadata field holding the ordered logical keys of a page's chunks.
+ *
+ * It exists so that reading one page costs that page's own chunk count instead
+ * of a scan of every chunk in the scope. The indexing pipeline is what writes
+ * it — `buildPageMetadata` in src/indexing/pipeline.ts — and imports this
+ * constant so the writer and the reader cannot drift apart.
+ */
+export const PAGE_CHUNK_KEYS_FIELD = "chunkKeys";
+
+/** One reconstructed section of a page, as `getChunksForPage` returns it. */
+export interface PageChunk {
+  chunkText: string;
+  ordinal: number;
+  sectionTitle: string;
+  headingPath: string[];
+}
+
+/**
+ * The ordered chunk-key manifest carried by a page record, or `null` when the
+ * record carries none and the caller must fall back to scanning.
+ *
+ * `null` covers three cases, all of which mean "this record cannot tell you
+ * what its chunks are": a record written before the manifest existed, a page
+ * whose manifest was deliberately omitted because it did not fit the metadata
+ * byte budget, and a value that is not a well-formed list of keys. An empty
+ * array is emphatically **not** one of them — it is a complete answer meaning
+ * the page has no chunks.
+ */
+function readChunkKeyManifest(metadata: PageVectorMetadata | undefined): string[] | null {
+  const raw = metadata?.[PAGE_CHUNK_KEYS_FIELD];
+  if (!Array.isArray(raw)) return null;
+  // Stored metadata is data, not a type guarantee. A manifest that is not
+  // entirely non-empty strings cannot be trusted to be complete, and a partial
+  // fetch built from it would drop sections while looking whole.
+  if (!raw.every((key) => typeof key === "string" && key.length > 0)) return null;
+  // A repeated key would reconstruct the same section twice. The pipeline never
+  // writes one — duplicate chunk keys are dropped before the manifest is built
+  // — so a list containing one did not come from a run this reader can trust.
+  if (new Set(raw as string[]).size !== raw.length) return null;
+  return raw as string[];
+}
+
+/** Do two manifests name the same keys in the same order? */
+function sameKeys(a: readonly string[] | null, b: readonly string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.length === b.length && a.every((key, index) => key === b[index]);
+}
+
+/**
+ * The page cannot be served whole: its record names sections that are not
+ * there.
+ *
+ * A deliberate failure, not a short page. The manifest and the chunk records
+ * can only disagree if a write landed half-way or a record was removed out of
+ * band, and returning what happens to remain would present a page missing a
+ * section as though it were complete — the one outcome this whole path exists
+ * to prevent.
+ */
+function incompletePageError(url: string, result: { missing: string[]; listed: number }): SearchSocketError {
+  return new SearchSocketError(
+    "VECTOR_BACKEND_UNAVAILABLE",
+    `Page ${url} lists ${result.listed} section${result.listed === 1 ? "" : "s"} but ` +
+      `${result.missing.length} could not be read back. Serving the rest would present an ` +
+      "incomplete page as a whole one; reindex the scope to repair it.",
+    { status: 503 }
+  );
+}
+
+/** Project a chunk record's metadata onto the shape page reconstruction needs. */
+function toPageChunk(metadata: ChunkVectorMetadata): PageChunk {
+  return {
+    chunkText: metadata.chunkText ?? "",
+    ordinal: metadata.ordinal ?? 0,
+    sectionTitle: metadata.sectionTitle ?? "",
+    headingPath: metadata.headingPath
+      ? String(metadata.headingPath).split(" > ").filter(Boolean)
+      : []
+  };
 }
 
 /**
@@ -115,10 +320,7 @@ interface PageVectorMetadata {
  * result as a faithful-enough reading copy, never as the exact source, and
  * nothing should promise byte-exact markdown on top of it.
  */
-function reconstructMarkdownFromChunks(
-  chunks: Array<{ chunkText: string; ordinal: number; sectionTitle: string; headingPath: string[] }>,
-  pageTitle: string
-): string {
+function reconstructMarkdownFromChunks(chunks: PageChunk[], pageTitle: string): string {
   if (chunks.length === 0) return "";
 
   const parts: string[] = [];
@@ -346,15 +548,99 @@ export class UpstashSearchStore {
     }
   }
 
+  /**
+   * Replace a record's metadata without re-sending the text it was embedded
+   * from.
+   *
+   * The point of the separate metadata fingerprint: a tag edit, a moved route
+   * file or a reordered section changes what is stored but not what should be
+   * embedded, and `upsert` would re-embed all of it. `OVERWRITE` rather than
+   * `PATCH` because the caller passes the complete projection, so a field that
+   * has been removed must genuinely disappear rather than linger.
+   *
+   * Returns the logical keys of records the backend reported no update for —
+   * i.e. records that no longer exist. Those cannot be patched into existence,
+   * so the caller re-upserts them rather than leaving the page short a section.
+   */
+  async updateChunkMetadata(
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    scope: Scope
+  ): Promise<string[]> {
+    return this.updateMetadata(this.chunksNs, "update chunk metadata", items, (item) => ({
+      recordId: chunkId(scope, item.id),
+      metadata: {
+        ...item.metadata,
+        chunkKey: item.id,
+        projectId: scope.projectId,
+        scopeName: scope.scopeName,
+        schemaVersion: INDEX_SCHEMA_VERSION,
+        type: (item.metadata.type as string) || "chunk"
+      }
+    }));
+  }
+
+  /** Page-record counterpart of `updateChunkMetadata`; `id` is the page URL. */
+  async updatePageMetadata(
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    scope: Scope
+  ): Promise<string[]> {
+    return this.updateMetadata(this.pagesNs, "update page metadata", items, (item) => ({
+      recordId: pageId(scope, item.id),
+      metadata: {
+        ...item.metadata,
+        projectId: scope.projectId,
+        scopeName: scope.scopeName,
+        schemaVersion: INDEX_SCHEMA_VERSION,
+        type: "page"
+      }
+    }));
+  }
+
+  private async updateMetadata(
+    ns: ReturnType<Index["namespace"]>,
+    operation: string,
+    items: Array<{ id: string; metadata: Record<string, unknown> }>,
+    toRecord: (item: { id: string; metadata: Record<string, unknown> }) => {
+      recordId: string;
+      metadata: Record<string, unknown>;
+    }
+  ): Promise<string[]> {
+    if (items.length === 0) return [];
+
+    const missing: string[] = [];
+    for (let i = 0; i < items.length; i += METADATA_UPDATE_CONCURRENCY) {
+      const window = items.slice(i, i + METADATA_UPDATE_CONCURRENCY);
+      const results = await Promise.all(
+        window.map(async (item) => {
+          const record = toRecord(item);
+          const result = await this.withRetry(operation, () =>
+            ns.update({
+              id: record.recordId,
+              metadata: record.metadata,
+              metadataUpdateMode: "OVERWRITE"
+            })
+          );
+          return result.updated > 0;
+        })
+      );
+      results.forEach((updated, offset) => {
+        if (!updated) missing.push(window[offset]!.id);
+      });
+    }
+
+    return missing;
+  }
+
   async search(
     data: string,
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<VectorHit[]> {
     const filterParts = [...scopeFilterClauses(scope)];
+    filterParts.push(...planRetrievalConstraints(opts).clauses);
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
@@ -417,6 +703,12 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
+      /**
+       * Narrows to chunks carrying every tag. There is no `pathPrefix` here on
+       * purpose: `url` already pins the page, so a prefix could only contradict
+       * it, and an option a method ignores is worse than one it does not offer.
+       */
+      tags?: string[];
     },
     scope: Scope
   ): Promise<VectorHit[]> {
@@ -434,15 +726,26 @@ export class UpstashSearchStore {
       urlFilterable = false;
     }
 
+    // A tag that cannot be expressed as a filter literal is enforced locally
+    // below instead. Discarding this flag meant the query came back unfiltered
+    // and was then cut to `limit` before anything checked the tags, so a
+    // matching chunk sitting behind `limit` non-matching ones disappeared.
+    const tagPlan = planRetrievalConstraints({ tags: opts.tags });
+    filterParts.push(...tagPlan.clauses);
+
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
+
+    // Anything the backend could not be asked to exclude has to be excluded
+    // here, which only works if enough candidates were fetched to survive it.
+    const filteredLocally = !urlFilterable || !tagPlan.complete;
 
     let results;
     try {
       results = await this.chunksNs.query<ChunkVectorMetadata>({
         data,
-        topK: urlFilterable ? opts.limit : Math.min(opts.limit * 10, 200),
+        topK: filteredLocally ? Math.min(opts.limit * 10, 200) : opts.limit,
         includeMetadata: true,
         filter: filterParts.join(" AND "),
         queryMode: QueryMode.HYBRID,
@@ -458,7 +761,14 @@ export class UpstashSearchStore {
       // these, but a filter-syntax surprise must not leak another tenant's
       // record into results. The URL is always re-checked locally so the
       // unfilterable-URL fallback above cannot return another page's chunks.
-      .filter((doc) => recordBelongsToScope(doc.metadata, scope) && doc.metadata?.url === url)
+      .filter(
+        (doc) =>
+          recordBelongsToScope(doc.metadata, scope) &&
+          doc.metadata?.url === url &&
+          // Applied before the slice, so `limit` counts chunks that actually
+          // match rather than chunks that merely came back.
+          matchesTags(doc.metadata?.tags ?? [], opts.tags ?? [])
+      )
       .slice(0, opts.limit)
       .map((doc) => ({
       // Logical chunk key, so the value round-trips back into deleteByIds().
@@ -497,7 +807,7 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     return this.queryPages({ data }, opts, scope);
@@ -508,7 +818,7 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     return this.queryPages({ vector }, opts, scope);
@@ -519,10 +829,11 @@ export class UpstashSearchStore {
     opts: {
       limit: number;
       filter?: string;
-    },
+    } & RetrievalConstraints,
     scope: Scope
   ): Promise<PageHit[]> {
     const filterParts = [...scopeFilterClauses(scope)];
+    filterParts.push(...planRetrievalConstraints(opts).clauses);
     if (opts.filter) {
       filterParts.push(groupFilter(opts.filter));
     }
@@ -684,8 +995,8 @@ export class UpstashSearchStore {
    * instead of range(). This avoids potential issues with range() returning
    * vectors from the wrong namespace on hybrid indexes.
    */
-  async fetchContentHashesForKeys(keys: string[], scope: Scope): Promise<Map<string, string>> {
-    const map = new Map<string, string>();
+  async fetchContentHashesForKeys(keys: string[], scope: Scope): Promise<Map<string, ChunkHashEntry>> {
+    const map = new Map<string, ChunkHashEntry>();
     if (keys.length === 0) return map;
 
     const BATCH_SIZE = this.batchSize;
@@ -701,7 +1012,13 @@ export class UpstashSearchStore {
           // explicitly rather than trusting the ID.
           if (doc && recordBelongsToScope(doc.metadata, scope) && doc.metadata?.contentHash) {
             const key = logicalKeyFromId(String(doc.id), scope, "chunk");
-            if (key !== null) map.set(key, doc.metadata.contentHash);
+            if (key !== null) {
+              map.set(key, {
+                contentHash: doc.metadata.contentHash,
+                metadataHash:
+                  typeof doc.metadata.metadataHash === "string" ? doc.metadata.metadataHash : undefined
+              });
+            }
           }
         }
       } catch (error) {
@@ -878,6 +1195,7 @@ export class UpstashSearchStore {
           if (url) {
             map.set(url, {
               contentHash: doc.metadata.contentHash,
+              metadataHash: typeof doc.metadata.metadataHash === "string" ? doc.metadata.metadataHash : undefined,
               custom: doc.metadata.custom === true
             });
           }
@@ -954,8 +1272,10 @@ export class UpstashSearchStore {
       // or written under an older schema — would be returned as this scope's.
       if (!recordBelongsToScope(doc.metadata, scope)) return null;
 
-      // Reconstruct markdown from chunks
-      const chunks = await this.getChunksForPage(url, scope);
+      // Reconstruct markdown from chunks. The page record names them, so this
+      // costs the page's own chunk count rather than a scan of the scope; a
+      // record written without a manifest falls back to that scan.
+      const chunks = await this.readPageChunks(url, scope, readChunkKeyManifest(doc.metadata));
       const markdown = reconstructMarkdownFromChunks(chunks, doc.metadata.title);
 
       return {
@@ -980,6 +1300,10 @@ export class UpstashSearchStore {
         weight: typeof doc.metadata.weight === "number" ? doc.metadata.weight : undefined
       };
     } catch (error) {
+      // A typed error raised inside this method already says exactly what went
+      // wrong — an incomplete chunk manifest, most of all. Re-wrapping it as a
+      // generic backend failure would throw that away.
+      if (error instanceof SearchSocketError) throw error;
       if (isMissingNamespaceError(error)) return null;
       throw toStorageError("get page", error);
     }
@@ -989,12 +1313,86 @@ export class UpstashSearchStore {
    * Fetch all chunks belonging to a specific page URL, sorted by ordinal.
    * Used to reassemble an approximation of page markdown; see
    * reconstructMarkdownFromChunks for why it is not canonical.
+   *
+   * `opts.chunkKeys` is the page record's manifest — see PAGE_CHUNK_KEYS_FIELD.
+   * With it, the work is proportional to the requested page. Without it (a null
+   * or omitted manifest), the only way to find a page's chunks is to walk every
+   * chunk in the scope, which is what this used to do unconditionally.
    */
   async getChunksForPage(
     url: string,
-    scope: Scope
-  ): Promise<Array<{ chunkText: string; ordinal: number; sectionTitle: string; headingPath: string[] }>> {
-    const chunks: Array<{ chunkText: string; ordinal: number; sectionTitle: string; headingPath: string[] }> = [];
+    scope: Scope,
+    opts?: { chunkKeys?: readonly string[] | null }
+  ): Promise<PageChunk[]> {
+    const result = await this.collectPageChunks(url, scope, opts?.chunkKeys ?? null);
+    if (result.missing.length > 0) throw incompletePageError(url, result);
+    return result.chunks;
+  }
+
+  /**
+   * A page's chunks, with one bounded retry against a re-read page record.
+   *
+   * A reader that fetched the page record moments before an indexing run
+   * replaced that page's sections holds a manifest naming records the run has
+   * since deleted. Every write succeeded and the stored page is complete; it is
+   * only this reader's snapshot that is stale, and failing it would turn a
+   * healthy reindex into a 503. Re-reading the page record once resolves that.
+   *
+   * The retry is worth making only when the manifest actually moved. An
+   * unchanged one means the records really are gone, and a second attempt would
+   * fail in exactly the same way.
+   */
+  private async readPageChunks(
+    url: string,
+    scope: Scope,
+    manifest: string[] | null
+  ): Promise<PageChunk[]> {
+    const first = await this.collectPageChunks(url, scope, manifest);
+    if (first.missing.length === 0) return first.chunks;
+
+    const refreshed = await this.refetchChunkManifest(url, scope);
+    if (refreshed !== undefined && !sameKeys(refreshed, manifest)) {
+      const second = await this.collectPageChunks(url, scope, refreshed);
+      if (second.missing.length === 0) return second.chunks;
+      throw incompletePageError(url, second);
+    }
+
+    throw incompletePageError(url, first);
+  }
+
+  /**
+   * Re-read just the chunk manifest of a page record, or `undefined` when the
+   * record can no longer be read at all — in which case the caller keeps the
+   * verdict it already had rather than inventing a new one.
+   */
+  private async refetchChunkManifest(url: string, scope: Scope): Promise<string[] | null | undefined> {
+    try {
+      const results = await this.pagesNs.fetch<PageVectorMetadata>([pageId(scope, url)], {
+        includeMetadata: true
+      });
+      const doc = results[0];
+      if (!doc?.metadata || !recordBelongsToScope(doc.metadata, scope)) return undefined;
+      return readChunkKeyManifest(doc.metadata);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The chunks of one page, plus the manifest keys that fetched nothing.
+   *
+   * Missing keys are reported rather than thrown so the caller can decide
+   * whether they are worth one retry; the scan path never reports any, because
+   * it has no list to be missing from.
+   */
+  private async collectPageChunks(
+    url: string,
+    scope: Scope,
+    manifest: readonly string[] | null
+  ): Promise<{ chunks: PageChunk[]; missing: string[]; listed: number }> {
+    if (manifest) return this.fetchChunksByKeys(url, scope, manifest);
+
+    const chunks: PageChunk[] = [];
     let cursor = "0";
 
     try {
@@ -1007,18 +1405,8 @@ export class UpstashSearchStore {
         });
 
         for (const doc of result.vectors) {
-          if (
-            recordBelongsToScope(doc.metadata, scope) &&
-            doc.metadata?.url === url
-          ) {
-            chunks.push({
-              chunkText: doc.metadata.chunkText ?? "",
-              ordinal: doc.metadata.ordinal ?? 0,
-              sectionTitle: doc.metadata.sectionTitle ?? "",
-              headingPath: doc.metadata.headingPath
-                ? String(doc.metadata.headingPath).split(" > ").filter(Boolean)
-                : []
-            });
+          if (recordBelongsToScope(doc.metadata, scope) && doc.metadata?.url === url) {
+            chunks.push(toPageChunk(doc.metadata));
           }
         }
 
@@ -1029,7 +1417,84 @@ export class UpstashSearchStore {
       if (!isMissingNamespaceError(error)) throw toStorageError("scan page chunks", error);
     }
 
-    return chunks.sort((a, b) => a.ordinal - b.ordinal);
+    return { chunks: chunks.sort((a, b) => a.ordinal - b.ordinal), missing: [], listed: 0 };
+  }
+
+  /**
+   * Read a page's chunks directly by ID, from the keys its record lists.
+   *
+   * Batched by `batchSize` like every other fetch-by-id path here, so a long
+   * page costs ceil(chunks / batchSize) requests and an unrelated corpus of any
+   * size costs nothing. Ownership is re-checked on every record: a direct fetch
+   * bypasses the metadata filter that protects queries, and this path must not
+   * become the one place that check is skipped.
+   *
+   * A key that fetches nothing is reported, never quietly dropped. The manifest
+   * and the chunk records can only disagree if a write landed half-way or a
+   * record was removed out of band, and in both cases the honest answer is that
+   * this page cannot be served whole right now — not a page that is missing a
+   * section without saying so.
+   */
+  private async fetchChunksByKeys(
+    url: string,
+    scope: Scope,
+    keys: readonly string[]
+  ): Promise<{ chunks: PageChunk[]; missing: string[]; listed: number }> {
+    if (keys.length === 0) return { chunks: [], missing: [], listed: 0 };
+
+    const found = new Map<string, PageChunk>();
+    const BATCH_SIZE = this.batchSize;
+
+    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+      const batch = keys.slice(i, i + BATCH_SIZE);
+      let results: Array<{ id: string | number; metadata?: ChunkVectorMetadata } | null>;
+      try {
+        // Deliberately not wrapped in withRetry, matching every other read in
+        // this store: withRetry converts its failure through toStorageError,
+        // and the missing-namespace test below cannot see through that wrapper.
+        results = await this.chunksNs.fetch<ChunkVectorMetadata>(
+          batch.map((key) => chunkId(scope, key)),
+          { includeMetadata: true }
+        );
+      } catch (error) {
+        // A namespace that has never been written to holds no chunks for any
+        // page, which is the same empty answer the scan path returns.
+        //
+        // But a page that lists chunks is evidence that sections are expected,
+        // so a vanished namespace is loss, not emptiness. Reporting zero here
+        // would hand back a silently sectionless page as a success — the exact
+        // "truncated result presented as complete" this manifest exists to
+        // avoid. Every listed key is missing.
+        if (isMissingNamespaceError(error)) {
+          return keys.length === 0
+            ? { chunks: [], missing: [], listed: 0 }
+            : { chunks: [], missing: [...keys], listed: keys.length };
+        }
+        throw toStorageError("fetch page chunks", error);
+      }
+
+      for (const doc of results) {
+        if (!doc || !doc.metadata) continue;
+        if (!recordBelongsToScope(doc.metadata, scope)) continue;
+        // The URL is re-checked as well as the scope. The manifest is stored
+        // data: a record that says it belongs to a different page must not be
+        // spliced into this one just because a key list named it.
+        if (doc.metadata.url !== url) continue;
+        const key = logicalKeyFromId(String(doc.id), scope, "chunk");
+        if (key !== null) found.set(key, toPageChunk(doc.metadata));
+      }
+    }
+
+    return {
+      // Sorted by ordinal, exactly as the scan path is, so the two return the
+      // same sequence for the same page.
+      chunks: keys
+        .filter((key) => found.has(key))
+        .map((key) => found.get(key)!)
+        .sort((a, b) => a.ordinal - b.ordinal),
+      missing: keys.filter((key) => !found.has(key)),
+      listed: keys.length
+    };
   }
 
   async fetchPageWithVector(

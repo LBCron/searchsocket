@@ -89,6 +89,54 @@ function buildCacheKey(query: string, options: CreateSearchOptions): string {
 }
 
 /**
+ * The wire is untyped, so a cast is a promise, not a check. A JSON `null` body,
+ * an error page that happened to parse, or `results: null` from a custom
+ * endpoint would otherwise be cached and rendered as a valid-looking empty
+ * response — indistinguishable from "no matches".
+ *
+ * Hand-written rather than a `zod` schema on purpose: this module ships as raw
+ * source to the browser, so anything it imports lands in the consumer's bundle.
+ * `src/client.ts` carries the same check; sharing it would mean a new module
+ * under `src/svelte/`, which is out of scope here. Every field the type declares as
+ * required is checked; an optional one only has to be the right type when it
+ * is present.
+ */
+function isSearchResult(value: unknown): value is SearchResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<SearchResult>;
+  if (
+    typeof result.url !== "string" ||
+    typeof result.title !== "string" ||
+    typeof result.snippet !== "string" ||
+    typeof result.score !== "number"
+  ) {
+    return false;
+  }
+  // An optional field may be absent, but a present one still has to be the
+  // type it is read as: `sectionTitle` reaches string methods and `chunks` is
+  // iterated.
+  if (result.sectionTitle !== undefined && typeof result.sectionTitle !== "string") return false;
+  if (result.chunks !== undefined) {
+    if (!Array.isArray(result.chunks)) return false;
+    if (!result.chunks.every((chunk) => typeof chunk === "object" && chunk !== null)) return false;
+  }
+  return true;
+}
+
+function isSearchResponse(payload: unknown): payload is SearchResponse {
+  if (typeof payload !== "object" || payload === null) return false;
+  const response = payload as Partial<SearchResponse>;
+  return (
+    typeof response.q === "string" &&
+    typeof response.scope === "string" &&
+    typeof response.meta === "object" &&
+    response.meta !== null &&
+    Array.isArray(response.results) &&
+    response.results.every(isSearchResult)
+  );
+}
+
+/**
  * The original store surface. Unchanged since it was first published — anything
  * that annotates or implements this type keeps compiling.
  */
@@ -140,22 +188,31 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
   // a query change in the same turn does not make the new query skip its cache.
   let retryFor: string | null = null;
 
+  // Identifies the run of the effect a response belongs to. Bumped on every run
+  // and on clear()/destroy(), so a response that arrives after the store moved
+  // on is recognised as stale without relying on the transport honouring
+  // `AbortController` — `fetchImpl` is a documented extension point and may
+  // ignore the signal entirely.
+  let requestSeq = 0;
+
   function settle(nextResults: SearchResult[], forQuery: string): void {
     results = nextResults;
     resolvedQuery = forQuery;
     error = null;
     hasSearched = true;
-    // Optional chaining so a malformed response (`results: null` from a custom
-    // endpoint) is passed through exactly as it always was, rather than being
-    // turned into an error by this new line.
-    status = (nextResults?.length ?? 0) > 0 ? "success" : "empty";
+    status = nextResults.length > 0 ? "success" : "empty";
   }
 
-  const destroy = $effect.root(() => {
+  const stopEffects = $effect.root(() => {
     $effect(() => {
       const currentQuery = query;
       // Subscribe to retry() without using the value for anything else.
       void generation;
+
+      // Claim this run's identity first: everything below, cache hits and empty
+      // queries included, abandons whatever was still in flight.
+      const requestId = ++requestSeq;
+      const isCurrent = () => requestId === requestSeq;
 
       const trimmed = currentQuery.trim();
 
@@ -225,24 +282,28 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
             throw new Error(message);
           }
 
-          const data = payload as SearchResponse;
-          if (cacheEnabled) {
-            resultCache.set(cacheKey, data.results);
+          if (!isSearchResponse(payload)) {
+            throw new Error("Invalid search response");
           }
+
           // A response that resolved after the request was abandoned must not
-          // overwrite the state the newer query (or clear()) already set.
-          if (controller.signal.aborted) return;
-          settle(data.results, currentQuery);
+          // overwrite the state — or the cache entry — that a newer query,
+          // clear() or destroy() already produced.
+          if (!isCurrent()) return;
+          if (cacheEnabled) {
+            resultCache.set(cacheKey, payload.results);
+          }
+          settle(payload.results, currentQuery);
         } catch (err) {
           if (err instanceof DOMException && err.name === "AbortError") return;
-          if (controller.signal.aborted) return;
+          if (!isCurrent()) return;
           error = err instanceof Error ? err : new Error(String(err));
           results = [];
           resolvedQuery = currentQuery;
           hasSearched = true;
           status = "error";
         } finally {
-          if (!controller.signal.aborted) {
+          if (isCurrent()) {
             loading = false;
           }
         }
@@ -283,6 +344,9 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
     clear() {
       // Reset synchronously: reading `results` immediately after clear() should
       // not still see the previous query's rows while the effect is pending.
+      // Bump before the effect re-runs: a response already in flight must not
+      // land in the window between here and the effect's own invalidation.
+      requestSeq += 1;
       query = "";
       results = [];
       error = null;
@@ -295,6 +359,11 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
       retryFor = query;
       generation += 1;
     },
-    destroy,
+    destroy() {
+      // Teardown invalidates every in-flight request, so nothing can write
+      // state or the cache once the component is gone.
+      requestSeq += 1;
+      stopEffects();
+    },
   };
 }

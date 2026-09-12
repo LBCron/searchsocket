@@ -67,9 +67,53 @@ export const handle: Handle = async ({ event, resolve }) => {
 
     expect(result).toBe("composed");
     const content = fs.readFileSync(path.join(dir, "src", "hooks.server.ts"), "utf8");
-    expect(content).toContain("sequence");
-    expect(content).toContain("searchsocketHandle");
     expect(content).toContain("@sveltejs/kit/hooks");
+    // The app's handle must be the outer one. searchsocketHandle() answers its
+    // endpoints without calling resolve(), so anything sequenced after it never
+    // runs for a search request — see tests/hooks-composition.test.ts.
+    expect(content).toMatch(
+      /sequence\(\s*async \(\{ event, resolve \}\)[\s\S]*?,\s*searchsocketHandle\(\)\s*\)/,
+    );
+  });
+
+  it("keeps a named existing handle first when composing", async () => {
+    const dir = await makeTempDir();
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "src", "hooks.server.ts"),
+      `import { sequence } from "@sveltejs/kit/hooks";
+import { authHandle } from "$lib/server/auth";
+import { loggingHandle } from "$lib/server/logging";
+
+export const handle = sequence(authHandle, loggingHandle);
+`,
+      "utf8",
+    );
+
+    const result = injectHooksServerTs(dir);
+
+    expect(result).toBe("composed");
+    const content = fs.readFileSync(path.join(dir, "src", "hooks.server.ts"), "utf8");
+    expect(content).toMatch(
+      /sequence\(\s*sequence\(authHandle, loggingHandle\)\s*,\s*searchsocketHandle\(\)\s*\)/,
+    );
+  });
+
+  it.each([
+    ["a re-exported handle", 'export { handle } from "./auth";\n'],
+    ["an aliased handle export", 'import { authHandle } from "./auth";\nexport { authHandle as handle };\n'],
+    ["a star re-export", 'export * from "./auth";\n'],
+  ])("returns 'fallback' for %s rather than shadowing it", async (_name, source) => {
+    const dir = await makeTempDir();
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "src", "hooks.server.ts"), source, "utf8");
+
+    // magicast cannot see these handles, so injecting our own would either
+    // duplicate the export or silently shadow the app's middleware.
+    const result = injectHooksServerTs(dir);
+
+    expect(result).toBe("fallback");
+    expect(fs.readFileSync(path.join(dir, "src", "hooks.server.ts"), "utf8")).toBe(source);
   });
 
   it("returns 'already-present' when searchsocketHandle is already imported", async () => {

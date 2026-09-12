@@ -324,6 +324,49 @@ describe("build discover mode (integration)", () => {
     expect(result.map((p) => p.url)).toEqual(["/"]);
   });
 
+  /**
+   * The split matters beyond bookkeeping: a failure marks the run incomplete
+   * and blocks stale-record deletion, while a skip leaves it authoritative.
+   */
+  describe("skip versus failure classification", () => {
+    it("treats a successful non-HTML response as a skip, not a failure", async () => {
+      const result = await runDiscoverFull(
+        {
+          "/": htmlPage("Home", ["/report.pdf"]),
+          "/report.pdf": "%PDF-1.4 pretend document"
+        },
+        {},
+        undefined,
+        { "/report.pdf": "application/pdf" }
+      );
+
+      expect(result.records.map((p) => p.url)).toEqual(["/"]);
+      expect(result.failures).toEqual([]);
+      expect(result.complete).toBe(true);
+    });
+
+    it("records a non-2xx response as a failure that blocks deletion", async () => {
+      const result = await runDiscoverFull({ "/": htmlPage("Home", ["/missing"]) });
+
+      expect(result.records.map((p) => p.url)).toEqual(["/"]);
+      expect(result.failures.map((f) => f.target)).toEqual(["/missing"]);
+      expect(result.failures[0]?.reason).toContain("404");
+      expect(result.complete).toBe(false);
+    });
+
+    it("indexes a page whose content type differs only in case", async () => {
+      const result = await runDiscoverFull(
+        { "/": htmlPage("Home", ["/docs"]), "/docs": htmlPage("Docs") },
+        {},
+        undefined,
+        { "/docs": "TEXT/HTML; charset=utf-8" }
+      );
+
+      expect(result.records.map((p) => p.url).sort()).toEqual(["/", "/docs"]);
+      expect(result.complete).toBe(true);
+    });
+  });
+
   it("respects maxPages limit from build config", async () => {
     const result = await runDiscover(
       {

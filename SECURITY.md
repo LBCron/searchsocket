@@ -4,8 +4,9 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.8.x | Yes |
-| ≤ 0.7.x | No — upgrade to 0.8, see [docs/migration-0.8.md](docs/migration-0.8.md) |
+| 0.10.x | Yes |
+| 0.8.x – 0.9.x | No — upgrade to 0.10 |
+| ≤ 0.7.x | No — upgrade, see [docs/migration-0.8.md](docs/migration-0.8.md) |
 
 ## Reporting a vulnerability
 
@@ -36,9 +37,15 @@ interchangeable.
 **Privileged** — the MCP endpoint and the standalone MCP server:
 
 - Return repository paths, a page's indexed markdown, and any scope the caller names.
-- The SvelteKit MCP route requires `mcp.handle.apiKey` or
-  `mcp.handle.apiKeyEnv`. Without one it answers 503 rather than serving
-  unauthenticated.
+- The SvelteKit MCP route fails closed. With neither `mcp.handle.apiKey` nor
+  `mcp.handle.apiKeyEnv` set it answers 503 rather than serving unauthenticated,
+  unless the deployment sets `mcp.handle.access: "public"`. Under public access an
+  anonymous caller — one sending no `Authorization` header at all — is served a
+  *redacted* result set: the same fields the browser API withholds are stripped, and
+  a caller-supplied `scope` is ignored. A request that does send an `Authorization`
+  header is still answered 401 when the credential is wrong, even under public
+  access, rather than being downgraded to the anonymous result set.
+- `mcp.enable: false` removes the route entirely.
 - The standalone server binds to loopback unless `mcp.access: "public"`, which
   in turn requires `mcp.http.apiKey` or `mcp.http.apiKeyEnv`. Put it behind a
   reverse proxy terminating HTTPS before exposing it.

@@ -2,6 +2,7 @@ import { load as cheerioLoad } from "cheerio";
 import pLimit from "p-limit";
 import { Logger } from "../../../core/logger";
 import { normalizeUrlPath, joinUrl } from "../../../utils/path";
+import { boundedFetch, BoundedFetchError } from "../../../utils/fetch";
 import type { PageSourceRecord, ResolvedSearchSocketConfig } from "../../../types";
 import { parseManifest, expandRoutes, isExcluded } from "./manifest-parser";
 import { startPreviewServer, type PreviewServer } from "./preview-server";
@@ -88,21 +89,32 @@ async function discoverPages(
       batch.map((item) =>
         limit(async (): Promise<PageSourceRecord | null> => {
           const fullUrl = joinUrl(server.baseUrl, item.url);
-          const response = await fetch(fullUrl);
 
-          if (!response.ok) {
-            logger.warn(`Skipping ${item.url}: ${response.status} ${response.statusText}`);
-            failures.push({ target: item.url, reason: `${response.status} ${response.statusText}` });
+          let html: string;
+          try {
+            // The content-type filter belongs in the fetch: rejecting on the
+            // headers keeps a linked PDF a deliberate skip instead of letting
+            // its body time out or blow the size cap and mark the run
+            // incomplete.
+            const fetched = await boundedFetch(fullUrl, {
+              allowedOrigin: baseOrigin,
+              accept: "text/html",
+              allowedContentTypes: ["text/html"]
+            });
+            html = fetched.body.toString("utf8");
+          } catch (error) {
+            if (error instanceof BoundedFetchError && error.kind === "content-type") {
+              // Not a page — a deliberate skip, not a failure.
+              return null;
+            }
+            // Keep the helper's message rather than just the status: a 200 HTML
+            // response rejected for exceeding the size cap would otherwise be
+            // reported as "200" and be undiagnosable.
+            const reason = error instanceof Error ? error.message : String(error);
+            logger.warn(`Skipping ${item.url}: ${reason}`);
+            failures.push({ target: item.url, reason });
             return null;
           }
-
-          const contentType = response.headers.get("content-type") ?? "";
-          if (!contentType.includes("text/html")) {
-            // Not a page — a deliberate skip, not a failure.
-            return null;
-          }
-
-          const html = await response.text();
 
           // Extract and queue new links if not at max depth
           if (item.depth < maxDepth) {
@@ -186,7 +198,7 @@ export async function loadBuildPages(
     const detected = await detectBuildOutput(cwd, config.source.staticOutputDir);
     if (detected && detected.adapter !== "node") {
       logger.info(`Detected ${detected.adapter} build output at ${detected.relativePath}; indexing prerendered HTML directly.`);
-      return loadPrerenderedPages(cwd, detected.absolutePath, maxPages);
+      return loadPrerenderedPages(cwd, detected.absolutePath, maxPages, buildConfig.exclude);
     }
     if (!detected) {
       logger.info(
@@ -224,6 +236,7 @@ export async function loadBuildPages(
   const { selected, limitedBy } = applyMaxPages(expanded, maxPages);
 
   const server = await startPreviewServer(cwd, { previewTimeout: buildConfig.previewTimeout }, logger);
+  const previewOrigin = new URL(server.baseUrl).origin;
 
   try {
     const concurrencyLimit = pLimit(8);
@@ -231,15 +244,14 @@ export async function loadBuildPages(
       selected.map((route) =>
         concurrencyLimit(async (): Promise<PageSourceRecord> => {
           const fetchUrl = joinUrl(server.baseUrl, route.url);
-          const response = await fetch(fetchUrl);
-
-          if (!response.ok) {
-            throw new Error(`Failed to fetch ${route.url}: ${response.status} ${response.statusText}`);
-          }
+          const { body } = await boundedFetch(fetchUrl, {
+            allowedOrigin: previewOrigin,
+            accept: "text/html"
+          });
 
           return {
             url: normalizeUrlPath(route.url),
-            html: await response.text(),
+            html: body.toString("utf8"),
             sourcePath: route.routeFile,
             outgoingLinks: [],
             routeFile: route.routeFile,

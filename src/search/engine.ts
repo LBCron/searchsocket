@@ -20,7 +20,9 @@ import type {
   SiteTreeNode,
   VectorHit
 } from "../types";
-import type { UpstashSearchStore } from "../vector/upstash";
+import type { RetrievalConstraints, UpstashSearchStore } from "../vector/upstash";
+import { matchesPathPrefix, matchesTags, planRetrievalConstraints } from "../vector/upstash";
+import { Logger } from "../core/logger";
 import type { RankedHit, RankedPage } from "./ranking";
 import { diceScore, compositeScore, dominantRelationshipType } from "./related-pages";
 import { toSnippet, queryAwareExcerpt } from "../utils/text";
@@ -36,6 +38,19 @@ const SUBRESULT_PAGE_LIMIT = 10;
 
 /** Simultaneous section lookups, so a large topK cannot burst the backend. */
 const SUBRESULT_CONCURRENCY = 5;
+
+/**
+ * Candidate windows for the overfetch fallback, as multiples of the base
+ * candidate count.
+ *
+ * Only reached when a path or tag constraint cannot be pushed into the backend
+ * filter — a quote, backslash, or GLOB metacharacter in the value. Everything
+ * else is one request, because the backend does the filtering.
+ */
+const FALLBACK_FETCH_STEPS = [1, 4, 16];
+
+/** Hard ceiling on candidates for one query, however selective the filter. */
+const MAX_CANDIDATE_FETCH = 500;
 
 /**
  * Debug ranking overrides.
@@ -182,21 +197,31 @@ export interface SearchEngineOptions {
   configPath?: string;
   config?: ResolvedSearchSocketConfig;
   store?: UpstashSearchStore;
+  /**
+   * Sink for retrieval warnings. Defaults to a stderr-only logger: a truncated
+   * retrieval is rare but must never pass unremarked, and stderr is the one
+   * channel every host — CLI, SvelteKit handler, stdio MCP server — already
+   * treats as its log.
+   */
+  logger?: Logger;
 }
 
 export class SearchEngine {
   private readonly cwd: string;
   private readonly config: ResolvedSearchSocketConfig;
   private readonly store: UpstashSearchStore | null;
+  private readonly logger: Logger;
 
   private constructor(options: {
     cwd: string;
     config: ResolvedSearchSocketConfig;
     store: UpstashSearchStore | null;
+    logger?: Logger;
   }) {
     this.cwd = options.cwd;
     this.config = options.config;
     this.store = options.store;
+    this.logger = options.logger ?? new Logger({ stderrOnly: true });
   }
 
   private requireStore(): UpstashSearchStore {
@@ -236,7 +261,8 @@ export class SearchEngine {
     return new SearchEngine({
       cwd,
       config,
-      store
+      store,
+      logger: options.logger
     });
   }
 
@@ -266,11 +292,21 @@ export class SearchEngine {
 
     const queryText = input.q;
 
-    // Post-query filtering for pathPrefix and tags
-    const pathPrefix = input.pathPrefix
-      ? (input.pathPrefix.startsWith("/") ? input.pathPrefix : `/${input.pathPrefix}`)
-      : undefined;
+    // Path and tag constraints are pushed into the backend query wherever the
+    // filter grammar can express them. Applying them only afterwards meant a
+    // selective filter was starved by a globally-ranked candidate window: a
+    // `/docs` query whose first 40 candidates were all blog pages returned
+    // nothing, however good the `/docs` match ranked 41st was.
+    //
+    // `/docs` is a *segment* prefix: it selects `/docs` and everything under
+    // it, and no longer `/docsmith`.
+    const pathPrefix = input.pathPrefix ? normalizeUrlPath(input.pathPrefix) : undefined;
     const filterTags = input.tags && input.tags.length > 0 ? input.tags : undefined;
+    const constraints: RetrievalConstraints = { pathPrefix, tags: filterTags };
+    // False only when a value cannot be written as a filter literal or GLOB
+    // pattern; then the local predicates below are the only enforcement and
+    // recall depends on the bounded overfetch in `retrieveConstrained`.
+    const constraintsPushedDown = planRetrievalConstraints(constraints).complete;
 
     // Build server-side Upstash filter for structured metadata.
     // Values containing a quote or backslash are rejected rather than escaped
@@ -289,25 +325,29 @@ export class SearchEngine {
     }
     const metaFilter = metaFilterStr || undefined;
 
+    // Kept even when the same constraint was pushed down: it costs nothing, and
+    // it is the only enforcement for a value the filter grammar cannot express.
     const applyPagePostFilters = (hits: PageHit[]): PageHit[] => {
       let filtered = hits;
       if (pathPrefix) {
-        filtered = filtered.filter((h) => h.url.startsWith(pathPrefix));
+        filtered = filtered.filter((h) => matchesPathPrefix(h.url, pathPrefix));
       }
       if (filterTags) {
-        filtered = filtered.filter((h) =>
-          filterTags.every((tag) => h.tags.includes(tag))
-        );
+        filtered = filtered.filter((h) => matchesTags(h.tags, filterTags));
       }
       return filtered;
     };
 
+    /** Sub-results of a page that already matched, so only tags are re-checked. */
+    const applyChunkTagFilters = (hits: VectorHit[]): VectorHit[] => {
+      if (!filterTags) return hits;
+      return hits.filter((h) => matchesTags(h.metadata.tags, filterTags));
+    };
+
     const applyChunkPostFilters = (hits: VectorHit[]): VectorHit[] => {
-      let filtered = hits;
-      if (filterTags) {
-        filtered = filtered.filter((h) =>
-          filterTags.every((tag) => h.metadata.tags.includes(tag))
-        );
+      let filtered = applyChunkTagFilters(hits);
+      if (pathPrefix) {
+        filtered = filtered.filter((h) => matchesPathPrefix(h.metadata.url, pathPrefix));
       }
       return filtered;
     };
@@ -317,16 +357,21 @@ export class SearchEngine {
     if (groupByPage) {
       // ── Page-first pipeline ──
       // 1. Search page vectors to get top pages ranked by similarity
-      const fetchMultiplier = (pathPrefix || filterTags) ? 2 : 1;
       const pageLimit = Math.max(topK * 2, 20);
 
-      const pageHits = await this.requireStore().searchPagesByText(
-        queryText,
-        { limit: pageLimit * fetchMultiplier, filter: metaFilter },
-        resolvedScope
+      const { items: filteredPages, boundReached, window } = await this.retrieveConstrained(
+        pageLimit,
+        topK,
+        constraintsPushedDown,
+        (limit) =>
+          this.requireStore().searchPagesByText(
+            queryText,
+            { limit, filter: metaFilter, ...constraints },
+            resolvedScope
+          ),
+        applyPagePostFilters
       );
-
-      const filteredPages = applyPagePostFilters(pageHits);
+      if (boundReached) this.warnPartialRetrieval(input.q, window);
 
       // 2. Rank pages with boosts (depth, incoming links, title match, page weights, etc.)
       let rankedPages = rankPageHits(filteredPages, effectiveConfig, input.q, input.debug);
@@ -350,10 +395,10 @@ export class SearchEngine {
               .searchChunksByUrl(
                 queryText,
                 page.url,
-                { limit: maxSubResults, filter: metaFilter },
+                { limit: maxSubResults, filter: metaFilter, tags: filterTags },
                 resolvedScope
               )
-              .then((chunks) => applyChunkPostFilters(chunks))
+              .then((chunks) => applyChunkTagFilters(chunks))
           )
         )
       );
@@ -379,23 +424,20 @@ export class SearchEngine {
     } else {
       // ── Chunk-only mode (groupBy: "chunk") — legacy behavior ──
       const candidateK = Math.max(50, topK);
-      const fetchMultiplier = (pathPrefix || filterTags) ? 2 : 1;
 
-      const hits = await this.requireStore().search(
-        queryText,
-        { limit: candidateK * fetchMultiplier, filter: metaFilter },
-        resolvedScope
+      const { items: filtered, boundReached, window } = await this.retrieveConstrained(
+        candidateK,
+        topK,
+        constraintsPushedDown,
+        (limit) =>
+          this.requireStore().search(
+            queryText,
+            { limit, filter: metaFilter, ...constraints },
+            resolvedScope
+          ),
+        applyChunkPostFilters
       );
-
-      let filtered = hits;
-      if (pathPrefix) {
-        filtered = filtered.filter((h) => h.metadata.url.startsWith(pathPrefix));
-      }
-      if (filterTags) {
-        filtered = filtered.filter((h) =>
-          filterTags!.every((tag) => h.metadata.tags.includes(tag))
-        );
-      }
+      if (boundReached) this.warnPartialRetrieval(input.q, window);
 
       const ranked = rankHits(filtered, effectiveConfig, input.q, input.debug);
       const searchMs = hrTimeMs(searchStart);
@@ -413,6 +455,60 @@ export class SearchEngine {
         }
       };
     }
+  }
+
+  /**
+   * Fetch candidates for a constrained query, escalating the window only while
+   * that can still help and only within a fixed work bound.
+   *
+   * One request when every constraint was pushed into the backend query, which
+   * is the normal case. A constraint the filter grammar cannot express is
+   * enforced locally instead, so the window is escalated to compensate — but
+   * only through `FALLBACK_FETCH_STEPS`, and never past `MAX_CANDIDATE_FETCH`:
+   * better recall must not cost an unbounded number of round trips.
+   *
+   * `boundReached` reports the one thing the backend lets us know for certain:
+   * that retrieval stopped because it ran out of budget rather than out of
+   * candidates. It is deliberately not a claim of completeness in the other
+   * direction — a vector store may under-fill a selective query for its own
+   * reasons — only the honest signal the audit asks for.
+   */
+  private async retrieveConstrained<T>(
+    baseLimit: number,
+    wanted: number,
+    pushedDown: boolean,
+    fetch: (limit: number) => Promise<T[]>,
+    keep: (candidates: T[]) => T[]
+  ): Promise<{ items: T[]; boundReached: boolean; window: number }> {
+    let items: T[] = [];
+    let limit = 0;
+
+    for (const step of FALLBACK_FETCH_STEPS) {
+      limit = Math.min(baseLimit * step, MAX_CANDIDATE_FETCH);
+      const candidates = await fetch(limit);
+      items = keep(candidates);
+
+      // A short window means this query has no more candidates to give, so a
+      // wider one would repeat the same work for the same answer.
+      if (pushedDown || items.length >= wanted || candidates.length < limit) {
+        return { items, boundReached: false, window: limit };
+      }
+      if (limit >= MAX_CANDIDATE_FETCH) break;
+    }
+
+    return { items, boundReached: true, window: limit };
+  }
+
+  /**
+   * Report a retrieval that stopped at its work bound with the filter still
+   * unsatisfied. Reported, never retried: the engine is serverless and must not
+   * turn a selective filter into an open-ended scan.
+   */
+  private warnPartialRetrieval(query: string, window: number): void {
+    this.logger.warn(
+      `Search for ${JSON.stringify(query)} stopped at its candidate limit of ${window} ` +
+        "with the requested path or tag filter still unsatisfied; results may be incomplete."
+    );
   }
 
   private buildPageFirstResults(

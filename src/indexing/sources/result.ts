@@ -3,8 +3,12 @@ import type { PageSourceRecord } from "../../types";
 /**
  * Why a source loader stopped short of observing every available page.
  * Any value here makes the run non-authoritative.
+ *
+ * `max-sitemaps` is discovery-side rather than load-side: the loader never
+ * enumerated some of the pages at all, so `discoveredCount` may understate the
+ * site rather than merely exceeding `records.length`.
  */
-export type SourceLimitReason = "max-pages" | "max-depth" | "timeout";
+export type SourceLimitReason = "max-pages" | "max-depth" | "timeout" | "max-sitemaps";
 
 export interface SourceFailure {
   /** The route, URL, or file path that could not be loaded. */
@@ -28,7 +32,11 @@ export interface SourceLoadResult {
    * loaded each one successfully. False makes the run deletion-ineligible.
    */
   complete: boolean;
-  /** How many pages were discovered before any limit was applied. */
+  /**
+   * Pages the loader actually enumerated, before page selection. A
+   * discovery-side limit (see `SourceLimitReason`) can cut this short too, so
+   * it is not always the site's total.
+   */
   discoveredCount: number;
   /** Pages that were discovered but could not be loaded. */
   failures: SourceFailure[];

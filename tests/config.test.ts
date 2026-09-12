@@ -38,12 +38,6 @@ describe("createDefaultConfig", () => {
     expect(config.upstash.namespaces.chunks).toBe("chunks");
   });
 
-  it("has embedding defaults", () => {
-    const config = createDefaultConfig("example");
-    expect(config.embedding.model).toBe("bge-large-en-v1.5");
-    expect(config.embedding.dimensions).toBe(1024);
-  });
-
   it("has llmsTxt defaults with generateFull enabled", () => {
     const config = createDefaultConfig("example");
     expect(config.llmsTxt.generateFull).toBe(true);
@@ -211,18 +205,6 @@ describe("mergeConfig", () => {
     expect(merged.source.build?.previewTimeout).toBe(30000);
   });
 
-  it("merges embedding overrides", async () => {
-    const dir = await makeTempDir();
-    await fs.mkdir(path.join(dir, "build"), { recursive: true });
-
-    const merged = mergeConfig(dir, {
-      embedding: { dimensions: 768 }
-    });
-
-    expect(merged.embedding.dimensions).toBe(768);
-    expect(merged.embedding.model).toBe("bge-large-en-v1.5"); // default preserved
-  });
-
   it("merges upstash overrides", async () => {
     const dir = await makeTempDir();
     await fs.mkdir(path.join(dir, "build"), { recursive: true });
@@ -261,26 +243,29 @@ describe("mergeConfig", () => {
     expect(merged.upstash.maxRetries).toBe(2); // default preserved
   });
 
-  describe("removed 0.8 options", () => {
+  describe("removed options", () => {
     // Zod strips unknown keys silently, so a config still setting one of these
     // would look accepted while the option did nothing — exactly how
     // search.pageSearchWeight came to be tuned despite having no effect.
     it.each([
       ["search.dualSearch", { search: { dualSearch: false } }],
       ["search.pageSearchWeight", { search: { pageSearchWeight: 0.5 } }],
-      ["embedding.batchSize", { embedding: { batchSize: 50 } }]
+      ["embedding.batchSize", { embedding: { batchSize: 50 } }],
+      ["embedding.model", { embedding: { model: "some-model" } }],
+      ["embedding.dimensions", { embedding: { dimensions: 768 } }],
+      ["embedding.taskType", { embedding: { taskType: "RETRIEVAL_QUERY" } }]
     ])("rejects %s with a migration message", async (key, raw) => {
       const dir = await makeTempDir();
       await fs.mkdir(path.join(dir, "build"), { recursive: true });
 
       expect(() => mergeConfig(dir, raw as never)).toThrow(new RegExp(key.replace(".", "\\.")));
-      expect(() => mergeConfig(dir, raw as never)).toThrow(/removed in 0\.8/);
+      expect(() => mergeConfig(dir, raw as never)).toThrow(/have been removed/);
     });
 
     it("still accepts a config that sets none of them", async () => {
       const dir = await makeTempDir();
       await fs.mkdir(path.join(dir, "build"), { recursive: true });
-      expect(() => mergeConfig(dir, { embedding: { dimensions: 768 } })).not.toThrow();
+      expect(() => mergeConfig(dir, { upstash: { batchSize: 25 } })).not.toThrow();
     });
   });
 

@@ -149,6 +149,201 @@ describe("expandRoutes", () => {
     ]);
   });
 
+  it("expands multi-parameter routes one segment per parameter", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/docs/[category]/[page]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/docs/[category]/[page]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(
+      routes,
+      { "/docs/[category]/[page]": ["guides/quickstart", "api/search"] },
+      [],
+      logger
+    );
+
+    expect(result).toEqual([
+      { url: "/docs/guides/quickstart", routeFile: "src/routes/docs/[category]/[page]/+page.svelte" },
+      { url: "/docs/api/search", routeFile: "src/routes/docs/[category]/[page]/+page.svelte" }
+    ]);
+  });
+
+  it("gives a rest parameter every segment the later parameters do not need", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/docs/[...path]/[page]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/docs/[...path]/[page]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(
+      routes,
+      { "/docs/[...path]/[page]": ["a/b/c/quickstart"] },
+      [],
+      logger
+    );
+
+    expect(result).toEqual([
+      { url: "/docs/a/b/c/quickstart", routeFile: "src/routes/docs/[...path]/[page]/+page.svelte" }
+    ]);
+  });
+
+  it("expands a lone rest parameter with the whole value", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/docs/[...slug]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/docs/[...slug]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(routes, { "/docs/[...slug]": ["guides/advanced/setup"] }, [], logger);
+
+    expect(result).toEqual([
+      { url: "/docs/guides/advanced/setup", routeFile: "src/routes/docs/[...slug]/+page.svelte" }
+    ]);
+  });
+
+  it("drops an optional parameter when the value runs out", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/lang/[[locale]]/docs/[slug]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/lang/[[locale]]/docs/[slug]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(
+      routes,
+      { "/lang/[[locale]]/docs/[slug]": ["en/intro", "intro"] },
+      [],
+      logger
+    );
+
+    expect(result).toEqual([
+      { url: "/lang/en/docs/intro", routeFile: "src/routes/lang/[[locale]]/docs/[slug]/+page.svelte" },
+      { url: "/lang/docs/intro", routeFile: "src/routes/lang/[[locale]]/docs/[slug]/+page.svelte" }
+    ]);
+  });
+
+  it("skips and warns when a value has too few segments for the route", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+    const routes: ManifestRoute[] = [
+      {
+        id: "/docs/[category]/[page]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/docs/[category]/[page]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(routes, { "/docs/[category]/[page]": ["guides"] }, [], logger);
+
+    expect(result).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("one path segment per parameter"));
+
+    warnSpy.mockRestore();
+  });
+
+  it("skips and warns when a value has more segments than parameters", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+    const routes: ManifestRoute[] = [
+      {
+        id: "/docs/[category]/[page]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/docs/[category]/[page]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(
+      routes,
+      { "/docs/[category]/[page]": ["guides/quickstart/extra"] },
+      [],
+      logger
+    );
+
+    expect(result).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("one path segment per parameter"));
+
+    warnSpy.mockRestore();
+  });
+
+  it("keeps giving a single parameter the whole value", () => {
+    const routes: ManifestRoute[] = [
+      { id: "/blog/[slug]", isPage: true, isDynamic: true, routeFile: "src/routes/blog/[slug]/+page.svelte" }
+    ];
+
+    const result = expandRoutes(routes, { "/blog/[slug]": ["nested/post"] }, [], logger);
+
+    expect(result).toEqual([
+      { url: "/blog/nested/post", routeFile: "src/routes/blog/[slug]/+page.svelte" }
+    ]);
+  });
+
+  it("keeps expanding parameters embedded in a segment", () => {
+    const routes: ManifestRoute[] = [
+      { id: "/foo-[bar]", isPage: true, isDynamic: true, routeFile: "src/routes/foo-[bar]/+page.svelte" },
+      { id: "/[slug].json", isPage: true, isDynamic: true, routeFile: "src/routes/[slug].json/+page.svelte" }
+    ];
+
+    const result = expandRoutes(
+      routes,
+      { "/foo-[bar]": ["hello"], "/[slug].json": ["data"] },
+      [],
+      logger
+    );
+
+    expect(result).toEqual([
+      { url: "/foo-hello", routeFile: "src/routes/foo-[bar]/+page.svelte" },
+      { url: "/data.json", routeFile: "src/routes/[slug].json/+page.svelte" }
+    ]);
+  });
+
+  it("fills an embedded parameter and a later parameter from separate segments", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/foo-[bar]/[id]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/foo-[bar]/[id]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(routes, { "/foo-[bar]/[id]": ["hello/7"] }, [], logger);
+
+    expect(result).toEqual([
+      { url: "/foo-hello/7", routeFile: "src/routes/foo-[bar]/[id]/+page.svelte" }
+    ]);
+  });
+
+  it("does not reserve a segment for a later rest parameter", () => {
+    const routes: ManifestRoute[] = [
+      {
+        id: "/[[lang]]/docs/[...rest]",
+        isPage: true,
+        isDynamic: true,
+        routeFile: "src/routes/[[lang]]/docs/[...rest]/+page.svelte"
+      }
+    ];
+
+    const result = expandRoutes(routes, { "/[[lang]]/docs/[...rest]": ["en"] }, [], logger);
+
+    expect(result).toEqual([
+      { url: "/en/docs", routeFile: "src/routes/[[lang]]/docs/[...rest]/+page.svelte" }
+    ]);
+  });
+
   it("falls back to URL-based key for paramValues lookup", () => {
     const routes: ManifestRoute[] = [
       { id: "/(app)/blog/[slug]", isPage: true, isDynamic: true, routeFile: "src/routes/(app)/blog/[slug]/+page.svelte" }
