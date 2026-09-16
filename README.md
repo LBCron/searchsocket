@@ -35,13 +35,21 @@ SearchSocket extracts content from your SvelteKit site, converts it to markdown,
 ## Install
 
 ```bash
+pnpm add searchsocket
+```
+
+A regular dependency is what the quickstart below needs: step 4 wires `searchsocketHandle()` into `src/hooks.server.ts`, which runs in your deployed server, not at build time.
+
+The dev-dependency install is the narrower case — you only index at build time and never mount the hook (no search API, no MCP endpoint, e.g. a static site whose frontend queries a search API you host elsewhere):
+
+```bash
 pnpm add -D searchsocket
 ```
 
-SearchSocket is typically a dev dependency since indexing runs at build time. If you use `searchsocketHandle()` at runtime (e.g., in a Node server adapter or serving the MCP endpoint from a production deployment), add it as a regular dependency:
+Prereleases publish to the `next` dist-tag; stable releases to `latest`:
 
 ```bash
-pnpm add searchsocket
+npm install searchsocket@next
 ```
 
 ## Quickstart
@@ -59,10 +67,20 @@ Creates `searchsocket.config.ts`, the `.searchsocket/` state directory, wires up
 Minimal config (`searchsocket.config.ts`):
 
 ```ts
-export default {};
+export default {
+  project: {
+    id: "my-site",              // namespaces your records in the vector index
+    baseUrl: "https://example.com"
+  },
+  source: {
+    mode: "static-output"       // or "build" | "crawl" | "content-files"
+  }
+};
 ```
 
-That's it — defaults handle the rest. SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` from your environment automatically.
+Defaults handle everything else, and SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` from your environment automatically.
+
+Set `project.id` and `source.mode` explicitly rather than leaving them out. Both are *inferred* when absent — `project.id` from `package.json`'s `name` (falling back to the directory name), `source.mode` from whether the static output directory exists on disk. That inference works on your machine and in CI, where the checkout is right there. A deployed server bundle has neither the checkout nor `package.json` at the path the loader expects, so `searchsocketHandle()` would resolve a different project id than the one you indexed under, or fail outright on source-mode detection. Explicit values are what make the runtime hook work off a checkout.
 
 ### 3. Set environment variables
 
@@ -85,7 +103,11 @@ import { searchsocketHandle } from "searchsocket/sveltekit";
 export const handle = searchsocketHandle();
 ```
 
-This exposes `POST /api/search`, `GET /api/search/health`, the MCP endpoint at `/api/mcp`, and page retrieval routes.
+This exposes `POST /api/search`, `GET /api/search` and `GET /api/search/health`, plus page retrieval routes.
+
+It also mounts the MCP route at `/api/mcp` when `mcp.enable` is on (it defaults to `NODE_ENV !== "production"`), but that route **fails closed**: until you set `mcp.handle.apiKey`/`mcp.handle.apiKeyEnv`, or opt into `mcp.handle.access: "public"`, every request to it answers 503. See [MCP Server](#mcp-server) for the configuration.
+
+The served API path comes from `api.path` (default `/api/search`). You can override it per-hook with `searchsocketHandle({ path: "/search-api" })` — if you do, set `api.path` in your config to the same value, because indexing-time output such as `llms.txt` reads the config, not the hook option.
 
 `searchsocket/sveltekit` is **server-only**. It pulls in the indexing pipeline, the MCP
 SDK, and Node builtins (`fs/promises`, `child_process`, `crypto`, `net`, `zlib`), so
@@ -192,7 +214,10 @@ For local testing, you can also build and index manually:
 ```bash
 pnpm build
 pnpm searchsocket index
+pnpm searchsocket search --q "getting started"   # confirm the index answers
 ```
+
+With that index in place, `pnpm dev` and Cmd+K give you a working search.
 
 ### 7. Connect Claude Code (optional)
 
@@ -257,12 +282,40 @@ With `groupBy: "page"` (the default):
     }
   ],
   "meta": {
-    "timingsMs": { "total": 135 }
+    "timingsMs": { "search": 128, "total": 135 }
   }
 }
 ```
 
+Both `meta.timingsMs.search` and `meta.timingsMs.total` are required. The browser client validates the whole response and rejects one that is missing either, so a custom endpoint or a test fixture that omits `search` surfaces as `Invalid search response`.
+
 The `chunks` array contains matching sections within each page. Use `groupBy: "chunk"` for flat per-chunk results without page aggregation.
+
+### HTTP API reference
+
+`GET <api.path>` takes the query as parameters; `POST <api.path>` takes the same fields as a JSON object body, plus `filters` (structured metadata, which has no GET spelling).
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `q` | string | Required. Empty or missing is a 400 |
+| `topK` | integer | 1–100 |
+| `maxSubResults` | integer | 1–20 |
+| `groupBy` | `"page"` \| `"chunk"` | Default `"page"` |
+| `pathPrefix` | string | Scope results to a path |
+| `scope` | string | Index scope |
+| `tags` | string | Repeatable — the only parameter that may appear more than once |
+
+```bash
+curl "http://localhost:5173/api/search?q=getting+started&topK=5&tags=guide&tags=api"
+```
+
+Rules the endpoint enforces:
+
+- `topK` and `maxSubResults` must be whole integers on GET. `10abc`, `1.5`, `1e3`, `0x10`, zero and negatives are all 400 — no prefix-parsing.
+- Repeating a singleton parameter (`q`, `topK`, `scope`, `pathPrefix`, `groupBy`, `maxSubResults`) is a 400, identical values included.
+- `debug` and `rankingOverrides` are refused with **403** on GET and POST alike, for being present at all — the value is irrelevant. They stay on the engine's own API, which the CLI and the local playground call directly.
+- `GET <api.path>/health` returns **200** only when the engine reports healthy, **503** when it does not. The body is the same either way.
+- Rate-limited responses are 429 and carry `Retry-After`. Error responses carry `cache-control: no-store`.
 
 ## Source Modes
 
@@ -382,6 +435,8 @@ const { results } = await client.search({
 });
 ```
 
+The client validates the whole response before returning it. A 2xx whose body carries a non-finite score, a malformed chunk, a `meta.timingsMs` missing `search` or `total`, or a result URL that is not safe to navigate to is rejected as an error rather than handed back to be rendered. It also strips `debug` and `rankingOverrides` before sending, so type-correct code that names them does not come back as a 403.
+
 ### `buildResultUrl(result)`
 
 Builds a URL from a search result that includes scroll-to-text metadata:
@@ -396,6 +451,12 @@ import { buildResultUrl } from "searchsocket/client";
 const href = buildResultUrl(result);
 // "/docs/getting-started?_ssk=Installation&_sskt=Install+with+pnpm#:~:text=Install%20with%20pnpm"
 ```
+
+### `isSafeResultUrl(value)`
+
+Whether a result URL is safe to render as an `href` or hand to a router. `javascript:`, `data:`, URLs carrying control characters, and anything the URL parser cannot resolve are refused; ordinary relative, protocol-relative and `http(s)` URLs pass. Exported from both `searchsocket/client` and `searchsocket/svelte`.
+
+`buildResultUrl()` returns `""` for an unsafe result, and the shipped `SearchResults` template renders such a row as a non-navigable span rather than a link. Treat an empty string as "do not link this".
 
 ## Svelte 5 Integration
 
@@ -491,7 +552,7 @@ pnpm searchsocket add search-results    # standalone result list
 pnpm searchsocket add search-trigger    # the button that opens the dialog
 ```
 
-Each command writes a self-contained kit to `src/lib/components/search/` (configurable via `--dir`): the component, a shared `SearchResultRow.svelte`, pure helpers in `search-ui.ts`, and `search-theme.css`. They are Svelte 5 source you own, not dependencies — nothing imports back into `node_modules`.
+Each command writes a self-contained kit to `src/lib/components/search/` (configurable via `--dir`): the component, a shared `SearchResultRow.svelte`, pure helpers in `search-ui.ts`, and `search-theme.css`. You own the Svelte 5 source — edit it freely, it is never updated under you. It is not standalone, though: the shared helpers import types from `searchsocket`, and the interactive components import `createSearch` from `searchsocket/svelte` and `createSearchClient`/`buildResultUrl` from `searchsocket/client`. The package stays a dependency; what you own is the markup and the styling.
 
 The default is styled with plain CSS and semantic `--ss-search-*` variables, so it works with or without Tailwind and looks finished without edits. Existing files are never overwritten without `--overwrite`, so adding a second component keeps any changes you made to the shared files.
 
@@ -704,8 +765,8 @@ Add `.mcp.json` to your project root:
 ```
 
 The MCP endpoint requires an API key. Its tools return repository paths, a
-page's indexed markdown, and any scope the caller names, so it refuses to serve
-without one:
+page's indexed markdown, and any scope the caller names, so it fails closed —
+every request answers **503** until a key is configured:
 
 ```ts
 // src/hooks.server.ts
@@ -724,6 +785,10 @@ export const handle = searchsocketHandle({
 
 `mcp.enable` defaults to `NODE_ENV !== "production"`, so set it explicitly for a
 production deployment.
+
+The one alternative to a key is `mcp.handle.access: "public"`, which serves anonymous
+callers the same redacted result set the browser API already returns — published
+content and nothing more. It is a deliberate opt-in, not a fallback.
 
 Then pass the key in `.mcp.json`:
 
@@ -815,6 +880,16 @@ export default {
   }
 };
 ```
+
+Both files open with a short **Retrieval API** section, so an agent that finds the file
+can query the index instead of crawling the page list. It names the search endpoint
+(always — the route needs no credential), and the MCP endpoint only when that endpoint
+would actually answer: MCP enabled, and either `mcp.handle.access: "public"` or an API
+key that resolves at index time.
+
+The advertised URLs come from `api.path` and `mcp.handle.path` in your config, read at
+index time. If you override the served path with `searchsocketHandle({ path })`, set
+`api.path` to the same value or the file will advertise a URL your site does not serve.
 
 After indexing, `llms.txt` (page index with links) and `llms-full.txt` (full content) are written to your static directory. `searchsocketHandle()` serves the file at `llmsTxt.outputPath` directly; `llms-full.txt` has no handler of its own and is served as a static asset, so it has to be in the deployed output. If your adapter copies `static/` before indexing runs, generate these ahead of the adapter step or serve them from your own route.
 
@@ -940,7 +1015,7 @@ pnpm searchsocket status
 
 ### `searchsocket doctor`
 
-Validate config, env vars, provider connectivity, and write access.
+Validate config, env vars, provider connectivity, and **local** write access — it writes a probe file into the state directory. It does not test write permission against the remote index.
 
 ```bash
 pnpm searchsocket doctor
@@ -973,8 +1048,13 @@ Reports pass/fail per assertion and Mean Reciprocal Rank (MRR) across all querie
 
 ### `searchsocket clean`
 
-Delete local state and optionally remote indexes. Remote deletion is a dry run
-until you pass `--apply`.
+Delete local state and optionally remote indexes.
+
+With `--remote`, the command is **plan-only until `--apply`** — it deletes nothing
+at all, local state included, and prints what it would do. `--apply` performs both
+the remote deletion and the local one; `--keep-local` suppresses the local deletion
+on an applied run. Without `--remote`, `clean` removes the local state directory
+immediately.
 
 ```bash
 pnpm searchsocket clean                                  # local state only
