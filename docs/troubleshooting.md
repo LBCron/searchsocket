@@ -6,7 +6,7 @@
 
 1. **Check that your index has data.** Run `pnpm searchsocket status` to see the document count and backend health.
 
-2. **Run the doctor.** `pnpm searchsocket doctor` validates your config, environment variables, and Upstash connectivity.
+2. **Run the doctor.** `pnpm searchsocket doctor` validates your config, environment variables, and Upstash connectivity. Its write check writes a file into the local state directory — it proves nothing about remote write permission or about the index being the hybrid type indexing needs. A token that reads fine and cannot upsert still passes doctor; `searchsocket index` is what proves that.
 
 3. **Check the Upstash dashboard.** Log into [console.upstash.com](https://console.upstash.com) and verify your Vector index has documents in the correct namespace (`chunks` and `pages`).
 
@@ -52,6 +52,14 @@
 
 - **Full page loads vs client navigation.** On SvelteKit client-side navigation, the `afterNavigate` hook handles scrolling. On full page loads, the browser's native Text Fragment support (`#:~:text=`) handles it — this requires Chrome 80+, Safari 16.1+, or Firefox 131+.
 
+### Health check reports the site as up while search is broken
+
+`GET <api.path>/health` answers **503** when the backend is unhealthy and 200 only when
+it is healthy. If your uptime monitor was written against the old behaviour — always
+200, with `ok: false` in the body — it will now report the outage as a failing check
+rather than a passing one. That is the intended reading; adjust the alert, not the
+endpoint.
+
 ### SSR bundling errors
 
 If you see errors like `Cannot find module 'searchsocket'` during SSR, mark SearchSocket as external:
@@ -94,7 +102,7 @@ Images are made searchable by extracting their text descriptions (`data-search-d
 
 | Command | What it checks |
 |---------|---------------|
-| `pnpm searchsocket doctor` | Config, env vars, Upstash connectivity, write access |
+| `pnpm searchsocket doctor` | Config, env vars, Upstash connectivity, **local** state-directory write access |
 | `pnpm searchsocket status` | Index health, document count, scope, last indexed time |
 | `pnpm searchsocket test` | Search quality assertions and MRR |
 | `pnpm searchsocket search --q "test"` | Quick search to verify results |

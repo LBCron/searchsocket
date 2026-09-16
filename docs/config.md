@@ -10,6 +10,19 @@ export default {};
 
 SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` from your environment by default.
 
+That empty object is enough for local development, where the filesystem and
+`package.json` are both present: `project.id` falls back to the `package.json` name
+and `source.mode` is detected from what exists on disk. Neither inference is
+available to a deployed server bundle, and both have to agree between the machine
+that indexed and the machine that serves. Set them explicitly once you deploy:
+
+```ts
+export default {
+  project: { id: "my-site" },
+  source: { mode: "static-output" }
+};
+```
+
 ## Project
 
 - `project.id` (default: `package.json` name) — unique identifier for the project
@@ -188,36 +201,8 @@ now produces a migration error. Tune ranking through `ranking.weights`.
 Final scores are not confined to 0–1 and are not confidence values: the boosts above are
 additive, and in page mode `pageWeights` multiplies on top of them. Both thresholds are
 therefore relative — they compare scores within one result set and mean nothing as
-absolute numbers.
-
-#### API access policy
-
-- `api.allowedScopes` (default `[]`) — scopes a browser request may select with
-  `?scope=` or a `scope` field in a POST body. Empty means the caller cannot
-  choose and always gets the server's configured scope; anything else is a 403.
-- `api.exposeInternalFields` (default `false`) — include `routeFile` (a path in
-  your repository) and `chunkText` (the matched section's indexed text) in
-  browser search responses, and `routeFile` in page responses. Off by default.
-
-### MCP access
-
-- `mcp.enable` (default `NODE_ENV !== "production"`) — mount the MCP endpoint on
-  the SvelteKit handle.
-- `mcp.handle.apiKey` / `mcp.handle.apiKeyEnv` — required for the endpoint to
-  serve anything while `mcp.handle.access` is `private`. MCP returns repository
-  paths, a page's indexed markdown, and any scope the caller names, so without a
-  key the route answers 503.
-- `mcp.handle.access` (default `private`) — governs the **SvelteKit handle
-  route**. `public` serves callers that present no `Authorization` header
-  instead of refusing them, with `routeFile`, `chunkText` and `breakdown`
-  stripped from every tool result and the caller's `scope` ignored — the same
-  fields `api.exposeInternalFields` withholds from the browser API. A valid
-  bearer token still returns them, so an editing agent configured with the key
-  keeps source paths and a public agent does not. A wrong or malformed token is
-  still a 401 rather than a silent downgrade.
-- `mcp.access` (default `private`) — governs the **standalone** MCP server only:
-  whether it binds to loopback or all interfaces. It has no effect on the
-  SvelteKit handle route, which is governed by `mcp.handle.access`.
+absolute numbers. Neither can empty a non-empty result list: the top result always
+survives both, so no threshold setting makes an off-topic query return nothing.
 
 ## Ranking weights
 
@@ -229,7 +214,10 @@ absolute numbers.
 
 ## API
 
-- `api.path` (default `/api/search`) — search endpoint path
+- `api.path` (default `/api/search`) — search endpoint path. `searchsocketHandle({ path })`
+  overrides the path actually served at runtime; `api.path` is what indexing-time output
+  (llms.txt) advertises. If you use the override, set `api.path` to match, or the
+  advertised URL points at nothing.
 - `api.cors.allowOrigins` (default `[]`) — allowed CORS origins
 - `api.rateLimit.windowMs` (optional) — rate limit window in milliseconds
 - `api.rateLimit.max` (optional) — max requests per window
@@ -257,6 +245,17 @@ absolute numbers.
 - `llmsTxt.description` (optional) — custom description
 - `llmsTxt.generateFull` (default `true`) — generate full content version
 - `llmsTxt.serveMarkdownVariants` (default `false`) — serve markdown variants
+
+The generated `llms.txt` and `llms-full.txt` carry a short **Retrieval API** section
+so an agent asks the index a question instead of crawling the page list. It always
+names the search endpoint (`config.api.path`, resolved against `project.baseUrl`), and
+names the MCP endpoint only when that route would actually answer: `mcp.enable` is on
+*and* `mcp.handle.access` is `public` or an API key resolves. Neither the key nor the
+variable holding it is ever written into the file.
+
+Both URLs are resolved at index time from config, so build and runtime have to agree —
+see the note on `api.path` above, and keep `project.id` and the scope the same on both
+sides.
 
 ## State
 
