@@ -152,6 +152,35 @@ describe("createSearchClient", () => {
     expect(body.groupBy).toBe("page");
   });
 
+  it("does not forward privileged fields the public endpoint refuses", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        q: "test",
+        scope: "main",
+        results: [],
+        meta: { timingsMs: { search: 0, total: 0 } }
+      })
+    });
+
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    // `SearchRequest` is shared with the engine, so this is type-correct code.
+    // The HTTP boundary refuses both fields for being present at all, which
+    // would make it a 403 if the client forwarded the request verbatim.
+    await client.search({
+      q: "test query",
+      topK: 5,
+      debug: false,
+      rankingOverrides: { ranking: { weights: { incomingLinks: 2 } } }
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0]?.[1]?.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ q: "test query", topK: 5 });
+    expect("debug" in body).toBe(false);
+    expect("rankingOverrides" in body).toBe(false);
+  });
+
   it("rejects a JSON null response body", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,

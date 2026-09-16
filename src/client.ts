@@ -2,7 +2,7 @@ import type { SearchRequest, SearchResponse, SearchResult } from "./types";
 // Lives under `src/svelte/` because that is the only source directory the
 // published tarball carries whole, and the raw-source store needs the same
 // checks. This entry point is bundled by tsup, so the import is inlined here.
-import { isSafeResultUrl, isSearchResponse } from "./svelte/response-validation";
+import { errorMessageFrom, isSafeResultUrl, isSearchResponse } from "./svelte/response-validation";
 
 export { isSafeResultUrl } from "./svelte/response-validation";
 
@@ -95,6 +95,26 @@ export function buildResultUrl(result: SearchResult): string {
   return `${path}?${params.toString()}${hash}`;
 }
 
+/**
+ * Fields the public search endpoint refuses outright.
+ *
+ * `SearchRequest` is shared with `SearchEngine.search`, where the CLI and the
+ * local playground legitimately pass `debug` and `rankingOverrides`. The HTTP
+ * boundary refuses them for being present at all, so forwarding a request
+ * verbatim would turn type-correct browser code — `search({ q, debug: false })`
+ * — into a 403. Drop them here instead: a browser client talking to the public
+ * endpoint has no use for either, and the strictness belongs on the server.
+ */
+const PRIVILEGED_REQUEST_FIELDS = ["debug", "rankingOverrides"] as const;
+
+function toPublicRequest(request: SearchRequest): SearchRequest {
+  if (!PRIVILEGED_REQUEST_FIELDS.some((field) => field in request)) return request;
+
+  const publicRequest = { ...request };
+  for (const field of PRIVILEGED_REQUEST_FIELDS) delete publicRequest[field];
+  return publicRequest;
+}
+
 export interface SearchClientOptions {
   endpoint?: string;
   fetchImpl?: typeof fetch;
@@ -111,7 +131,7 @@ export function createSearchClient(options: SearchClientOptions = {}) {
         headers: {
           "content-type": "application/json"
         },
-        body: JSON.stringify(request)
+        body: JSON.stringify(toPublicRequest(request))
       });
 
       let payload: unknown;
@@ -125,8 +145,7 @@ export function createSearchClient(options: SearchClientOptions = {}) {
       }
 
       if (!response.ok) {
-        const message = (payload as { error?: { message?: string } }).error?.message ?? "Search failed";
-        throw new Error(message);
+        throw new Error(errorMessageFrom(payload, "Search failed"));
       }
 
       if (!isSearchResponse(payload)) {

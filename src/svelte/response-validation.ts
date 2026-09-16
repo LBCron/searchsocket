@@ -158,3 +158,21 @@ export function isSearchResponse(payload: unknown): payload is SearchResponse {
 
   return Array.isArray(response.results) && response.results.every(isSearchResult);
 }
+
+/**
+ * Pull the server's message out of a non-2xx body.
+ *
+ * Both entry points reached for `payload.error?.message` directly, where the
+ * optional chain guards `error` but not `payload`: a non-2xx response whose
+ * body is JSON `null` — or a bare string or number, which an upstream proxy or
+ * a custom endpoint can easily return — threw a `TypeError` that surfaced in
+ * place of the real failure. Falls back to the caller's default whenever the
+ * body is not the documented `{ error: { message } }` envelope.
+ */
+export function errorMessageFrom(payload: unknown, fallback: string): string {
+  if (typeof payload !== "object" || payload === null) return fallback;
+  const error = (payload as { error?: unknown }).error;
+  if (typeof error !== "object" || error === null) return fallback;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" && message !== "" ? message : fallback;
+}

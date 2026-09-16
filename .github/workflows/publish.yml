@@ -83,10 +83,23 @@ jobs:
         # Confirms the registry actually serves what we just pushed, rather
         # than assuming a successful publish means a working install.
         run: |
-          sleep 15
           cd "$(mktemp -d)"
           npm init -y > /dev/null
-          npm install "searchsocket@${GITHUB_REF_NAME#v}"
+          # The install is retried for the same reason the dist-tag check below
+          # is: the registry converges a little behind the publish. A fixed
+          # sleep that turned out to be too short failed the workflow for a
+          # version that had already published — and a published version is
+          # immutable, so that failure could not be retried away.
+          VERSION="${GITHUB_REF_NAME#v}"
+          INSTALLED=""
+          for _ in 1 2 3 4 5; do
+            npm install "searchsocket@$VERSION" && { INSTALLED=yes; break; }
+            sleep 10
+          done
+          if [ -z "$INSTALLED" ]; then
+            echo "::error::searchsocket@$VERSION did not become installable"
+            exit 1
+          fi
           # A publish that landed on the wrong dist-tag installs and imports
           # perfectly well, so the smoke test has to look at the tag itself.
           # Retried because registry metadata converges a little behind the
@@ -95,11 +108,11 @@ jobs:
           RESOLVED=""
           for _ in 1 2 3 4 5; do
             RESOLVED="$(npm view "searchsocket@$DIST_TAG" version || true)"
-            [ "$RESOLVED" = "${GITHUB_REF_NAME#v}" ] && break
+            [ "$RESOLVED" = "$VERSION" ] && break
             sleep 10
           done
-          if [ "$RESOLVED" != "${GITHUB_REF_NAME#v}" ]; then
-            echo "::error::dist-tag $DIST_TAG resolves to ${RESOLVED:-nothing}, not ${GITHUB_REF_NAME#v}"
+          if [ "$RESOLVED" != "$VERSION" ]; then
+            echo "::error::dist-tag $DIST_TAG resolves to ${RESOLVED:-nothing}, not $VERSION"
             exit 1
           fi
           node -e "import('searchsocket').then(m => { if (!m) process.exit(1); console.log('root import ok'); })"

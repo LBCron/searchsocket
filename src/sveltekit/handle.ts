@@ -660,8 +660,13 @@ async function readBoundedJsonBody(request: any, bodyLimit: number): Promise<unk
  * Refusing the *field* rather than the enabled value is what makes the rule
  * unbypassable: `debug: false` with overrides attached is not a special case to
  * reason about, it is simply not accepted here.
+ *
+ * Exported for tests only — `src/sveltekit.ts` re-exports this module by name
+ * and does not list it, so it is not part of the package's public surface. The
+ * browser client strips the same fields before sending; the test that holds the
+ * two lists together needs this one to be readable rather than retyped.
  */
-const PRIVILEGED_SEARCH_FIELDS = ["debug", "rankingOverrides"] as const;
+export const PRIVILEGED_SEARCH_FIELDS = ["debug", "rankingOverrides"] as const;
 
 function assertNoPrivilegedFields(has: (field: string) => boolean): void {
   for (const field of PRIVILEGED_SEARCH_FIELDS) {
@@ -941,7 +946,7 @@ async function handleMcpRequest(
         },
         id: null
       }),
-      { status: 405, headers: { "content-type": "application/json", allow: "POST" } }
+      { status: 405, headers: { "content-type": "application/json", "cache-control": "no-store", allow: "POST" } }
     );
   }
 
@@ -955,7 +960,7 @@ async function handleMcpRequest(
         },
         id: null
       }),
-      { status: 405, headers: { "content-type": "application/json", allow: "POST" } }
+      { status: 405, headers: { "content-type": "application/json", "cache-control": "no-store", allow: "POST" } }
     );
   }
 
@@ -989,7 +994,7 @@ async function handleMcpRequest(
         },
         id: null
       }),
-      { status: 503, headers: { "content-type": "application/json" } }
+      { status: 503, headers: { "content-type": "application/json", "cache-control": "no-store" } }
     );
   }
 
@@ -1000,7 +1005,7 @@ async function handleMcpRequest(
         error: { code: -32001, message: "Unauthorized" },
         id: null
       }),
-      { status: 401, headers: { "content-type": "application/json" } }
+      { status: 401, headers: { "content-type": "application/json", "cache-control": "no-store" } }
     );
 
   // A caller that sent no Authorization header at all is anonymous. One that
@@ -1106,7 +1111,7 @@ async function handleMcpRequest(
         },
         id: null
       }),
-      { status: 500, headers: { "content-type": "application/json" } }
+      { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store" } }
     );
   }
 }

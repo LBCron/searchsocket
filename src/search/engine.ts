@@ -518,8 +518,19 @@ export class SearchEngine {
     debug?: boolean,
     maxSubResults: number = 5
   ): SearchResult[] {
-    return rankedPages.map((page, i) => {
-      const chunks = allChunks[i] ?? [];
+    return rankedPages.flatMap((page, i) => {
+      // A non-finite score is the sentinel `rankHits`/`rankPages` use for a hit
+      // whose backend score or metadata could not be read as a number, and the
+      // minScoreRatio filter cannot remove it: that filter is skipped entirely
+      // when the top score is itself non-finite, so a run of malformed hits
+      // passes through untouched. `JSON.stringify(-Infinity)` is `null`, which
+      // the browser validators reject — one bad record would otherwise fail the
+      // whole response rather than just itself.
+      if (!Number.isFinite(page.finalScore)) return [];
+
+      // Sub-result scores come straight off the backend hit rather than through
+      // ranking, so they get the same finite check as the page score.
+      const chunks = (allChunks[i] ?? []).filter((c) => Number.isFinite(c.score));
 
       // Best chunk is the first one (highest similarity to query within this page)
       const bestChunk = chunks[0];
@@ -581,13 +592,17 @@ export class SearchEngine {
     // unreachable — the page-first pipeline builds its own results — so its
     // config (aggregationCap, aggregationDecay, weights.aggregation,
     // minChunkScoreRatio) was tunable but inert.
-      let filtered = ordered;
+      // Same finite guard as the page-first path: minScoreRatio is skipped when
+      // the top score is non-finite, so malformed hits would otherwise reach the
+      // wire as `null` scores and fail the browser validators for the whole
+      // response rather than for themselves.
+      let filtered = ordered.filter((entry) => Number.isFinite(entry.finalScore));
       const minScoreRatio = cfg.ranking.minScoreRatio;
-      if (minScoreRatio > 0 && ordered.length > 0) {
-        const topScore = ordered[0]!.finalScore;
-        if (Number.isFinite(topScore) && topScore > 0) {
+      if (minScoreRatio > 0 && filtered.length > 0) {
+        const topScore = filtered[0]!.finalScore;
+        if (topScore > 0) {
           const threshold = topScore * minScoreRatio;
-          filtered = ordered.filter((entry) => entry.finalScore >= threshold);
+          filtered = filtered.filter((entry) => entry.finalScore >= threshold);
         }
       }
       return filtered.slice(0, topK).map(({ hit, finalScore, breakdown }) => {

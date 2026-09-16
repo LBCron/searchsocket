@@ -1,5 +1,5 @@
 import type { SearchRequest, SearchResult } from "../types";
-import { isSearchResponse } from "./response-validation";
+import { errorMessageFrom, isSearchResponse } from "./response-validation";
 export { default as SearchSocket } from "./SearchSocket.svelte";
 // Re-exported so a Svelte consumer that renders results from its own fetch can
 // apply the same safe-link rule the store applies.
@@ -233,9 +233,7 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
           }
 
           if (!response.ok) {
-            const message =
-              (payload as { error?: { message?: string } }).error?.message ?? "Search failed";
-            throw new Error(message);
+            throw new Error(errorMessageFrom(payload, "Search failed"));
           }
 
           if (!isSearchResponse(payload)) {
