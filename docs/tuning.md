@@ -167,8 +167,9 @@ Create a `searchsocket.test.json` file in your project root:
 
 `maxResults` is a ceiling on how far a result list is allowed to sprawl, not a way
 to assert that a query returns nothing. Relative trimming cannot empty a non-empty
-list — the top result always survives — so `"maxResults": 0` only ever passes when
-the index genuinely has nothing to return under the current scope and filters.
+list — the top result always survives — so `"maxResults": 0` is not an assertion
+that a query is off-topic. It passes only when nothing eligible came back at all:
+an empty scope, filters that match no records, or a backend returning nothing.
 
 ### Available assertions
 
@@ -212,7 +213,7 @@ The test runner reports:
 - For `inTop5` failures, the actual rank of each missing URL
 - **MRR (Mean Reciprocal Rank)** across all queries that have `topResult` or `inTop5` assertions
 
-MRR is a standard information retrieval metric: the average of `1/rank` for the first relevant result in each query. An MRR of 1.0 means every expected result ranked first. Lower values are the mean of the reciprocals, not the reciprocal of the mean rank — 0.5 is what you get from ranks 1 and 4 as readily as from two results at rank 2, so read it alongside the per-query output rather than on its own.
+MRR is a standard information retrieval metric: the average of `1/rank` for the first relevant result in each query. An MRR of 1.0 means every expected result ranked first. Lower values are the mean of the reciprocals, not the reciprocal of the mean rank — two results at rank 2 give 0.5, but so does one result at rank 1 paired with a query that missed entirely, since a miss contributes 0. Read it alongside the per-query output rather than on its own.
 
 ### Using tests in CI/CD
 

@@ -105,7 +105,7 @@ export const handle = searchsocketHandle();
 
 This exposes `POST /api/search`, `GET /api/search` and `GET /api/search/health`, plus page retrieval routes.
 
-It also mounts the MCP route at `/api/mcp` when `mcp.enable` is on (it defaults to `NODE_ENV !== "production"`), but that route **fails closed**: until you set `mcp.handle.apiKey`/`mcp.handle.apiKeyEnv`, or opt into `mcp.handle.access: "public"`, every request to it answers 503. See [MCP Server](#mcp-server) for the configuration.
+It also mounts the MCP route at `/api/mcp` when `mcp.enable` is on (it defaults to `NODE_ENV !== "production"`), but that route **fails closed**: until you set `mcp.handle.apiKey`/`mcp.handle.apiKeyEnv`, or opt into `mcp.handle.access: "public"`, every MCP call answers 503. (Only POST carries a call; GET and DELETE are 405 whatever the key says.) See [MCP Server](#mcp-server) for the configuration.
 
 The served API path comes from `api.path` (default `/api/search`). You can override it per-hook with `searchsocketHandle({ path: "/search-api" })` — if you do, set `api.path` in your config to the same value, because indexing-time output such as `llms.txt` reads the config, not the hook option.
 
@@ -303,7 +303,7 @@ The `chunks` array contains matching sections within each page. Use `groupBy: "c
 | `groupBy` | `"page"` \| `"chunk"` | Default `"page"` |
 | `pathPrefix` | string | Scope results to a path |
 | `scope` | string | Index scope |
-| `tags` | string | Repeatable — the only parameter that may appear more than once |
+| `tags` | string (GET) / string[] (POST) | The only parameter that may repeat on GET; a JSON array in a POST body |
 
 ```bash
 curl "http://localhost:5173/api/search?q=getting+started&topK=5&tags=guide&tags=api"
@@ -312,10 +312,11 @@ curl "http://localhost:5173/api/search?q=getting+started&topK=5&tags=guide&tags=
 Rules the endpoint enforces:
 
 - `topK` and `maxSubResults` must be whole integers on GET. `10abc`, `1.5`, `1e3`, `0x10`, zero and negatives are all 400 — no prefix-parsing.
-- Repeating a singleton parameter (`q`, `topK`, `scope`, `pathPrefix`, `groupBy`, `maxSubResults`) is a 400, identical values included.
+- Repeating a singleton parameter (`q`, `topK`, `scope`, `pathPrefix`, `groupBy`, `maxSubResults`) is a 400, identical values included. The same rule applies to `?scope=` on the page-retrieval route.
 - `debug` and `rankingOverrides` are refused with **403** on GET and POST alike, for being present at all — the value is irrelevant. They stay on the engine's own API, which the CLI and the local playground call directly.
-- `GET <api.path>/health` returns **200** only when the engine reports healthy, **503** when it does not. The body is the same either way.
-- Rate-limited responses are 429 and carry `Retry-After`. Error responses carry `cache-control: no-store`.
+- `GET <api.path>/health` returns **200** only when the engine reports healthy, **503** when it does not. The body keeps its existing shape — `{ "ok": true }`, or `{ "ok": false, "details": "..." }` — so only the status changed.
+- Rate-limited responses are 429 and carry `Retry-After`, exposed to browser JavaScript via `Access-Control-Expose-Headers` when CORS is on. Error responses carry `cache-control: no-store`.
+- A record whose score cannot be read as a number is dropped from the results rather than serialized. The browser client refuses a whole response containing one, so the engine removes it first — a corrupt record costs you that row, not the search.
 
 ## Source Modes
 
@@ -766,7 +767,7 @@ Add `.mcp.json` to your project root:
 
 The MCP endpoint requires an API key. Its tools return repository paths, a
 page's indexed markdown, and any scope the caller names, so it fails closed —
-every request answers **503** until a key is configured:
+every MCP call answers **503** until a key is configured:
 
 ```ts
 // src/hooks.server.ts

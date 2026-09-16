@@ -10,11 +10,13 @@ export default {};
 
 SearchSocket reads `UPSTASH_VECTOR_REST_URL` and `UPSTASH_VECTOR_REST_TOKEN` from your environment by default.
 
-That empty object is enough for local development, where the filesystem and
-`package.json` are both present: `project.id` falls back to the `package.json` name
-and `source.mode` is detected from what exists on disk. Neither inference is
-available to a deployed server bundle, and both have to agree between the machine
-that indexed and the machine that serves. Set them explicitly once you deploy:
+That empty object leans entirely on inference: `project.id` falls back to the
+`package.json` name, and `source.mode` is detected from what exists on disk — which
+means it only works once you have already built, since detection fails with
+`CONFIG_MISSING` when the static output directory is absent and nothing else
+selects a mode. Neither inference is available to a deployed server bundle, and both
+have to agree between the machine that indexed and the machine that serves. Set them
+explicitly rather than relying on detection:
 
 ```ts
 export default {
