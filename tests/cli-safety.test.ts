@@ -113,7 +113,66 @@ describe("searchsocket CLI safety (real process)", () => {
 
       expect(status).toBe(0);
       expect(stdout).toContain("deleted local state directory");
+      // A local-only clean is not plan-first: --remote is what defers deletion.
+      expect(stdout).not.toContain("plan:");
       expect(fs.existsSync(path.join(tmpDir, ".searchsocket"))).toBe(false);
+    });
+
+    // The bug this closes: the local removal ran before the remote dry-run
+    // guard, so a plan run printed "dry-run only" after it had already wiped
+    // .searchsocket.
+    it("deletes nothing on a --remote dry run and says what it would delete", () => {
+      fs.mkdirSync(path.join(tmpDir, ".searchsocket"));
+      fs.writeFileSync(path.join(tmpDir, ".searchsocket", "manifest.json"), "{}");
+
+      const { status, stdout } = runCli(tmpDir, ["clean", "--remote"]);
+
+      expect(status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, ".searchsocket", "manifest.json"))).toBe(true);
+      expect(stdout).toContain("plan: delete local state directory");
+      expect(stdout).toContain("plan: delete remote records");
+      expect(stdout).toContain("dry-run only. pass --apply to delete.");
+      expect(stdout).not.toContain("deleted local state directory");
+    });
+
+    it("deletes nothing on an --all-scopes dry run", () => {
+      fs.mkdirSync(path.join(tmpDir, ".searchsocket"));
+
+      const { status, stdout } = runCli(tmpDir, [
+        "clean",
+        "--remote",
+        "--all-scopes",
+        "--confirm-project",
+        "cli-safety"
+      ]);
+
+      expect(status).toBe(0);
+      expect(fs.existsSync(path.join(tmpDir, ".searchsocket"))).toBe(true);
+      expect(stdout).toContain("plan: drop ALL scopes");
+      expect(stdout).toContain("nothing has been deleted.");
+    });
+
+    it("reports a plan for a state directory it would not delete anyway", () => {
+      fs.writeFileSync(path.join(tmpDir, "searchsocket.config.ts"), config("content"));
+
+      const { stdout } = runCli(tmpDir, ["clean", "--remote"]);
+
+      expect(stdout).toContain("plan: leave local state directory alone");
+      expect(fs.existsSync(path.join(tmpDir, "content", "index.md"))).toBe(true);
+    });
+
+    it("honours --keep-local on a dry run and on an applied run", () => {
+      fs.mkdirSync(path.join(tmpDir, ".searchsocket"));
+
+      const plan = runCli(tmpDir, ["clean", "--remote", "--keep-local"]);
+      expect(plan.status).toBe(0);
+      expect(plan.stdout).toContain("plan: keep the local state directory");
+      expect(fs.existsSync(path.join(tmpDir, ".searchsocket"))).toBe(true);
+
+      // The backend is unconfigured, so the applied run fails at the remote
+      // step — local state must survive that too.
+      runCli(tmpDir, ["clean", "--remote", "--keep-local", "--apply"]);
+      expect(fs.existsSync(path.join(tmpDir, ".searchsocket"))).toBe(true);
     });
 
     it("refuses a state.dir that points at the project directory", () => {

@@ -44,7 +44,17 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME is not valid semver"
             exit 1
           fi
-          echo "publishing $PKG"
+
+          # The tag and package.json agree by this point, so either is the same
+          # source of truth for the dist-tag. A prerelease (1.0.0-rc.1) must not
+          # land on "latest", where it would silently replace the stable release
+          # for every plain `npm install searchsocket`.
+          case "$TAG" in
+            *-*) DIST_TAG=next ;;
+            *)   DIST_TAG=latest ;;
+          esac
+          echo "DIST_TAG=$DIST_TAG" >> "$GITHUB_ENV"
+          echo "publishing $PKG to dist-tag $DIST_TAG"
 
       - name: Verify the tag is on main
         # Guards against publishing from a branch that never went through the
@@ -67,7 +77,7 @@ jobs:
       - name: Verify the tarball is complete
         run: pnpm run check:package
 
-      - run: pnpm publish --no-git-checks --access public --provenance
+      - run: pnpm publish --no-git-checks --access public --provenance --tag "${DIST_TAG:?dist-tag was not computed}"
 
       - name: Smoke test the published package
         # Confirms the registry actually serves what we just pushed, rather
@@ -77,6 +87,21 @@ jobs:
           cd "$(mktemp -d)"
           npm init -y > /dev/null
           npm install "searchsocket@${GITHUB_REF_NAME#v}"
+          # A publish that landed on the wrong dist-tag installs and imports
+          # perfectly well, so the smoke test has to look at the tag itself.
+          # Retried because registry metadata converges a little behind the
+          # publish; the only false failure left is a second release taking the
+          # same dist-tag while this job runs.
+          RESOLVED=""
+          for _ in 1 2 3 4 5; do
+            RESOLVED="$(npm view "searchsocket@$DIST_TAG" version || true)"
+            [ "$RESOLVED" = "${GITHUB_REF_NAME#v}" ] && break
+            sleep 10
+          done
+          if [ "$RESOLVED" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::dist-tag $DIST_TAG resolves to ${RESOLVED:-nothing}, not ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
           node -e "import('searchsocket').then(m => { if (!m) process.exit(1); console.log('root import ok'); })"
           node -e "import('searchsocket/client').then(() => console.log('client import ok'))"
           node ./node_modules/searchsocket/dist/cli.js --version

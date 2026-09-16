@@ -907,12 +907,15 @@ program
 
 program
   .command("clean")
-  .description("Delete local state and optionally delete remote indexes (dry-run by default for remote)")
+  .description(
+    "Delete local state and optionally delete remote indexes " +
+      "(--remote is plan-only, deleting nothing at all, until --apply)"
+  )
   .option("--scope <name>", "scope to delete remotely (defaults to the resolved scope)")
   .option("--remote", "delete remote indexes for a single scope", false)
   .option("--all-scopes", "delete every scope in the project (requires --confirm-project)", false)
   .option("--confirm-project <id>", "confirmation token for --all-scopes; must equal the project id")
-  .option("--apply", "actually perform remote deletions", false)
+  .option("--apply", "actually perform the planned deletions (remote records and local state)", false)
   .option("--keep-local", "do not delete the local state directory", false)
   .action(async (opts, command) => {
     const rootOpts = getRootOptions(command);
@@ -957,10 +960,22 @@ program
       }
     }
 
+    // A remote clean is plan-first: without --apply it deletes nothing at all,
+    // local state included. The local removal used to run before the dry-run
+    // guard, so `clean --remote` printed "dry-run only" *after* it had already
+    // wiped the local state directory.
+    const planOnly = opts.remote && !opts.apply;
+
     if (!opts.keepLocal) {
       let removal: Awaited<ReturnType<typeof removeStateDir>>;
       try {
-        removal = await removeStateDir(cwd, config.state.dir);
+        // A plan run goes through the same guards with the deletion itself
+        // stubbed out, so the plan is the real decision rather than a second,
+        // drifting prediction of it. It is still a snapshot: a marker file or
+        // the directory itself can change between the plan and the apply.
+        removal = planOnly
+          ? await removeStateDir(cwd, config.state.dir, async () => {})
+          : await removeStateDir(cwd, config.state.dir);
       } catch (error) {
         process.stderr.write(
           `error: ${error instanceof Error ? error.message : String(error)}\n`
@@ -970,12 +985,20 @@ program
       }
 
       if (removal.removed) {
-        process.stdout.write(`deleted local state directory: ${removal.statePath}\n`);
+        process.stdout.write(
+          planOnly
+            ? `plan: delete local state directory: ${removal.statePath}\n`
+            : `deleted local state directory: ${removal.statePath}\n`
+        );
       } else {
         process.stdout.write(
-          `left local state directory alone: ${removal.statePath} (${removal.reason})\n`
+          planOnly
+            ? `plan: leave local state directory alone: ${removal.statePath} (${removal.reason})\n`
+            : `left local state directory alone: ${removal.statePath} (${removal.reason})\n`
         );
       }
+    } else if (planOnly) {
+      process.stdout.write("plan: keep the local state directory (--keep-local)\n");
     }
 
     if (!opts.remote) return;
@@ -984,6 +1007,7 @@ program
       process.stdout.write(`plan: drop ALL scopes in project ${config.project.id}\n`);
       if (!opts.apply) {
         process.stdout.write("dry-run only. pass --apply to delete.\n");
+        process.stdout.write("nothing has been deleted.\n");
         return;
       }
 
