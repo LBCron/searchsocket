@@ -17,6 +17,105 @@ function resolvePageUrl(pageUrl: string, baseUrl?: string): string {
 }
 
 /**
+ * Describe the site's retrieval endpoints for an LLM reading llms.txt.
+ *
+ * An agent that finds only a page list will crawl the page list; the whole
+ * point of an indexed site is that it can be asked a question instead. This
+ * section is what turns the file from a directory into a pointer at the API.
+ */
+function buildRetrievalSection(config: ResolvedSearchSocketConfig): string[] {
+  const baseUrl = config.project.baseUrl;
+  const lines: string[] = [];
+
+  // The browser search route is mounted unconditionally by the SvelteKit hook
+  // and needs no credential, so it is always advertisable.
+  const searchUrl = resolveRoute(config.api.path, baseUrl);
+  lines.push(
+    `- Search: \`GET ${searchUrl}?q={query}\` returns JSON results (page URL, title, matching sections). No authentication required.`
+  );
+
+  if (isMcpReachable(config)) {
+    const mcpUrl = resolveRoute(config.mcp.handle.path, baseUrl);
+    lines.push(`- MCP: \`POST ${mcpUrl}\` speaks JSON-RPC over Streamable HTTP. ${mcpAuthNote(config)}`);
+  }
+
+  return ["", "## Retrieval API", "", ...lines];
+}
+
+/**
+ * Resolve the MCP key the same way the request handler does.
+ *
+ * Deliberately reads `process.env` rather than treating a configured
+ * `apiKeyEnv` *name* as proof of a key: the name being set says nothing about
+ * the variable being set, and handle.ts resolves the value. A build that runs
+ * without the deploy-time secret therefore stays quiet about MCP, which is the
+ * direction to err in — a missing pointer costs an agent one fallback to the
+ * page list, an advertised 503 costs it a failed call and misplaced trust.
+ */
+function resolveMcpApiKey(config: ResolvedSearchSocketConfig): string | undefined {
+  return (
+    config.mcp.handle.apiKey ??
+    (config.mcp.handle.apiKeyEnv ? process.env[config.mcp.handle.apiKeyEnv] : undefined)
+  );
+}
+
+/**
+ * Whether the MCP route would actually answer a request.
+ *
+ * `handle.ts` mounts the route only when `mcp.enable` is true, and then fails
+ * closed with a 503 when access is private and no key resolved. Advertising a
+ * dead endpoint in a public file is worse than saying nothing, so this mirrors
+ * that gating exactly.
+ */
+function isMcpReachable(config: ResolvedSearchSocketConfig): boolean {
+  if (!config.mcp.enable) return false;
+  if (config.mcp.handle.access === "public") return true;
+  return Boolean(resolveMcpApiKey(config));
+}
+
+/**
+ * The credential sentence for the MCP line.
+ *
+ * Never names the key or the environment variable holding it: this file is
+ * served publicly at /llms.txt, and the variable's name is deployment detail an
+ * external caller cannot act on anyway. A caller entitled to the endpoint was
+ * given the key out of band.
+ */
+function mcpAuthNote(config: ResolvedSearchSocketConfig): string {
+  // Resolved, not merely named: under public access an unresolved key means
+  // every authenticated attempt is a 401, so promising that a Bearer token
+  // unlocks the full result set would be a lie.
+  const hasKey = Boolean(resolveMcpApiKey(config));
+
+  if (config.mcp.handle.access === "public") {
+    return hasKey
+      ? "Open to anonymous callers, which receive a redacted result set; an API key sent as a Bearer token unlocks the full one."
+      : "Open to anonymous callers, which receive a redacted result set.";
+  }
+
+  return "Requires an API key sent as an `Authorization: Bearer` header.";
+}
+
+/**
+ * Resolve a configured route to the form an LLM should call.
+ *
+ * Uses the same URL resolution as the page list rather than `joinUrl`: routes
+ * are matched against `event.url.pathname`, so they are origin-absolute, and
+ * appending them to a baseUrl that carries a path prefix would produce a URL
+ * the hook never sees. With no baseUrl the relative path stands on its own —
+ * whoever is reading this fetched it from the site, so it resolves against the
+ * origin they already have, exactly as the page links do.
+ *
+ * The configured path is passed through verbatim, deliberately skipping
+ * `normalizeUrlPath`: the hook compares it to the pathname literally, so a
+ * configured "/api/search/" is the path that answers and normalising the
+ * trailing slash away would advertise one that does not.
+ */
+function resolveRoute(routePath: string, baseUrl?: string): string {
+  return resolvePageUrl(routePath, baseUrl);
+}
+
+/**
  * Generate the content of an llms.txt file from indexed pages.
  */
 export function generateLlmsTxt(
@@ -32,6 +131,8 @@ export function generateLlmsTxt(
   if (description) {
     lines.push("", `> ${description}`);
   }
+
+  lines.push(...buildRetrievalSection(config));
 
   // Filter out /llms.txt and /llms-full.txt from the page list
   const filtered = pages.filter(
@@ -79,6 +180,8 @@ export function generateLlmsFullTxt(
   if (description) {
     lines.push("", `> ${description}`);
   }
+
+  lines.push(...buildRetrievalSection(config));
 
   const filtered = pages.filter(
     (p) => p.url !== "/llms.txt" && p.url !== "/llms-full.txt"

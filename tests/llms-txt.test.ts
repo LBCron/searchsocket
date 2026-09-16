@@ -37,6 +37,21 @@ function makeConfig(overrides: Partial<ResolvedSearchSocketConfig["llmsTxt"]> = 
   };
 }
 
+function withMcp(
+  config: ResolvedSearchSocketConfig,
+  handle: Partial<ResolvedSearchSocketConfig["mcp"]["handle"]> & { enable?: boolean }
+): ResolvedSearchSocketConfig {
+  const { enable, ...handleOverrides } = handle;
+  return {
+    ...config,
+    mcp: {
+      ...config.mcp,
+      enable: enable ?? config.mcp.enable,
+      handle: { ...config.mcp.handle, ...handleOverrides }
+    }
+  };
+}
+
 describe("generateLlmsTxt", () => {
   it("generates valid llms.txt with title, description, and page entries", () => {
     const config = makeConfig({ title: "My Site", description: "A site about things." });
@@ -233,5 +248,169 @@ describe("writeLlmsTxt", () => {
     await writeLlmsTxt([], config, tmpDir, logger);
 
     await expect(fs.access(path.join(tmpDir, "static/llms-full.txt"))).rejects.toThrow();
+  });
+});
+
+describe("retrieval API section", () => {
+  it("always points at the public search endpoint", () => {
+    const config = makeConfig();
+    const result = generateLlmsTxt([], config);
+
+    expect(result).toContain("## Retrieval API");
+    expect(result).toContain("- Search: `GET /api/search?q={query}`");
+    expect(result).toContain("No authentication required.");
+  });
+
+  it("honours a custom api.path", () => {
+    const base = makeConfig();
+    const config = { ...base, api: { ...base.api, path: "/_search" } };
+
+    expect(generateLlmsTxt([], config)).toContain("`GET /_search?q={query}`");
+  });
+
+  it("uses absolute endpoint URLs when baseUrl is configured", () => {
+    const config = makeConfig();
+    config.project.baseUrl = "https://example.com";
+
+    const result = generateLlmsTxt([], withMcp(config, { enable: true, apiKey: "sk-test-key" }));
+    expect(result).toContain("`GET https://example.com/api/search?q={query}`");
+    expect(result).toContain("`POST https://example.com/api/mcp`");
+  });
+
+  it("falls back to origin-relative endpoint paths when baseUrl is unset", () => {
+    const config = makeConfig();
+    config.project.baseUrl = undefined;
+
+    const result = generateLlmsTxt([], withMcp(config, { enable: true, apiKey: "sk-test-key" }));
+    expect(result).toContain("`GET /api/search?q={query}`");
+    expect(result).toContain("`POST /api/mcp`");
+  });
+
+  it("resolves endpoints against the origin, not a baseUrl path prefix", () => {
+    // Routes are matched against event.url.pathname, so they are
+    // origin-absolute; appending them to a prefixed baseUrl would advertise a
+    // URL the SvelteKit hook never sees.
+    const config = makeConfig();
+    config.project.baseUrl = "https://example.com/docs/";
+
+    expect(generateLlmsTxt([], config)).toContain("`GET https://example.com/api/search?q={query}`");
+  });
+
+  it("advertises MCP when it is enabled and a key is configured", () => {
+    const config = withMcp(makeConfig(), { enable: true, apiKey: "sk-test-key" });
+    const result = generateLlmsTxt([], config);
+
+    expect(result).toContain("- MCP: `POST /api/mcp`");
+    expect(result).toContain("Authorization: Bearer");
+  });
+
+  it("advertises MCP when apiKeyEnv resolves to a value", () => {
+    process.env.SS_MCP_KEY_PRESENT = "sk-from-env";
+    try {
+      const config = withMcp(makeConfig(), { enable: true, apiKeyEnv: "SS_MCP_KEY_PRESENT" });
+      const result = generateLlmsTxt([], config);
+
+      expect(result).toContain("- MCP: `POST /api/mcp`");
+      // Neither the value nor the variable's name belongs in a public file.
+      expect(result).not.toContain("sk-from-env");
+      expect(result).not.toContain("SS_MCP_KEY_PRESENT");
+    } finally {
+      delete process.env.SS_MCP_KEY_PRESENT;
+    }
+  });
+
+  it("stays silent about MCP when apiKeyEnv names a variable that is not set", () => {
+    // handle.ts resolves the variable, so an unset name is a 503 at runtime.
+    delete process.env.SS_MCP_KEY_ABSENT;
+    const config = withMcp(makeConfig(), { enable: true, apiKeyEnv: "SS_MCP_KEY_ABSENT" });
+
+    expect(generateLlmsTxt([], config)).not.toContain("/api/mcp");
+  });
+
+  it("does not promise a Bearer upgrade on a public route whose key never resolves", () => {
+    delete process.env.SS_MCP_KEY_ABSENT;
+    const config = withMcp(makeConfig(), {
+      enable: true,
+      access: "public",
+      apiKeyEnv: "SS_MCP_KEY_ABSENT"
+    });
+
+    const result = generateLlmsTxt([], config);
+    expect(result).toContain("- MCP: `POST /api/mcp`");
+    expect(result).not.toContain("Bearer");
+  });
+
+  it("advertises configured paths verbatim, trailing slash included", () => {
+    // The hook matches the pathname literally, so normalising the slash away
+    // would advertise a path that falls through to the application.
+    const base = makeConfig();
+    const config = withMcp(
+      { ...base, api: { ...base.api, path: "/api/search/" } },
+      { enable: true, access: "public", path: "/api/mcp/" }
+    );
+
+    const result = generateLlmsTxt([], config);
+    expect(result).toContain("`GET /api/search/?q={query}`");
+    expect(result).toContain("`POST /api/mcp/`");
+  });
+
+  it("advertises MCP when access is public and no key is configured", () => {
+    const config = withMcp(makeConfig(), { enable: true, access: "public" });
+    const result = generateLlmsTxt([], config);
+
+    expect(result).toContain("- MCP: `POST /api/mcp`");
+    expect(result).toContain("anonymous callers");
+    expect(result).not.toContain("Authorization: Bearer");
+  });
+
+  it("mentions both modes when access is public and a key is configured", () => {
+    const config = withMcp(makeConfig(), { enable: true, access: "public", apiKey: "sk-test-key" });
+    const result = generateLlmsTxt([], config);
+
+    expect(result).toContain("anonymous callers");
+    expect(result).toContain("Bearer token");
+  });
+
+  it("stays silent about MCP when it is enabled but private with no key", () => {
+    // handle.ts fails this configuration closed with a 503; advertising it
+    // would point an LLM at a dead endpoint.
+    const config = withMcp(makeConfig(), { enable: true, access: "private" });
+    const result = generateLlmsTxt([], config);
+
+    expect(result).toContain("## Retrieval API");
+    expect(result).not.toContain("/api/mcp");
+  });
+
+  it("stays silent about MCP when mcp.enable is false", () => {
+    const config = withMcp(makeConfig(), { enable: false, access: "public", apiKey: "sk-test-key" });
+
+    expect(generateLlmsTxt([], config)).not.toContain("/api/mcp");
+  });
+
+  it("never leaks the API key value into the public file", () => {
+    const config = withMcp(makeConfig(), { enable: true, apiKey: "sk-super-secret-value" });
+
+    expect(generateLlmsTxt([], config)).not.toContain("sk-super-secret-value");
+    expect(generateLlmsFullTxt([], config)).not.toContain("sk-super-secret-value");
+  });
+
+  it("appears in llms-full.txt ahead of the page content", () => {
+    const config = withMcp(makeConfig(), { enable: true, apiKey: "sk-test-key" });
+    const pages = [makePage({ url: "/a", title: "Page A", markdown: "Body." })];
+
+    const result = generateLlmsFullTxt(pages, config);
+    expect(result).toContain("## Retrieval API");
+    expect(result).toContain("## [Page A]");
+    expect(result.indexOf("## Retrieval API")).toBeLessThan(result.indexOf("## [Page A]"));
+  });
+
+  it("sits above the page list in llms.txt", () => {
+    const config = makeConfig();
+    const result = generateLlmsTxt([makePage()], config);
+
+    // Both headings must exist, or the index comparison passes on -1.
+    expect(result).toContain("## Retrieval API");
+    expect(result).toContain("## Pages");
+    expect(result.indexOf("## Retrieval API")).toBeLessThan(result.indexOf("## Pages"));
   });
 });
