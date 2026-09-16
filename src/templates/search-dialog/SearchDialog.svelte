@@ -335,6 +335,10 @@
     try {
       if (onSelect && (await onSelect(result)) === false) return;
       const url = buildResultUrl(result);
+      // "" means the result URL failed the safe-link check (an executable
+      // scheme, or one obfuscated with control characters). Never hand that to
+      // the router; leave the dialog open so the selection visibly did nothing.
+      if (!url) return;
       if (clearOnNavigate) search.clear();
       open = false;
       await navigate(url);

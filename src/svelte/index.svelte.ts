@@ -1,5 +1,9 @@
-import type { SearchRequest, SearchResponse, SearchResult } from "../types";
+import type { SearchRequest, SearchResult } from "../types";
+import { isSearchResponse } from "./response-validation";
 export { default as SearchSocket } from "./SearchSocket.svelte";
+// Re-exported so a Svelte consumer that renders results from its own fetch can
+// apply the same safe-link rule the store applies.
+export { isSafeResultUrl } from "./response-validation";
 
 export interface CreateSearchOptions {
   endpoint?: string;
@@ -86,54 +90,6 @@ function buildCacheKey(query: string, options: CreateSearchOptions): string {
   if (options.groupBy !== undefined) parts.groupBy = options.groupBy;
   if (options.maxSubResults !== undefined) parts.maxSubResults = options.maxSubResults;
   return JSON.stringify(parts);
-}
-
-/**
- * The wire is untyped, so a cast is a promise, not a check. A JSON `null` body,
- * an error page that happened to parse, or `results: null` from a custom
- * endpoint would otherwise be cached and rendered as a valid-looking empty
- * response — indistinguishable from "no matches".
- *
- * Hand-written rather than a `zod` schema on purpose: this module ships as raw
- * source to the browser, so anything it imports lands in the consumer's bundle.
- * `src/client.ts` carries the same check; sharing it would mean a new module
- * under `src/svelte/`, which is out of scope here. Every field the type declares as
- * required is checked; an optional one only has to be the right type when it
- * is present.
- */
-function isSearchResult(value: unknown): value is SearchResult {
-  if (typeof value !== "object" || value === null) return false;
-  const result = value as Partial<SearchResult>;
-  if (
-    typeof result.url !== "string" ||
-    typeof result.title !== "string" ||
-    typeof result.snippet !== "string" ||
-    typeof result.score !== "number"
-  ) {
-    return false;
-  }
-  // An optional field may be absent, but a present one still has to be the
-  // type it is read as: `sectionTitle` reaches string methods and `chunks` is
-  // iterated.
-  if (result.sectionTitle !== undefined && typeof result.sectionTitle !== "string") return false;
-  if (result.chunks !== undefined) {
-    if (!Array.isArray(result.chunks)) return false;
-    if (!result.chunks.every((chunk) => typeof chunk === "object" && chunk !== null)) return false;
-  }
-  return true;
-}
-
-function isSearchResponse(payload: unknown): payload is SearchResponse {
-  if (typeof payload !== "object" || payload === null) return false;
-  const response = payload as Partial<SearchResponse>;
-  return (
-    typeof response.q === "string" &&
-    typeof response.scope === "string" &&
-    typeof response.meta === "object" &&
-    response.meta !== null &&
-    Array.isArray(response.results) &&
-    response.results.every(isSearchResult)
-  );
 }
 
 /**

@@ -1,14 +1,11 @@
 import type { SearchRequest, SearchResponse, SearchResult } from "./types";
+// Lives under `src/svelte/` because that is the only source directory the
+// published tarball carries whole, and the raw-source store needs the same
+// checks. This entry point is bundled by tsup, so the import is inlined here.
+import { isSafeResultUrl, isSearchResponse } from "./svelte/response-validation";
 
-/**
- * Build a URL for a search result that includes section metadata (`_ssk`) and
- * a text-target phrase (`_sskt`) plus a Text Fragment (`#:~:text=`). When the destination
- * page uses `searchsocketScrollToText`, `_sskt` (or `_ssk`) triggers a smooth
- * scroll on SvelteKit client-side navigations. For full page loads, browsers
- * that support Text Fragments will scroll natively.
- *
- * If no usable text target is available, the original URL is returned unchanged.
- */
+export { isSafeResultUrl } from "./svelte/response-validation";
+
 const SNIPPET_TARGET_MAX_WORDS = 12;
 
 function normalizeTargetText(value: string): string {
@@ -41,16 +38,40 @@ function selectTextTarget(result: SearchResult): string {
   return sectionTitle;
 }
 
+/**
+ * Build a URL for a search result that includes section metadata (`_ssk`) and
+ * a text-target phrase (`_sskt`) plus a Text Fragment (`#:~:text=`). When the
+ * destination page uses `searchsocketScrollToText`, `_sskt` (or `_ssk`) triggers
+ * a smooth scroll on SvelteKit client-side navigations. For full page loads,
+ * browsers that support Text Fragments will scroll natively.
+ *
+ * If no usable text target is available, the result URL is returned unchanged.
+ *
+ * @returns the navigable URL, or `""` when the result URL fails
+ * {@link isSafeResultUrl}. Callers must treat the empty string as "do not link
+ * and do not navigate" rather than as a same-page href.
+ */
 export function buildResultUrl(result: SearchResult): string {
+  // The client and the store both refuse an unsafe URL before a result is
+  // returned, but a component can be handed `results` from any source. Returning
+  // the empty string keeps the signature and gives every caller one falsy value
+  // to guard on, instead of an href that executes.
+  if (!isSafeResultUrl(result.url)) return "";
+
+  // Build from the same spelling the safe-link check approved. Surrounding
+  // whitespace is ignored when a browser resolves a bare URL, but appending a
+  // query turns it into path content: "/docs " would become "/docs%20?_sskt=…".
+  const url = result.url.trim();
+
   const textTarget = selectTextTarget(result);
   if (!textTarget) {
-    return result.url;
+    return url;
   }
 
   // Split the URL preserving its original form (relative, absolute, etc.)
-  const hashIdx = result.url.indexOf("#");
-  const beforeHash = hashIdx >= 0 ? result.url.slice(0, hashIdx) : result.url;
-  const existingHash = hashIdx >= 0 ? result.url.slice(hashIdx) : "";
+  const hashIdx = url.indexOf("#");
+  const beforeHash = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+  const existingHash = hashIdx >= 0 ? url.slice(hashIdx) : "";
 
   const queryIdx = beforeHash.indexOf("?");
   const path = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
@@ -77,52 +98,6 @@ export function buildResultUrl(result: SearchResult): string {
 export interface SearchClientOptions {
   endpoint?: string;
   fetchImpl?: typeof fetch;
-}
-
-/**
- * The wire is untyped, so a cast is a promise, not a check. A JSON `null` body,
- * an error page that happened to parse, or `results: null` from a custom
- * endpoint would otherwise reach the caller as a valid-looking empty response —
- * indistinguishable from "no matches".
- *
- * Hand-written rather than a `zod` schema on purpose: this is a browser entry
- * point, and the store in `src/svelte/` needs the same check but ships as raw
- * source that cannot import from here. Every field the type declares as
- * required is checked; an optional one only has to be the right type when it is present.
- */
-function isSearchResult(value: unknown): value is SearchResult {
-  if (typeof value !== "object" || value === null) return false;
-  const result = value as Partial<SearchResult>;
-  if (
-    typeof result.url !== "string" ||
-    typeof result.title !== "string" ||
-    typeof result.snippet !== "string" ||
-    typeof result.score !== "number"
-  ) {
-    return false;
-  }
-  // An optional field may be absent, but a present one still has to be the
-  // type it is read as: `sectionTitle` reaches string methods and `chunks` is
-  // iterated.
-  if (result.sectionTitle !== undefined && typeof result.sectionTitle !== "string") return false;
-  if (result.chunks !== undefined) {
-    if (!Array.isArray(result.chunks)) return false;
-    if (!result.chunks.every((chunk) => typeof chunk === "object" && chunk !== null)) return false;
-  }
-  return true;
-}
-
-function isSearchResponse(payload: unknown): payload is SearchResponse {
-  if (typeof payload !== "object" || payload === null) return false;
-  const response = payload as Partial<SearchResponse>;
-  return (
-    typeof response.q === "string" &&
-    typeof response.scope === "string" &&
-    typeof response.meta === "object" &&
-    response.meta !== null &&
-    Array.isArray(response.results) &&
-    response.results.every(isSearchResult)
-  );
 }
 
 export function createSearchClient(options: SearchClientOptions = {}) {

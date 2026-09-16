@@ -660,6 +660,16 @@
   opacity: 1;
 }
 
+/* A result whose URL failed the safe-link check: shown, but not clickable. */
+.ss-search__link--unavailable {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.ss-search__link--unavailable:hover {
+  background: none;
+}
+
 .ss-search--results[data-variant="list"] .ss-search__results-item + .ss-search__results-item {
   border-top: 1px solid var(--ss-search-border);
 }
