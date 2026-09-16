@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchUrlPattern, matchUrlPatterns } from "../src/utils/pattern";
+import { describeUnsupportedUrlPattern, matchUrlPattern, matchUrlPatterns } from "../src/utils/pattern";
 
 describe("matchUrlPattern", () => {
   describe("exact match", () => {
@@ -90,5 +90,31 @@ describe("matchUrlPatterns", () => {
 
   it("returns false for empty patterns", () => {
     expect(matchUrlPatterns("/about", [])).toBe(false);
+  });
+});
+
+describe("describeUnsupportedUrlPattern", () => {
+  it.each(["/", "/blog", "/blog/", "/blog/*", "/blog/**", "/*", "/**", "/a/b/c/**"])(
+    "accepts %s",
+    (pattern) => {
+      expect(describeUnsupportedUrlPattern(pattern)).toBeNull();
+    }
+  );
+
+  it.each([
+    ["/**/private/**", "wildcard"],
+    ["/draft-*.html", "wildcard"],
+    ["/blog/*/comments", "wildcard"],
+    ["/blog/***", "wildcard"],
+    ["blog/**", "must start with"],
+    ["https://example.com/blog", "must start with"],
+    ["/page?.html", "\"?\""],
+    ["/api/{a,b}", "\"{\""],
+    ["/[slug]", "\"[\""],
+    ["/docs//**", "empty path segment"],
+    ["//docs", "empty path segment"],
+    ["/docs//", "empty path segment"]
+  ])("rejects %s", (pattern, fragment) => {
+    expect(describeUnsupportedUrlPattern(pattern)).toContain(fragment);
   });
 });

@@ -1,5 +1,5 @@
 import { QueryMode, FusionAlgorithm } from "@upstash/vector";
-import type { Index } from "@upstash/vector";
+import type { Index, Requester, UpstashRequest, UpstashResponse } from "@upstash/vector";
 import type {
   PageHit,
   PageRecord,
@@ -20,6 +20,7 @@ import {
   scopeFilterClauses,
   urlFromPageId
 } from "./ids";
+import type { SearchStore } from "./store";
 
 /**
  * Records per write/delete/fetch request. Upstash bounds both request size and
@@ -40,6 +41,14 @@ const DEFAULT_RETRY_BASE_MS = 200;
  * being one serial round trip per record without burying the endpoint.
  */
 const METADATA_UPDATE_CONCURRENCY = 8;
+/**
+ * Ceiling on the scope scan a page read falls back to when its record carries
+ * no chunk manifest: at most this many range requests of this many records.
+ * 50 × 100 covers a 5,000-chunk scope, well past a typical docs site, while
+ * keeping one `get_page` from issuing hundreds of sequential backend requests.
+ */
+const LEGACY_PAGE_SCAN_MAX_REQUESTS = 50;
+const LEGACY_PAGE_SCAN_PAGE_SIZE = 100;
 
 /**
  * Characters GLOB reads as pattern syntax. Upstash documents no escape sequence
@@ -187,6 +196,25 @@ export interface PageHashEntry {
    */
   metadataHash?: string;
   custom: boolean;
+  /**
+   * The page's stored chunk manifest, or null when the record carries none
+   * (see PAGE_CHUNK_KEYS_FIELD). The pipeline uses it to find the chunks of a
+   * page it removes because the page is now excluded, since a chunk key does
+   * not encode its URL.
+   */
+  chunkKeys?: string[] | null;
+}
+
+/** One stored chunk, as `scanChunkInventory` reports it. */
+export interface ChunkInventoryEntry {
+  /** Whether the chunk belongs to a caller-supplied custom record. */
+  custom: boolean;
+  /**
+   * The URL of the page the chunk belongs to, or null when the record does not
+   * carry a usable one. Lets a caller find every stored chunk of a page, not
+   * just the generation its page record's manifest lists.
+   */
+  url: string | null;
 }
 
 /** One entry of the chunk inventory returned by `fetchContentHashesForKeys`. */
@@ -226,6 +254,8 @@ interface PageVectorMetadata {
    * manifest did not fit the metadata byte budget.
    */
   chunkKeys?: string[];
+  /** Number of chunks the page was written with; see PAGE_CHUNK_COUNT_FIELD. */
+  chunkCount?: number;
   [key: string]: unknown;
 }
 
@@ -238,6 +268,26 @@ interface PageVectorMetadata {
  * constant so the writer and the reader cannot drift apart.
  */
 export const PAGE_CHUNK_KEYS_FIELD = "chunkKeys";
+
+/**
+ * The page-metadata field holding how many chunks the page was written with.
+ *
+ * Written alongside the manifest, and kept when the manifest itself is omitted
+ * because it would not fit the metadata byte budget. It is what separates such
+ * a page from one written before manifests existed, and what lets a reader
+ * prove that a page-filtered lookup found every section rather than trusting a
+ * result an approximate filtered query may have cut short.
+ */
+export const PAGE_CHUNK_COUNT_FIELD = "chunkCount";
+
+/**
+ * Filtered-query window for a page whose manifest was omitted: ordinals are
+ * read `CHUNK_QUERY_ORDINAL_WINDOW` at a time with Upstash's maximum topK, so a
+ * window that could hold every one of its matches twice over and still comes
+ * back full proves nothing and is abandoned.
+ */
+const CHUNK_QUERY_ORDINAL_WINDOW = 500;
+const CHUNK_QUERY_TOP_K = 1000;
 
 /** One reconstructed section of a page, as `getChunksForPage` returns it. */
 export interface PageChunk {
@@ -270,6 +320,12 @@ function readChunkKeyManifest(metadata: PageVectorMetadata | undefined): string[
   // — so a list containing one did not come from a run this reader can trust.
   if (new Set(raw as string[]).size !== raw.length) return null;
   return raw as string[];
+}
+
+/** The stored chunk count of a page record, or null when it carries none. */
+function readChunkCount(metadata: PageVectorMetadata | undefined): number | null {
+  const raw = metadata?.[PAGE_CHUNK_COUNT_FIELD];
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : null;
 }
 
 /** Do two manifests name the same keys in the same order? */
@@ -372,8 +428,22 @@ export interface UpstashSearchStoreOptions {
  * change in that behaviour cannot break first-run indexing.
  */
 export function isMissingNamespaceError(error: unknown): boolean {
+  // The status outranks the wording. A 429, 5xx or timeout that happens to say
+  // "namespace chunks not found" is a transient failure: reading it as an
+  // absent namespace skipped the retry and could report an empty inventory.
+  // Auth failures are never "empty" either. Only a non-transient status, or an
+  // error with no status at all, can mean the namespace is absent.
+  const status = errorStatus(error);
+  if (status !== undefined && (status === 401 || status === 403 || status === 408 || status === 429 || status >= 500)) {
+    return false;
+  }
   const message = error instanceof Error ? error.message : String(error);
   return /namespace .*(not found|does not exist)|no such namespace/i.test(message);
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const status = (error as { status?: unknown } | null | undefined)?.status;
+  return typeof status === "number" ? status : undefined;
 }
 
 /**
@@ -391,21 +461,119 @@ export type StorageErrorCode =
   | "UNKNOWN";
 
 /**
+ * An HTTP error response from Upstash, with the status the SDK would discard.
+ *
+ * Named `UpstashError` like the SDK's own class, so anything matching on the
+ * name still recognises it; the difference is the `status` field, which
+ * `classifyStorageError` trusts over the message.
+ */
+export class UpstashHttpError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "UpstashError";
+    this.status = status;
+  }
+}
+
+/** Longest server message kept on an error; an HTML error page is not a message. */
+const MAX_HTTP_ERROR_MESSAGE = 300;
+
+/** Network-level retries for a request that never got a response, as the SDK's own client does. */
+const NETWORK_RETRY_ATTEMPTS = 5;
+const networkBackoff = (retryCount: number): number => Math.exp(retryCount) * 50;
+
+/**
+ * An `@upstash/vector` `Requester` that keeps the HTTP status of error responses.
+ *
+ * The SDK's own HTTP client (1.2) parses every response body as JSON and, for a
+ * non-2xx response, throws `new UpstashError(body.error)` — the status is
+ * dropped, so a 503 answering `{"error":"overloaded"}` or a 429 with a wording
+ * the message patterns do not know was classified UNKNOWN and never retried.
+ * `new Index(requester)` is the SDK's documented way to supply the transport,
+ * so this mirrors its client — same URL joining, `Content-Type` and bearer
+ * headers, `no-store` cache and network retry — except that an error response
+ * throws an `UpstashHttpError` carrying its status, whatever its body is.
+ * Telemetry headers are not sent.
+ */
+export function createUpstashRequester(opts: { url: string; token: string }): Requester {
+  const baseUrl = opts.url.replace(/\/$/, "");
+  const headers = {
+    "Content-Type": "application/json",
+    authorization: `Bearer ${opts.token}`
+  };
+
+  return {
+    async request<TResult>(req: UpstashRequest): Promise<UpstashResponse<TResult>> {
+      const requestOptions: RequestInit = {
+        cache: "no-store",
+        method: "POST",
+        headers,
+        body: JSON.stringify(req.body),
+        keepalive: true
+      };
+
+      let res: Response | null = null;
+      let error: unknown = null;
+      for (let i = 0; i <= NETWORK_RETRY_ATTEMPTS; i += 1) {
+        try {
+          res = await fetch([baseUrl, ...(req.path ?? [])].join("/"), requestOptions);
+          break;
+        } catch (fetchError) {
+          error = fetchError;
+          if (i < NETWORK_RETRY_ATTEMPTS) {
+            await new Promise((resolve) => setTimeout(resolve, networkBackoff(i)));
+          }
+        }
+      }
+
+      if (!res) {
+        throw error ?? new Error("Exhausted all retries");
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        let message = "";
+        try {
+          const parsed = JSON.parse(text) as { error?: unknown };
+          if (typeof parsed?.error === "string") message = parsed.error;
+        } catch {
+          // Not JSON — an HTML page from a proxy, say. The status says enough.
+        }
+        throw new UpstashHttpError((message || `HTTP ${res.status}`).slice(0, MAX_HTTP_ERROR_MESSAGE), res.status);
+      }
+
+      const body = (await res.json()) as UpstashResponse<TResult>;
+      return { result: body.result, error: body.error };
+    }
+  };
+}
+
+/**
  * Classify a raw SDK/network error into an actionable category.
  *
- * Classification is message-driven because `UpstashError` carries only the
- * server's `error` string — it has no status code. The `status` check below
- * still runs for errors raised by anything else in the stack (a fetch polyfill,
- * a proxy) that does attach one.
+ * An error response through `createUpstashRequester` carries its HTTP status,
+ * and the status decides. The SDK's
+ * own `UpstashError` carries only the server's `error` string, so errors from
+ * an index built on the SDK's default client still fall back to message patterns.
  */
 export function classifyStorageError(error: unknown): StorageErrorCode {
   if (isMissingNamespaceError(error)) return "NAMESPACE_MISSING";
 
+  // The SDK parses every response body as JSON *before* it checks the status,
+  // so a 502/503 answered with an HTML error page from a proxy or load
+  // balancer surfaces as a bare SyntaxError with no status at all. The SDK
+  // never produces a SyntaxError for anything else — a request it sends is
+  // JSON.stringify output — so this is a transient backend failure, not a bug.
+  // Checked before the message patterns: a JSON parse message can contain
+  // "syntax", which would otherwise read as a non-retryable filter error.
+  if (error instanceof SyntaxError || (error as { name?: unknown })?.name === "SyntaxError") {
+    return "SERVICE_UNAVAILABLE";
+  }
+
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-  const status =
-    typeof (error as { status?: unknown })?.status === "number"
-      ? (error as { status: number }).status
-      : undefined;
+  const status = errorStatus(error);
 
   // A status code, when present, is more reliable than message matching, so it
   // decides first. Otherwise a 502 whose body happens to mention "filter" would
@@ -432,7 +600,7 @@ export function classifyStorageError(error: unknown): StorageErrorCode {
     return "INVALID_FILTER";
   }
   if (
-    /\bunavailable\b|\beconnrefused\b|\benotfound\b|\beconnreset\b|socket hang up|fetch failed|\bnetwork\b|internal server error|bad gateway|service unavailable|exhausted all retries/.test(
+    /\bunavailable\b|\boverloaded\b|\beconnrefused\b|\benotfound\b|\beconnreset\b|socket hang up|fetch failed|\bnetwork\b|internal server error|bad gateway|service unavailable|exhausted all retries/.test(
       message
     )
   ) {
@@ -459,7 +627,7 @@ export function toStorageError(operation: string, error: unknown): SearchSocketE
 }
 
 
-export class UpstashSearchStore {
+export class UpstashSearchStore implements SearchStore {
   private readonly index: Index;
   private readonly pagesNs: ReturnType<Index["namespace"]>;
   private readonly chunksNs: ReturnType<Index["namespace"]>;
@@ -493,6 +661,23 @@ export class UpstashSearchStore {
     // Safe to retry: every write is an upsert keyed by a deterministic record
     // ID, and every delete names explicit IDs, so re-applying a batch that may
     // have partially succeeded converges on the same state.
+    try {
+      return await this.retryTransient(fn);
+    } catch (error) {
+      throw toStorageError(operation, error);
+    }
+  }
+
+  /**
+   * The retry loop itself, rethrowing the *raw* final error.
+   *
+   * Reads use this directly rather than `withRetry`: each read has its own
+   * catch that must still recognise a missing namespace (an empty answer, not
+   * a failure), and that test cannot see through a converted error. Every read
+   * wrapped here is idempotent — a fetch by ID, or a range page re-requested
+   * with the same cursor.
+   */
+  private async retryTransient<T>(fn: () => Promise<T>): Promise<T> {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
@@ -512,7 +697,7 @@ export class UpstashSearchStore {
       }
     }
 
-    throw toStorageError(operation, lastError);
+    throw lastError;
   }
 
   async upsertChunks(
@@ -1003,9 +1188,11 @@ export class UpstashSearchStore {
     for (let i = 0; i < keys.length; i += BATCH_SIZE) {
       const batch = keys.slice(i, i + BATCH_SIZE);
       try {
-        const results = await this.chunksNs.fetch<ChunkVectorMetadata>(
-          batch.map((key) => chunkId(scope, key)),
-          { includeMetadata: true }
+        const results = await this.retryTransient(() =>
+          this.chunksNs.fetch<ChunkVectorMetadata>(
+            batch.map((key) => chunkId(scope, key)),
+            { includeMetadata: true }
+          )
         );
         for (const doc of results) {
           // A direct fetch bypasses the metadata filter, so verify ownership
@@ -1040,23 +1227,46 @@ export class UpstashSearchStore {
    * it leaves their page records alone.
    */
   async scanChunkIds(scope: Scope): Promise<Map<string, boolean>> {
-    const ids = new Map<string, boolean>();
+    const inventory = await this.scanChunkInventory(scope);
+    return new Map([...inventory].map(([key, entry]) => [key, entry.custom]));
+  }
+
+  /**
+   * Every chunk in the scope with its provenance and page URL, in one scan.
+   *
+   * The URL costs nothing extra: the scan already fetches full metadata to read
+   * ownership and `custom`. It is what lets the pipeline remove every stored
+   * chunk of an excluded page rather than only the ones its manifest lists.
+   */
+  async scanChunkInventory(scope: Scope): Promise<Map<string, ChunkInventoryEntry>> {
+    const ids = new Map<string, ChunkInventoryEntry>();
     let cursor = "0";
 
     try {
       for (;;) {
         // Scoped by ID prefix so the scan costs what this scope holds rather
         // than what every project sharing the index holds.
-        const result = await this.chunksNs.range<ChunkVectorMetadata>({
-          cursor,
-          prefix: recordPrefix(scope, "chunk"),
-          limit: 100,
-          includeMetadata: true
-        });
+        // Full metadata is fetched although only ownership, `custom` and `url`
+        // are read: Upstash's range takes `includeMetadata` as all-or-nothing
+        // and has no field projection, and all three live in metadata.
+        const pageCursor = cursor;
+        const result = await this.retryTransient(() =>
+          this.chunksNs.range<ChunkVectorMetadata>({
+            cursor: pageCursor,
+            prefix: recordPrefix(scope, "chunk"),
+            limit: 100,
+            includeMetadata: true
+          })
+        );
         for (const doc of result.vectors) {
           if (!recordBelongsToScope(doc.metadata, scope)) continue;
           const key = logicalKeyFromId(String(doc.id), scope, "chunk");
-          if (key !== null) ids.set(key, doc.metadata?.custom === true);
+          if (key === null) continue;
+          const url = doc.metadata?.url;
+          ids.set(key, {
+            custom: doc.metadata?.custom === true,
+            url: typeof url === "string" && url.length > 0 ? url : null
+          });
         }
         if (!result.nextCursor || result.nextCursor === "0") break;
         cursor = result.nextCursor;
@@ -1181,12 +1391,15 @@ export class UpstashSearchStore {
 
     try {
       for (;;) {
-        const result = await this.pagesNs.range<PageVectorMetadata>({
-          cursor,
-          prefix: recordPrefix(scope, "page"),
-          limit: 100,
-          includeMetadata: true
-        });
+        const pageCursor = cursor;
+        const result = await this.retryTransient(() =>
+          this.pagesNs.range<PageVectorMetadata>({
+            cursor: pageCursor,
+            prefix: recordPrefix(scope, "page"),
+            limit: 100,
+            includeMetadata: true
+          })
+        );
         for (const doc of result.vectors) {
           if (!recordBelongsToScope(doc.metadata, scope) || !doc.metadata?.contentHash) continue;
           // Keyed by URL: callers reason about pages by URL, and the physical
@@ -1196,7 +1409,8 @@ export class UpstashSearchStore {
             map.set(url, {
               contentHash: doc.metadata.contentHash,
               metadataHash: typeof doc.metadata.metadataHash === "string" ? doc.metadata.metadataHash : undefined,
-              custom: doc.metadata.custom === true
+              custom: doc.metadata.custom === true,
+              chunkKeys: readChunkKeyManifest(doc.metadata)
             });
           }
         }
@@ -1275,7 +1489,12 @@ export class UpstashSearchStore {
       // Reconstruct markdown from chunks. The page record names them, so this
       // costs the page's own chunk count rather than a scan of the scope; a
       // record written without a manifest falls back to that scan.
-      const chunks = await this.readPageChunks(url, scope, readChunkKeyManifest(doc.metadata));
+      const chunks = await this.readPageChunks(
+        url,
+        scope,
+        readChunkKeyManifest(doc.metadata),
+        readChunkCount(doc.metadata)
+      );
       const markdown = reconstructMarkdownFromChunks(chunks, doc.metadata.title);
 
       return {
@@ -1322,9 +1541,9 @@ export class UpstashSearchStore {
   async getChunksForPage(
     url: string,
     scope: Scope,
-    opts?: { chunkKeys?: readonly string[] | null }
+    opts?: { chunkKeys?: readonly string[] | null; chunkCount?: number | null }
   ): Promise<PageChunk[]> {
-    const result = await this.collectPageChunks(url, scope, opts?.chunkKeys ?? null);
+    const result = await this.collectPageChunks(url, scope, opts?.chunkKeys ?? null, opts?.chunkCount ?? null);
     if (result.missing.length > 0) throw incompletePageError(url, result);
     return result.chunks;
   }
@@ -1345,14 +1564,15 @@ export class UpstashSearchStore {
   private async readPageChunks(
     url: string,
     scope: Scope,
-    manifest: string[] | null
+    manifest: string[] | null,
+    chunkCount: number | null
   ): Promise<PageChunk[]> {
-    const first = await this.collectPageChunks(url, scope, manifest);
+    const first = await this.collectPageChunks(url, scope, manifest, chunkCount);
     if (first.missing.length === 0) return first.chunks;
 
     const refreshed = await this.refetchChunkManifest(url, scope);
-    if (refreshed !== undefined && !sameKeys(refreshed, manifest)) {
-      const second = await this.collectPageChunks(url, scope, refreshed);
+    if (refreshed !== undefined && !sameKeys(refreshed.manifest, manifest)) {
+      const second = await this.collectPageChunks(url, scope, refreshed.manifest, refreshed.chunkCount);
       if (second.missing.length === 0) return second.chunks;
       throw incompletePageError(url, second);
     }
@@ -1365,14 +1585,17 @@ export class UpstashSearchStore {
    * record can no longer be read at all — in which case the caller keeps the
    * verdict it already had rather than inventing a new one.
    */
-  private async refetchChunkManifest(url: string, scope: Scope): Promise<string[] | null | undefined> {
+  private async refetchChunkManifest(
+    url: string,
+    scope: Scope
+  ): Promise<{ manifest: string[] | null; chunkCount: number | null } | undefined> {
     try {
       const results = await this.pagesNs.fetch<PageVectorMetadata>([pageId(scope, url)], {
         includeMetadata: true
       });
       const doc = results[0];
       if (!doc?.metadata || !recordBelongsToScope(doc.metadata, scope)) return undefined;
-      return readChunkKeyManifest(doc.metadata);
+      return { manifest: readChunkKeyManifest(doc.metadata), chunkCount: readChunkCount(doc.metadata) };
     } catch {
       return undefined;
     }
@@ -1388,21 +1611,59 @@ export class UpstashSearchStore {
   private async collectPageChunks(
     url: string,
     scope: Scope,
-    manifest: readonly string[] | null
+    manifest: readonly string[] | null,
+    chunkCount: number | null = null
   ): Promise<{ chunks: PageChunk[]; missing: string[]; listed: number }> {
     if (manifest) return this.fetchChunksByKeys(url, scope, manifest);
+
+    // A current-schema page whose manifest was omitted for size still says how
+    // many chunks it has, so a page-filtered lookup can be checked for
+    // completeness. Only a provably complete answer is used.
+    if (chunkCount !== null) {
+      const queried = await this.queryChunksByUrl(url, scope, chunkCount);
+      if (queried) return { chunks: queried, missing: [], listed: 0 };
+    }
 
     const chunks: PageChunk[] = [];
     let cursor = "0";
 
     try {
-      for (;;) {
-        const result = await this.chunksNs.range<ChunkVectorMetadata>({
-          cursor,
-          prefix: recordPrefix(scope, "chunk"),
-          limit: 100,
-          includeMetadata: true
-        });
+      for (let requests = 0; ; requests += 1) {
+        // This path serves a single page read — the public endpoint and MCP
+        // `get_page` — so its cost must not grow with the whole scope. A page
+        // without a manifest was written by an older version (or its manifest
+        // did not fit the metadata budget); past the ceiling the honest answer
+        // is a retryable failure that says how to fix it, not an unbounded run
+        // of sequential backend requests for one request.
+        if (requests >= LEGACY_PAGE_SCAN_MAX_REQUESTS) {
+          const scanned = LEGACY_PAGE_SCAN_MAX_REQUESTS * LEGACY_PAGE_SCAN_PAGE_SIZE;
+          // Two different situations, and only one of them is fixed by a
+          // reindex. A record with a chunk count was written by this version
+          // and deliberately left without a manifest because the page has too
+          // many sections for one; reindexing writes the same record again.
+          throw new SearchSocketError(
+            "VECTOR_BACKEND_UNAVAILABLE",
+            chunkCount !== null
+              ? `Page ${url} has ${chunkCount} sections, too many for its record to list, and neither a ` +
+                  `page-filtered lookup nor a scan of the first ${scanned} records in scope ` +
+                  `"${scope.scopeName}" found all of them. Reindexing will not change this; split the ` +
+                  "page or raise chunking.maxChars so it has fewer sections."
+              : `Page ${url} was indexed by an older version without a chunk manifest, and finding its ` +
+                  `sections would scan more than ${scanned} records in scope "${scope.scopeName}". ` +
+                  "Reindex the scope (searchsocket index --force) to write chunk manifests.",
+            503
+          );
+        }
+
+        const pageCursor = cursor;
+        const result = await this.retryTransient(() =>
+          this.chunksNs.range<ChunkVectorMetadata>({
+            cursor: pageCursor,
+            prefix: recordPrefix(scope, "chunk"),
+            limit: LEGACY_PAGE_SCAN_PAGE_SIZE,
+            includeMetadata: true
+          })
+        );
 
         for (const doc of result.vectors) {
           if (recordBelongsToScope(doc.metadata, scope) && doc.metadata?.url === url) {
@@ -1414,10 +1675,82 @@ export class UpstashSearchStore {
         cursor = result.nextCursor;
       }
     } catch (error) {
+      if (error instanceof SearchSocketError) throw error;
       if (!isMissingNamespaceError(error)) throw toStorageError("scan page chunks", error);
     }
 
     return { chunks: chunks.sort((a, b) => a.ordinal - b.ordinal), missing: [], listed: 0 };
+  }
+
+  /**
+   * Find a page's chunks with URL-filtered queries, or null when the result
+   * cannot be proven complete.
+   *
+   * Upstash filtered queries are approximate: past a filtering budget they
+   * post-filter, and a selective filter can return fewer matches than exist.
+   * A matching count is not proof either: chunk records carry no generation
+   * marker, so stale chunks left by an older write can make up the number and
+   * serve the wrong mix of sections. The answer is accepted only when ordinals
+   * `0..expected-1` each appear exactly once, no chunk read has an ordinal at or
+   * past `expected`, and no window was truncated at its topK. A page whose
+   * hooks dropped chunks leaves ordinal gaps and fails this too, which is safe:
+   * the caller falls back to the bounded scan. Ordinals are read in windows so a
+   * page larger than the maximum topK is still reachable, and the number of
+   * windows is bounded by the page's own size, never the scope's.
+   */
+  private async queryChunksByUrl(url: string, scope: Scope, expected: number): Promise<PageChunk[] | null> {
+    if (expected === 0) return [];
+
+    let urlLiteral: string;
+    try {
+      urlLiteral = filterStringLiteral(url, "url");
+    } catch {
+      return null;
+    }
+
+    const windows = Math.ceil(expected / CHUNK_QUERY_ORDINAL_WINDOW);
+    if (windows > LEGACY_PAGE_SCAN_MAX_REQUESTS) return null;
+
+    const found = new Map<string, PageChunk>();
+
+    try {
+      for (let window = 0; window < windows; window += 1) {
+        const lo = window * CHUNK_QUERY_ORDINAL_WINDOW;
+        const filter = [
+          ...scopeFilterClauses(scope),
+          `url = ${urlLiteral}`,
+          `ordinal >= ${lo}`,
+          `ordinal < ${lo + CHUNK_QUERY_ORDINAL_WINDOW}`
+        ].join(" AND ");
+        const results = await this.retryTransient(() =>
+          this.chunksNs.query<ChunkVectorMetadata>({
+            data: url,
+            topK: CHUNK_QUERY_TOP_K,
+            includeMetadata: true,
+            filter
+          })
+        );
+        // A full window may have been cut off at topK; nothing proves it whole.
+        if (results.length >= CHUNK_QUERY_TOP_K) return null;
+        for (const doc of results) {
+          if (!doc.metadata || !recordBelongsToScope(doc.metadata, scope) || doc.metadata.url !== url) continue;
+          const key = logicalKeyFromId(String(doc.id), scope, "chunk");
+          if (key !== null) found.set(key, toPageChunk(doc.metadata));
+        }
+      }
+    } catch (error) {
+      if (isMissingNamespaceError(error)) return null;
+      throw toStorageError("query page chunks", error);
+    }
+
+    if (found.size !== expected) return null;
+    const seen = new Set<number>();
+    for (const chunk of found.values()) {
+      const ordinal = chunk.ordinal;
+      if (!Number.isInteger(ordinal) || ordinal < 0 || ordinal >= expected || seen.has(ordinal)) return null;
+      seen.add(ordinal);
+    }
+    return [...found.values()].sort((a, b) => a.ordinal - b.ordinal);
   }
 
   /**
@@ -1449,12 +1782,14 @@ export class UpstashSearchStore {
       const batch = keys.slice(i, i + BATCH_SIZE);
       let results: Array<{ id: string | number; metadata?: ChunkVectorMetadata } | null>;
       try {
-        // Deliberately not wrapped in withRetry, matching every other read in
-        // this store: withRetry converts its failure through toStorageError,
-        // and the missing-namespace test below cannot see through that wrapper.
-        results = await this.chunksNs.fetch<ChunkVectorMetadata>(
-          batch.map((key) => chunkId(scope, key)),
-          { includeMetadata: true }
+        // retryTransient rather than withRetry: withRetry converts its failure
+        // through toStorageError, and the missing-namespace test below cannot
+        // see through that wrapper.
+        results = await this.retryTransient(() =>
+          this.chunksNs.fetch<ChunkVectorMetadata>(
+            batch.map((key) => chunkId(scope, key)),
+            { includeMetadata: true }
+          )
         );
       } catch (error) {
         // A namespace that has never been written to holds no chunks for any
@@ -1581,7 +1916,7 @@ export class UpstashSearchStore {
         cursor = result.nextCursor;
       }
     } catch (error) {
-      if (!isMissingNamespaceError(error)) throw error;
+      if (!isMissingNamespaceError(error)) throw toStorageError("scan pages for deletion", error);
     }
 
     const BATCH_SIZE = this.batchSize;

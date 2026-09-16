@@ -68,6 +68,7 @@ The easiest way to wire up search in a Svelte component. Handles debouncing, cac
 
 ```svelte
 <script>
+  import { onDestroy } from "svelte";
   import { createSearch } from "searchsocket/svelte";
 
   const search = createSearch({
@@ -77,6 +78,10 @@ The easiest way to wire up search in a Svelte component. Handles debouncing, cac
     topK: 10,
     groupBy: "page"
   });
+
+  // Not automatic. Without this the store's effect root and any in-flight
+  // request outlive the component.
+  onDestroy(search.destroy);
 </script>
 
 <input bind:value={search.query} />
@@ -90,7 +95,7 @@ The easiest way to wire up search in a Svelte component. Handles debouncing, cac
 <!-- search.hasSearched   — true once any query has settled -->
 <!-- search.clear()       — reset query, results and error -->
 <!-- search.retry()       — re-run the current query, bypassing the cache -->
-<!-- search.destroy()     — cleanup function -->
+<!-- search.destroy()     — tear down the store; call it from onDestroy -->
 ```
 
 The store is reactive — updating `search.query` triggers a debounced search automatically. Previous in-flight requests are aborted when a new query comes in.
@@ -173,6 +178,13 @@ const href = buildResultUrl(result);
 
 Use this as the `href` for result links. If the result has no section title, the original URL is returned unchanged.
 
+`buildResultUrl` returns `""` for a result whose URL is not safe to navigate to —
+`javascript:`, `data:`, anything carrying a control character, anything the URL
+parser rejects. Treat an empty string as "do not render a link": the bundled
+`SearchResults` renders a non-navigable span, and the dialog and inline input do
+not navigate. The same check is exported as `isSafeResultUrl` from
+`searchsocket/client` and `searchsocket/svelte` if you need it directly.
+
 ## Search modal (Cmd+K pattern)
 
 The most common search UI pattern: a modal triggered by a keyboard shortcut.
@@ -182,6 +194,7 @@ The most common search UI pattern: a modal triggered by a keyboard shortcut.
 ```svelte
 <!-- SearchModal.svelte -->
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { createSearch } from "searchsocket/svelte";
   import { buildResultUrl } from "searchsocket/client";
   import { goto } from "$app/navigation";
@@ -189,6 +202,7 @@ The most common search UI pattern: a modal triggered by a keyboard shortcut.
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
   const search = createSearch({ topK: 8, groupBy: "page" });
+  onDestroy(search.destroy);
 
   let activeIndex = $state(-1);
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -205,9 +219,12 @@ The most common search UI pattern: a modal triggered by a keyboard shortcut.
   });
 
   function navigateTo(result: (typeof search.results)[number]) {
+    // `buildResultUrl` returns "" for a URL that is not safe to navigate to.
+    const href = buildResultUrl(result);
+    if (!href) return;
     open = false;
     search.query = "";
-    goto(buildResultUrl(result));
+    goto(href);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -335,6 +352,7 @@ Scope search to a section of your site (e.g., only docs, only blog) by passing `
 
 ```svelte
 <script>
+  import { onDestroy } from "svelte";
   import { createSearch } from "searchsocket/svelte";
 
   let { pathPrefix = "" }: { pathPrefix?: string } = $props();
@@ -344,6 +362,7 @@ Scope search to a section of your site (e.g., only docs, only blog) by passing `
     groupBy: "page",
     pathPrefix: pathPrefix || undefined
   });
+  onDestroy(search.destroy);
 </script>
 ```
 
@@ -630,6 +649,7 @@ These class names are part of the public API — style them from outside the com
 .ss-search__result-meta .ss-search__result-section  .ss-search__result-breadcrumb
 .ss-search__result-snippet                          .ss-search__result-action
 .ss-search__results-list .ss-search__results-item   .ss-search__link
+.ss-search__link--unavailable
 .ss-search__subresults  .ss-search__subresult-link  .ss-search__results-count
 .ss-search__state       .ss-search__state-title     .ss-search__state-description
 .ss-search__button      .ss-search__footer          .ss-search__footer-shortcuts
@@ -778,7 +798,7 @@ const response = await client.search({
 response.results     // SearchResult[]
 response.q           // echoed query
 response.scope       // resolved scope name
-response.meta        // { timingsMs: { total: number } }
+response.meta        // { timingsMs: { search: number; total: number } }
 ```
 
 ### Search result shape
@@ -810,14 +830,42 @@ interface SearchResultChunk {
 
 ### Response validation
 
-Both the client and the `createSearch` store check the response shape before handing it
-on. On a 2xx response, a JSON `null` body, an error page that happened to parse, or
-`results: null` from a custom endpoint is rejected as `Invalid search response` — an
-error state, not an empty result set. (A non-2xx response takes the earlier branch and
-surfaces the endpoint's own error message, or `Search failed`.) Either way the client
-throws and the store sets `search.error` and moves to `status: "error"`, rather than
-showing "no matches" for what is actually a broken endpoint. A rejected response is never
-written to the result cache.
+Both the client and the `createSearch` store validate a response before handing it on,
+at two levels.
+
+The **envelope** has to be well-formed. On a 2xx response, a JSON `null` body, an error
+page that happened to parse, a missing `q` or `scope`, `results: null`, or a
+`meta.timingsMs` missing a finite `search` or `total` is rejected as
+`Invalid search response` — an error state, not an empty result set. (A non-2xx
+response takes the earlier branch and surfaces the endpoint's own error message, or
+`Search failed`.) Either way the client throws and the store sets `search.error` and
+moves to `status: "error"`, rather than showing "no matches" for what is actually a
+broken endpoint. A rejected response is never written to the result cache.
+
+Individual **rows** are dropped rather than failing the search. A result with a
+non-finite `score`, a wrong-typed field, or a URL that is not safe to navigate to is
+removed, and so is a malformed chunk within an otherwise valid result; the rest of the
+response is returned. One bad record in the index costs that row, not the search box.
+
+To apply the same rules to a response you fetched yourself, import them from
+`searchsocket/client` (or `searchsocket/svelte`): `parseSearchResponse(payload)` returns
+the cleaned response, or `null` for a broken envelope, and `isSearchResponse(payload)` is
+a strict type guard that is `true` only when no row would be dropped.
+
+A custom endpoint therefore has to return the documented envelope in full:
+
+```json
+{
+  "q": "deployment",
+  "scope": "main",
+  "results": [],
+  "meta": { "timingsMs": { "search": 24, "total": 30 } }
+}
+```
+
+`q` and `scope` are required strings, `results` an array, and both `timingsMs`
+numbers must be present and finite. Every result needs a `title`, a `snippet`, a
+finite `score` and a `url` that passes `isSafeResultUrl`.
 
 ## Accessibility
 
@@ -896,11 +944,26 @@ The search endpoint accepts JSON:
 }
 ```
 
+`debug` and `rankingOverrides` are refused with a 403 for being present at all —
+on GET and POST alike, whatever their value. They stay on the engine's own API, so
+the CLI and the local playground still use them; see [Tuning](tuning.md).
+
 Also available as GET with query parameters:
 
 ```
 GET /api/search?q=getting+started&topK=5&groupBy=page&pathPrefix=/docs
 ```
+
+GET parameter rules:
+
+- `topK` and `maxSubResults` must be whole integers — `10abc`, `1.5`, `1e3`, `0x10`,
+  zero and negatives are all a 400. `topK` is bounded 1–100, `maxSubResults` 1–20.
+- `q`, `topK`, `scope`, `pathPrefix`, `groupBy` and `maxSubResults` may appear once.
+  Repeating one is a 400 rather than a silent "first value wins". `tags` is the one
+  parameter meant to repeat.
+
+A rate-limited request answers 429 with a `Retry-After` header, and every error
+response carries `cache-control: no-store`.
 
 ### `GET /api/search/health`
 
@@ -910,8 +973,10 @@ Returns backend health status:
 { "ok": true }
 ```
 
-An unhealthy backend answers `{ "ok": false, "details": "<category>" }` — a category, not
-the raw backend message, which can carry a credential.
+An unhealthy backend answers **HTTP 503** with `{ "ok": false, "details": "<category>" }`
+— a category, not the raw backend message, which can carry a credential. Only a healthy
+backend answers 200, so an uptime check that watches status codes sees the outage
+without having to parse the body.
 
 ### `GET /api/search/pages/<path>`
 

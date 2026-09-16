@@ -17,17 +17,38 @@ import path from "node:path";
 const root = process.cwd();
 const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 
+/**
+ * Every file path an export entry can resolve to, however deeply its conditions
+ * nest (`{ import: { types, default }, require: { types, default } }`).
+ */
+function exportTargets(entry) {
+  if (typeof entry === "string") return [entry];
+  if (entry === null || typeof entry !== "object") return [];
+  return Object.values(entry).flatMap(exportTargets);
+}
+
+/**
+ * Resolve one condition path through an export entry, e.g. ["import", "default"].
+ * A flat string entry satisfies any path.
+ */
+function resolveCondition(entry, conditions) {
+  let current = entry;
+  for (const condition of conditions) {
+    if (typeof current === "string") return current;
+    if (current === null || typeof current !== "object") return null;
+    current = current[condition];
+  }
+  return typeof current === "string" ? current : null;
+}
+
 /** Files the tarball must contain for each declared export to resolve. */
 function requiredFiles() {
   const required = new Set();
 
-  for (const [subpath, entry] of Object.entries(pkg.exports ?? {})) {
-    for (const target of Object.values(entry)) {
-      if (typeof target === "string") {
-        required.add(target.replace(/^\.\//, ""));
-      }
+  for (const entry of Object.values(pkg.exports ?? {})) {
+    for (const target of exportTargets(entry)) {
+      required.add(target.replace(/^\.\//, ""));
     }
-    void subpath;
   }
 
   if (pkg.bin) {
@@ -50,8 +71,8 @@ function svelteSourceDependencies() {
   const seen = new Set();
   const queue = [];
 
-  for (const entry of Object.values(pkg.exports?.["./svelte"] ?? {})) {
-    if (typeof entry === "string") queue.push(entry.replace(/^\.\//, ""));
+  for (const entry of exportTargets(pkg.exports?.["./svelte"])) {
+    queue.push(entry.replace(/^\.\//, ""));
   }
 
   while (queue.length > 0) {
@@ -147,7 +168,7 @@ function browserEntryProblems() {
 
     // Only the ESM build: a browser bundler never reaches the CJS one, and that
     // file legitimately contains CommonJS plumbing.
-    const target = typeof entry.import === "string" ? entry.import : null;
+    const target = resolveCondition(entry, ["import", "default"]);
     if (!target) {
       problems.push(`missing browser entry: ${subpath} declares no "import" condition`);
       continue;
@@ -176,6 +197,42 @@ function browserEntryProblems() {
     }
   }
 
+  return problems;
+}
+
+/**
+ * A bundled entry must pair each module format with its own declarations.
+ * Pointing `require` at the ESM `.d.ts` makes TypeScript treat a CommonJS
+ * consumer's import as ESM ("masquerading as ESM"), and `types` must come
+ * first inside each condition because resolution takes the first match.
+ */
+function typeConditionProblems() {
+  const problems = [];
+  for (const [subpath, entry] of Object.entries(pkg.exports ?? {})) {
+    if (subpath === "./svelte" || entry === null || typeof entry !== "object") continue;
+
+    for (const [condition, jsExt, dtsExt] of [
+      ["import", ".js", ".d.ts"],
+      ["require", ".cjs", ".d.cts"]
+    ]) {
+      const branch = entry[condition];
+      if (branch === undefined) continue;
+      if (typeof branch !== "object" || branch === null) {
+        problems.push(`${subpath}: "${condition}" must be { types, default } so it carries its own declarations`);
+        continue;
+      }
+      const keys = Object.keys(branch);
+      if (keys[0] !== "types") {
+        problems.push(`${subpath}: "${condition}.types" must be the first key`);
+      }
+      if (typeof branch.default !== "string" || !branch.default.endsWith(jsExt)) {
+        problems.push(`${subpath}: "${condition}.default" should be a ${jsExt} file`);
+      }
+      if (typeof branch.types !== "string" || !branch.types.endsWith(dtsExt)) {
+        problems.push(`${subpath}: "${condition}.types" should be a ${dtsExt} file`);
+      }
+    }
+  }
   return problems;
 }
 
@@ -218,6 +275,7 @@ function main() {
   }
 
   problems.push(...browserEntryProblems());
+  problems.push(...typeConditionProblems());
 
   for (const file of svelteSourceDependencies()) {
     if (!packed.has(file)) {

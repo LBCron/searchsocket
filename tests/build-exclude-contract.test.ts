@@ -194,3 +194,58 @@ describe("source.build.exclude is honoured identically by every build mode", () 
     expect(await prerenderedUrls(["/admin"], 2)).toEqual(["/admin/users", "/api/v1"]);
   });
 });
+
+describe("build source exclusions reach the pipeline", () => {
+  async function manifestCwd(routeIds: string[]): Promise<string> {
+    const cwd = await makeTempDir();
+    const serverDir = path.join(cwd, ".svelte-kit", "output", "server");
+    await fs.mkdir(serverDir, { recursive: true });
+    const routes = routeIds
+      .map((id) => `{ id: "${id}", pattern: /^x$/, page: { layouts: [0], leaf: 1 } }`)
+      .join(",\n");
+    await fs.writeFile(
+      path.join(serverDir, "manifest-full.js"),
+      `export const manifest = { _: { routes: [${routes}] } };\n`,
+      "utf8"
+    );
+    return cwd;
+  }
+
+  it("a dynamic route covered by the top-level exclude is not an expansion failure", async () => {
+    const cwd = await manifestCwd(["/", "/docs", "/blog/[slug]"]);
+    mockPreviewServer = await startSite();
+    const config = buildConfig([]);
+    config.exclude = ["/blog/**"];
+
+    const { loadBuildPages } = await import("../src/indexing/sources/build/index");
+    const result = await loadBuildPages(cwd, config);
+
+    expect(result.failures).toEqual([]);
+    expect(result.complete).toBe(true);
+  });
+
+  it("reports URLs removed by source.build.exclude in every build mode", async () => {
+    const { loadBuildPages } = await import("../src/indexing/sources/build/index");
+
+    const manifest = await manifestCwd(SITE_URLS);
+    mockPreviewServer = await startSite();
+    expect((await loadBuildPages(manifest, buildConfig(["/admin/**"]))).excludedUrls).toEqual(["/admin", "/admin/users"]);
+
+    const discovery = await makeTempDir();
+    mockPreviewServer = await startSite();
+    expect(
+      (await loadBuildPages(discovery, buildConfig(["/admin/**"], { discover: true }))).excludedUrls
+    ).toEqual(["/admin", "/admin/users"]);
+
+    const prerendered = await makeTempDir();
+    for (const url of SITE_URLS) {
+      const dir = path.join(prerendered, "build", ...url.split("/").filter(Boolean));
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "index.html"), htmlPage(url), "utf8");
+    }
+    expect((await loadBuildPages(prerendered, buildConfig(["/admin/**"]))).excludedUrls).toEqual([
+      "/admin",
+      "/admin/users"
+    ]);
+  });
+});

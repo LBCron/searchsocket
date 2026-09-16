@@ -80,9 +80,6 @@ two spellings of a precomposed character (`é` versus `e` + combining acute). Ac
 called `café`. Accent-insensitive recall would need a script-aware policy, so it is
 deliberately not done here.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-
 ### Score breakdowns
 
 The playground enables debug mode automatically. Each result shows a breakdown of how its score was calculated:
@@ -93,6 +90,11 @@ The playground enables debug mode automatically. Each result shows a breakdown o
 - **Title match boost** — full weight if query appears in title
 - **Anchor text boost** — full weight if query matches incoming link text
 - **Freshness boost** — `1 / (1 + daysSince * decayRate) * weight`
+
+Breakdowns and per-request ranking overrides come from the playground's own local
+server, which calls the search engine directly. The public HTTP endpoint refuses
+`debug` and `rankingOverrides` with a 403 for being present at all, so tune through
+the playground or a direct `SearchEngine.search()` call — not through `/api/search`.
 
 ### Exporting your config
 
@@ -129,7 +131,7 @@ export default {
 
 - **Start with thresholds.** `minScoreRatio` has the biggest impact on result quality — it controls how many low-relevance results are trimmed. Higher values (0.75–0.85) give cleaner results but may miss relevant content.
 - **Use gentle weight adjustments.** Weights compound with each other. Moving `titleMatch` from 0.15 to 0.20 has a noticeable effect.
-- **Test with diverse queries.** Try broad queries ("getting started"), specific queries ("API rate limit"), and queries that should return nothing. Good tuning handles all three.
+- **Test with diverse queries.** Try broad queries ("getting started"), specific queries ("API rate limit"), and off-topic queries ("xyzzy gibberish nonsense"). The off-topic one will still return something — both thresholds are relative, so the best candidate always survives. Read it as a diagnostic: if the best guess for nonsense looks plausible, your snippets and titles are doing their job; if it looks absurd, that is a content problem, not a threshold you can turn up.
 - **Watch the score breakdowns.** If `depthBoost` is dominating, shallow pages will always rank highest regardless of relevance. Reduce `depth` weight or disable it.
 
 ## Search quality testing
@@ -155,13 +157,19 @@ Create a `searchsocket.test.json` file in your project root:
     }
   },
   {
-    "query": "xyzzy gibberish nonsense",
+    "query": "pricing",
     "expect": {
-      "maxResults": 0
+      "maxResults": 5
     }
   }
 ]
 ```
+
+`maxResults` is a ceiling on how far a result list is allowed to sprawl, not a way
+to assert that a query returns nothing. Relative trimming cannot empty a non-empty
+list — the top result always survives — so `"maxResults": 0` is not an assertion
+that a query is off-topic. It passes only when nothing eligible came back at all:
+an empty scope, filters that match no records, or a backend returning nothing.
 
 ### Available assertions
 
@@ -205,7 +213,7 @@ The test runner reports:
 - For `inTop5` failures, the actual rank of each missing URL
 - **MRR (Mean Reciprocal Rank)** across all queries that have `topResult` or `inTop5` assertions
 
-MRR is a standard information retrieval metric: the average of `1/rank` for the first relevant result in each query. An MRR of 1.0 means every expected result ranked first. An MRR of 0.5 means they averaged rank 2.
+MRR is a standard information retrieval metric: the average of `1/rank` for the first relevant result in each query. An MRR of 1.0 means every expected result ranked first. Lower values are the mean of the reciprocals, not the reciprocal of the mean rank — two results at rank 2 give 0.5, but so does one result at rank 1 paired with a query that missed entirely, since a miss contributes 0. Read it alongside the per-query output rather than on its own.
 
 ### Using tests in CI/CD
 

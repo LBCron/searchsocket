@@ -131,6 +131,8 @@ describe("robots.txt availability and index mutation", () => {
     expect(store.deleteByIds).not.toHaveBeenCalled();
     expect(stats.deletionEligible).toBe(false);
     expect(stats.warnings.some((w) => w.detail.includes("robots.txt unreadable"))).toBe(true);
+    // A refused run resolves normally, so the refusal has to be on the stats.
+    expect(stats.writesRefused?.reason).toBe("robots-unavailable");
   });
 
   it("treats a 404 as no rules published and indexes normally", async () => {

@@ -447,6 +447,21 @@ describe("build discover mode (integration)", () => {
     expect(urls).toEqual(["/", "/level1"]);
   });
 
+  it("reports excluded links seen on a page at maxDepth", async () => {
+    const result = await runDiscoverFull(
+      {
+        "/": htmlPage("Home", ["/level1"]),
+        "/level1": htmlPage("Level 1", ["/private/old"]),
+        "/private/old": htmlPage("Private")
+      },
+      { maxDepth: 1, exclude: ["/private/**"] }
+    );
+
+    expect(result.records.map((p) => p.url).sort()).toEqual(["/", "/level1"]);
+    expect([...(result.excludedUrls ?? [])]).toEqual(["/private/old"]);
+    expect(result.limitedBy).toBeUndefined();
+  });
+
   it("maxDepth=0 only fetches seed URLs without following links", async () => {
     const result = await runDiscover(
       {

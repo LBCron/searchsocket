@@ -3,7 +3,7 @@ import path from "node:path";
 import fg from "fast-glob";
 import type { PageSourceRecord, ResolvedSearchSocketConfig } from "../../types";
 import { staticHtmlFileToUrl } from "../../utils/path";
-import { applyMaxPages, sourceResult, type SourceFailure, type SourceLoadResult } from "./result";
+import { applyMaxPagesByUrl, sourceResult, type SourceFailure, type SourceLoadResult } from "./result";
 
 export async function loadStaticOutputPages(
   cwd: string,
@@ -20,7 +20,10 @@ export async function loadStaticOutputPages(
   // unstable slice means repeated --max-pages runs index different subsets.
   htmlFiles.sort();
 
-  const { selected, limitedBy } = applyMaxPages(htmlFiles, maxPages);
+  // Limited by URL, not by file: see applyMaxPagesByUrl.
+  const { selected, limitedBy } = applyMaxPagesByUrl(htmlFiles, maxPages, (filePath) =>
+    staticHtmlFileToUrl(filePath, outputDir)
+  );
 
   const pages: PageSourceRecord[] = [];
   const failures: SourceFailure[] = [];
@@ -34,7 +37,8 @@ export async function loadStaticOutputPages(
       // the run non-authoritative so its records are not treated as deleted.
       failures.push({
         target: path.relative(cwd, filePath).replace(/\\/g, "/"),
-        reason: error instanceof Error ? error.message : String(error)
+        reason: error instanceof Error ? error.message : String(error),
+        url: staticHtmlFileToUrl(filePath, outputDir)
       });
       continue;
     }

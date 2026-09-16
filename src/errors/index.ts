@@ -1,15 +1,16 @@
 export type SearchSocketErrorCode =
   | "CONFIG_MISSING"
-  | "EMBEDDING_MODEL_MISMATCH"
+  | "CONFIG_INVALID"
   | "ROUTE_MAPPING_FAILED"
   | "VECTOR_BACKEND_UNAVAILABLE"
   | "SEARCH_NOT_CONFIGURED"
   | "RATE_LIMITED"
   | "INVALID_REQUEST"
   | "INTERNAL_ERROR"
-  | "EMBEDDING_FAILED"
   | "BUILD_MANIFEST_NOT_FOUND"
-  | "BUILD_SERVER_FAILED";
+  | "BUILD_SERVER_FAILED"
+  /** A safety check refused an index mutation; nothing was written. See `IndexStats.writesRefused`. */
+  | "INDEX_WRITES_REFUSED";
 
 export interface SearchSocketErrorOptions {
   status?: number;
@@ -20,9 +21,30 @@ export interface SearchSocketErrorOptions {
   cause?: unknown;
 }
 
+/**
+ * Marks a SearchSocket error across bundles. Each published entry point
+ * (`searchsocket`, `searchsocket/sveltekit`, the CLI, CommonJS and ESM builds)
+ * carries its own copy of this class, so a plain prototype check fails for an
+ * error thrown by one entry and caught with the class imported from another —
+ * a config file that throws via `searchsocket`, or an app catching an error
+ * from `searchsocket/sveltekit`. `Symbol.for` is shared by every copy.
+ */
+const SEARCHSOCKET_ERROR_BRAND = Symbol.for("searchsocket.SearchSocketError");
+
 export class SearchSocketError extends Error {
   public readonly code: SearchSocketErrorCode;
   public readonly status: number;
+
+  static [Symbol.hasInstance](value: unknown): boolean {
+    // A subclass keeps ordinary prototype semantics; only the base class
+    // recognises an instance created by another bundle's copy.
+    if (this !== SearchSocketError) return Function.prototype[Symbol.hasInstance].call(this, value);
+    return (
+      typeof value === "object" &&
+      value !== null &&
+      (value as Record<PropertyKey, unknown>)[SEARCHSOCKET_ERROR_BRAND] === true
+    );
+  }
 
   constructor(
     code: SearchSocketErrorCode,
@@ -33,6 +55,7 @@ export class SearchSocketError extends Error {
       typeof statusOrOptions === "number" ? { status: statusOrOptions } : statusOrOptions;
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "SearchSocketError";
+    Object.defineProperty(this, SEARCHSOCKET_ERROR_BRAND, { value: true });
     this.code = code;
     this.status = options.status ?? 500;
   }

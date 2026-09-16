@@ -1,45 +1,61 @@
 import { z } from "zod";
+import { URL_PATTERN_SYNTAX, describeUnsupportedUrlPattern } from "../utils/pattern";
 
-export const searchSocketConfigSchema = z.object({
+/**
+ * A URL path pattern as understood by `matchUrlPattern`. Validated here because
+ * an unsupported glob would otherwise be compared literally and never match —
+ * an `exclude` that excludes nothing, or a page weight that weights nothing.
+ */
+const urlPattern = z.string().superRefine((pattern, ctx) => {
+  const problem = describeUnsupportedUrlPattern(pattern);
+  if (problem) {
+    ctx.addIssue({ code: "custom", message: `${problem} ${URL_PATTERN_SYNTAX}` });
+  }
+});
+
+// Every object is strict: zod would otherwise strip an unknown key silently, so
+// a misspelled option (`ranking.minScoreRaito`) would look accepted while doing
+// nothing. load.ts turns the resulting issue into a message naming the key.
+export const searchSocketConfigSchema = z.strictObject({
   project: z
-    .object({
+    .strictObject({
       id: z.string().min(1).optional(),
       baseUrl: z.string().url().optional()
     })
     .optional(),
   scope: z
-    .object({
+    .strictObject({
       mode: z.enum(["fixed", "git", "env"]).optional(),
       fixed: z.string().min(1).optional(),
       envVar: z.string().min(1).optional(),
       sanitize: z.boolean().optional()
     })
     .optional(),
-  exclude: z.array(z.string()).optional(),
+  exclude: z.array(urlPattern).optional(),
   respectRobotsTxt: z.boolean().optional(),
   source: z
-    .object({
+    .strictObject({
       mode: z.enum(["static-output", "crawl", "content-files", "build"]).optional(),
       staticOutputDir: z.string().min(1).optional(),
       strictRouteMapping: z.boolean().optional(),
       crawl: z
-        .object({
+        .strictObject({
           baseUrl: z.string().url(),
           routes: z.array(z.string()).optional(),
           sitemapUrl: z.string().optional()
         })
         .optional(),
       contentFiles: z
-        .object({
+        .strictObject({
           globs: z.array(z.string()).min(1),
           baseDir: z.string().optional()
         })
         .optional(),
       build: z
-        .object({
+        .strictObject({
           outputDir: z.string().min(1).optional(),
           paramValues: z.record(z.string(), z.array(z.string())).optional(),
-          exclude: z.array(z.string()).optional(),
+          exclude: z.array(urlPattern).optional(),
           previewTimeout: z.number().int().positive().optional(),
           discover: z.boolean().optional(),
           seedUrls: z.array(z.string()).optional(),
@@ -50,7 +66,7 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   extract: z
-    .object({
+    .strictObject({
       mainSelector: z.string().optional(),
       dropTags: z.array(z.string()).optional(),
       dropSelectors: z.array(z.string()).optional(),
@@ -61,15 +77,13 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   transform: z
-    .object({
-      output: z.literal("markdown").optional(),
+    .strictObject({
       preserveCodeBlocks: z.boolean().optional(),
       preserveTables: z.boolean().optional()
     })
     .optional(),
   chunking: z
-    .object({
-      strategy: z.literal("hybrid").optional(),
+    .strictObject({
       maxChars: z.number().int().positive().optional(),
       overlapChars: z.number().int().nonnegative().optional(),
       minChars: z.number().int().positive().optional(),
@@ -80,13 +94,13 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   upstash: z
-    .object({
+    .strictObject({
       url: z.string().url().optional(),
       token: z.string().min(1).optional(),
       urlEnv: z.string().min(1).optional(),
       tokenEnv: z.string().min(1).optional(),
       namespaces: z
-        .object({
+        .strictObject({
           pages: z.string().min(1).optional(),
           chunks: z.string().min(1).optional()
         })
@@ -98,7 +112,7 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   indexing: z
-    .object({
+    .strictObject({
       /**
        * Refuse to delete when a run would remove more than this fraction of
        * the existing pages, unless --accept-large-deletion is passed.
@@ -109,17 +123,17 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   ranking: z
-    .object({
+    .strictObject({
       enableIncomingLinkBoost: z.boolean().optional(),
       enableDepthBoost: z.boolean().optional(),
       enableFreshnessBoost: z.boolean().optional(),
       freshnessDecayRate: z.number().positive().optional(),
       enableAnchorTextBoost: z.boolean().optional(),
-      pageWeights: z.record(z.string(), z.number().min(0)).optional(),
+      pageWeights: z.record(urlPattern, z.number().min(0)).optional(),
       minScoreRatio: z.number().min(0).max(1).optional(),
       scoreGapThreshold: z.number().min(0).max(1).optional(),
       weights: z
-        .object({
+        .strictObject({
           incomingLinks: z.number().optional(),
           depth: z.number().optional(),
           titleMatch: z.number().optional(),
@@ -130,10 +144,10 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   api: z
-    .object({
+    .strictObject({
       path: z.string().optional(),
       cors: z
-        .object({
+        .strictObject({
           allowOrigins: z.array(z.string()).optional()
         })
         .optional(),
@@ -150,7 +164,7 @@ export const searchSocketConfigSchema = z.object({
        */
       exposeInternalFields: z.boolean().optional(),
       rateLimit: z
-        .object({
+        .strictObject({
           windowMs: z.number().int().positive().optional(),
           max: z.number().int().positive().optional()
         })
@@ -158,12 +172,12 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   mcp: z
-    .object({
+    .strictObject({
       enable: z.boolean().optional(),
       access: z.enum(["public", "private"]).optional(),
       transport: z.enum(["stdio", "http"]).optional(),
       http: z
-        .object({
+        .strictObject({
           port: z.number().int().positive().optional(),
           path: z.string().optional(),
           apiKey: z.string().min(1).optional(),
@@ -171,7 +185,7 @@ export const searchSocketConfigSchema = z.object({
         })
         .optional(),
       handle: z
-        .object({
+        .strictObject({
           path: z.string().optional(),
           /**
            * Independent of the top-level `mcp.access`, which only governs the
@@ -188,7 +202,7 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   llmsTxt: z
-    .object({
+    .strictObject({
       enable: z.boolean().optional(),
       outputPath: z.string().optional(),
       title: z.string().optional(),
@@ -198,7 +212,7 @@ export const searchSocketConfigSchema = z.object({
     })
     .optional(),
   state: z
-    .object({
+    .strictObject({
       // `clean` deletes this directory recursively. Only the two spellings that
       // are always a mistake are rejected here; containment is decided by
       // resolveStateDir in core/state.ts, which knows the project root and can

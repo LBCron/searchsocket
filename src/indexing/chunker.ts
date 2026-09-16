@@ -353,6 +353,87 @@ export function buildEmbeddingText(chunk: Chunk, prependTitle: boolean): string 
   return `${prefix}\n\n${chunk.chunkText}`;
 }
 
+/**
+ * Recover the section body from a stored `chunkText`.
+ *
+ * Chunk records store the *embedding* text as `chunkText`, which with
+ * `chunking.prependTitle` (the default) begins with the prefix
+ * buildEmbeddingText() adds. That prefix helps retrieval and nothing else:
+ * excerpted into a snippet it produced "Page Title — Section Section …", and
+ * the deep-link text target built from that snippet named a phrase no page
+ * contains. It is deterministic from the record's own title and section title,
+ * so it is removed at read time — existing indexes benefit without a re-embed.
+ *
+ * Only call this when the index was written with `prependTitle` on: the match
+ * is on text alone, so without the prefix a section whose body genuinely opens
+ * with its page title ("Intro\n\nActual content" under a page titled "Intro")
+ * would lose that paragraph.
+ */
+export function stripEmbeddingPrefix(chunkText: string, title: string, sectionTitle?: string): string {
+  if (!chunkText || !title) return chunkText;
+  const prefix = sectionTitle ? `${title} — ${sectionTitle}\n\n` : `${title}\n\n`;
+  return chunkText.startsWith(prefix) ? chunkText.slice(prefix.length) : chunkText;
+}
+
+/**
+ * The logical key of a page's summary chunk.
+ *
+ * Fixed by the page URL alone, and never shared with a body chunk: chunkPage()
+ * claims this identity before numbering body sections, so a section that
+ * happens to hash the same gets a different collision ordinal. That makes the
+ * key a reliable way to recognise a stored summary record, which carries no
+ * type flag of its own.
+ */
+export function pageSummaryChunkKey(url: string): string {
+  return chunkLogicalKey(pageSummaryIdentity(url));
+}
+
+function pageSummaryIdentity(url: string) {
+  return { url, headingPath: ["__summary__"], text: "__summary__", collisionOrdinal: 0 };
+}
+
+/**
+ * The text of a stored chunk worth showing a reader: the body without the
+ * embedding prefix (when the index prepends one) and, for a page-summary
+ * record, without the retrieval scaffolding buildSummaryChunkText() puts around
+ * the description — the page title, the humanized URL path, and the keyword
+ * list. Those made a summary snippet read "Title Title docs / guides / …".
+ *
+ * `isPageSummary` must come from the record's identity (see
+ * pageSummaryChunkKey()), not its shape: an ordinary headingless chunk can
+ * legitimately begin with the page title. Falls back to the body whenever
+ * removing the scaffolding would leave nothing.
+ */
+export function chunkDisplayText(
+  metadata: {
+    chunkText: string;
+    title: string;
+    sectionTitle?: string;
+    url?: string;
+    keywords?: string[];
+  },
+  options: { prependTitle: boolean; isPageSummary: boolean }
+): string {
+  const body = options.prependTitle
+    ? stripEmbeddingPrefix(metadata.chunkText, metadata.title, metadata.sectionTitle)
+    : metadata.chunkText;
+  if (!options.isPageSummary || !metadata.title) return body;
+
+  let text = body;
+  const humanized = metadata.url ? humanizeUrlPath(metadata.url) : "";
+  // The root page's summary has no path line.
+  const scaffold = humanized ? `${metadata.title}\n\n${humanized}\n\n` : `${metadata.title}\n\n`;
+  if (!text.startsWith(scaffold)) return body;
+  text = text.slice(scaffold.length);
+
+  if (metadata.keywords && metadata.keywords.length > 0) {
+    const keywordLine = `\n\n${metadata.keywords.join(", ")}`;
+    if (text.endsWith(keywordLine)) text = text.slice(0, -keywordLine.length);
+  }
+
+  return text.trim() ? text : body;
+}
+
 export function chunkPage(
   page: IndexedPage,
   config: ResolvedSearchSocketConfig,
@@ -372,12 +453,7 @@ export function chunkPage(
     // Scope is no longer part of the logical key: isolation now lives in the
     // physical record ID (see src/vector/ids.ts), so the same page in two
     // scopes produces the same logical key and different records.
-    const summaryIdentity = {
-      url: page.url,
-      headingPath: ["__summary__"],
-      text: "__summary__",
-      collisionOrdinal: 0
-    };
+    const summaryIdentity = pageSummaryIdentity(page.url);
     const summaryChunkKey = chunkLogicalKey(summaryIdentity);
 
     // The summary's synthetic identity is not reserved: a page can genuinely

@@ -28,7 +28,10 @@ afterEach(async () => {
 
 /** A store that remembers what was written, so run 2 sees run 1's records. */
 function createStatefulMockStore() {
-  const pageHashes = new Map<string, { contentHash: string; metadataHash?: string; custom: boolean }>();
+  const pageHashes = new Map<
+    string,
+    { contentHash: string; metadataHash?: string; custom: boolean; chunkKeys?: string[] | null }
+  >();
   const chunkIds = new Set<string>();
   // Both fingerprints, exactly as the real store returns them: the embedding
   // hash decides whether the text must be re-embedded, the metadata hash
@@ -37,15 +40,18 @@ function createStatefulMockStore() {
   // Provenance per chunk, so the store mock can answer the same question the
   // real one does — otherwise the custom-chunk protection is never exercised.
   const chunkCustom = new Map<string, boolean>();
+  // Page URL per chunk, as the real store's inventory scan reports it.
+  const chunkUrls = new Map<string, string>();
 
   const store = {
     getPageHashes: vi.fn(async () => new Map(pageHashes)),
-    upsertPages: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean } }>) => {
+    upsertPages: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean; chunkKeys?: string[] } }>) => {
       for (const doc of docs) {
         pageHashes.set(doc.id, {
           contentHash: doc.metadata.contentHash ?? "",
           metadataHash: doc.metadata.metadataHash,
-          custom: doc.metadata.custom === true
+          custom: doc.metadata.custom === true,
+          chunkKeys: doc.metadata.chunkKeys ?? null
         });
       }
     }),
@@ -70,6 +76,9 @@ function createStatefulMockStore() {
     }),
     deletePages: vi.fn(async () => pageHashes.clear()),
     scanChunkIds: vi.fn(async () => new Map([...chunkIds].map((k) => [k, chunkCustom.get(k) === true]))),
+    scanChunkInventory: vi.fn(async () =>
+      new Map([...chunkIds].map((k) => [k, { custom: chunkCustom.get(k) === true, url: chunkUrls.get(k) ?? null }]))
+    ),
     fetchContentHashesForKeys: vi.fn(async (keys: string[]) => {
       const out = new Map<string, { contentHash: string; metadataHash?: string }>();
       for (const key of keys) {
@@ -78,9 +87,10 @@ function createStatefulMockStore() {
       }
       return out;
     }),
-    upsertChunks: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean } }>) => {
+    upsertChunks: vi.fn(async (docs: Array<{ id: string; metadata: { contentHash?: string; metadataHash?: string; custom?: boolean; url?: string } }>) => {
       for (const doc of docs) {
         chunkIds.add(doc.id);
+        if (doc.metadata.url) chunkUrls.set(doc.id, doc.metadata.url);
         chunkHashes.set(doc.id, {
           contentHash: doc.metadata.contentHash ?? "",
           metadataHash: doc.metadata.metadataHash
@@ -107,6 +117,7 @@ function createStatefulMockStore() {
     deleteByIds: vi.fn(async (ids: string[]) => {
       for (const id of ids) {
         chunkIds.delete(id);
+        chunkUrls.delete(id);
         chunkHashes.delete(id);
         chunkCustom.delete(id);
       }
@@ -114,7 +125,7 @@ function createStatefulMockStore() {
     listPages: vi.fn(async (): Promise<PageRecord[]> => [])
   } as unknown as UpstashSearchStore;
 
-  return { store, pageHashes, chunkIds };
+  return { store, pageHashes, chunkIds, chunkUrls, chunkCustom };
 }
 
 async function createFixture(
@@ -895,5 +906,340 @@ describe("indexing safety — published artifacts", () => {
 
     expect(stats.deletionEligible).toBe(true);
     expect(after).not.toContain("/docs/beta");
+  });
+});
+
+const FOUR_PAGES = {
+  "docs/alpha": "Alpha content here.",
+  "docs/beta": "Beta content here.",
+  "docs/delta": "Delta content here.",
+  "docs/gamma": "Gamma content here."
+};
+
+/** Exactly what SvelteKit prerenders for a `redirect(308)` from a page route. */
+const SVELTEKIT_REDIRECT_STUB =
+  '<script>location.href="/docs/copytree/cli";</script>' +
+  '<meta http-equiv="refresh" content="0;url=/docs/copytree/cli">';
+
+const EMPTY_MAIN = "<html><head><title>Beta</title></head><body><main></main></body></html>";
+
+const NOINDEX_GAMMA =
+  '<html><head><title>Gamma</title><meta name="robots" content="noindex"></head>' +
+  "<body><main><h1>Gamma</h1><p>Gamma content here.</p></main></body></html>";
+
+describe("indexing safety — redirect stubs and observed exclusions", () => {
+  it("a prerendered redirect stub is an exclusion, not a failure", async () => {
+    const { stats, store } = await indexThenRerun(
+      FOUR_PAGES,
+      { changedOnly: true },
+      async (cwd) => {
+        await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), SVELTEKIT_REDIRECT_STUB, "utf8");
+      }
+    );
+
+    expect(stats.warnings).toEqual([]);
+    expect(stats.deletionEligible).toBe(true);
+    expect(stats.writesRefused).toBeNull();
+    expect(store.deletePagesByIds).toHaveBeenCalledWith(["/docs/beta"], expect.anything());
+  });
+
+  it("a redirect stub does not stop an unrelated removed page from being pruned", async () => {
+    const { stats, store } = await indexThenRerun(
+      FOUR_PAGES,
+      { changedOnly: true },
+      async (cwd) => {
+        await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), SVELTEKIT_REDIRECT_STUB, "utf8");
+        await fs.rm(path.join(cwd, "build", "docs", "delta"), { recursive: true, force: true });
+      }
+    );
+
+    expect(stats.deletionEligible).toBe(true);
+    expect(vi.mocked(store.deletePagesByIds).mock.calls[0]?.[0]).toEqual(["/docs/beta", "/docs/delta"]);
+  });
+
+  it("deletes an observed noindex page even when an unrelated page fails to extract", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, pageHashes, chunkIds } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    const gammaChunks = pageHashes.get("/docs/gamma")?.chunkKeys ?? [];
+    const betaChunks = pageHashes.get("/docs/beta")?.chunkKeys ?? [];
+    expect(gammaChunks.length).toBeGreaterThan(0);
+
+    await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+    // An absence-inferred removal in the same run must still be withheld.
+    await fs.rm(path.join(cwd, "build", "docs", "delta"), { recursive: true, force: true });
+
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(stats.warnings.some((w) => w.kind === "extraction-failure")).toBe(true);
+    expect(store.deletePagesByIds).toHaveBeenLastCalledWith(["/docs/gamma"], expect.anything());
+    expect(stats.pagesDeleted).toBe(1);
+    expect([...pageHashes.keys()]).toContain("/docs/beta");
+    expect([...pageHashes.keys()]).toContain("/docs/delta");
+    for (const key of gammaChunks) expect(chunkIds.has(key)).toBe(false);
+    for (const key of betaChunks) expect(chunkIds.has(key)).toBe(true);
+  });
+
+  it("deletes a page newly matched by config exclude despite an unrelated failure", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, pageHashes } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    config.exclude = ["/docs/gamma"];
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(stats.pagesDeleted).toBe(1);
+    expect([...pageHashes.keys()]).not.toContain("/docs/gamma");
+  });
+
+  it("a dry run reports but does not perform observed-exclusion deletions", async () => {
+    const { stats, store } = await indexThenRerun(
+      FOUR_PAGES,
+      { changedOnly: true, dryRun: true },
+      async (cwd) => {
+        await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+        await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+      }
+    );
+
+    expect(stats.pagesDeleted).toBe(1);
+    expect(store.deletePagesByIds).not.toHaveBeenCalled();
+    expect(store.deleteByIds).not.toHaveBeenCalled();
+  });
+
+  it("counts observed exclusions towards the deletion ratio", async () => {
+    // Two of three pages newly noindex is 67%, over the 50% default. A
+    // mis-scoped exclusion is exactly the mistake the guard exists for.
+    const { stats, store } = await indexThenRerun(
+      THREE_PAGES,
+      { changedOnly: true },
+      async (cwd) => {
+        for (const page of ["beta", "gamma"]) {
+          await fs.writeFile(
+            path.join(cwd, "build", "docs", page, "index.html"),
+            `<html><head><meta name="robots" content="noindex"></head><body><main><p>${page}</p></main></body></html>`,
+            "utf8"
+          );
+        }
+      }
+    );
+
+    expect(stats.pagesDeleted).toBe(0);
+    expect(store.deletePagesByIds).not.toHaveBeenCalled();
+    expect(store.upsertPages).not.toHaveBeenCalled();
+    expect(stats.writesRefused).toEqual({ reason: "max-deletion-ratio", detail: expect.stringContaining("would delete 2 of 3 pages") });
+  });
+
+  it("does not delete observed exclusions when every site page is excluded", async () => {
+    const { cwd, config } = await createFixture(THREE_PAGES);
+    const { store } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    config.exclude = ["/docs/**"];
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({
+      changedOnly: true,
+      acceptLargeDeletion: true
+    });
+
+    expect(stats.pagesDeleted).toBe(0);
+    expect(store.deletePagesByIds).toHaveBeenCalledTimes(0);
+    expect(stats.dangerousOperations.some((op) => op.startsWith("refused-empty-deletion"))).toBe(true);
+  });
+
+  it("reports no refusal on an ordinary run", async () => {
+    const { stats } = await indexThenRerun(THREE_PAGES, { changedOnly: true });
+    expect(stats.writesRefused).toBeNull();
+  });
+});
+
+describe("observed exclusions — whole-URL evidence", () => {
+  const REAL_DOCS =
+    "<html><head><title>Docs</title></head><body><main><h1>Docs</h1><p>The live docs page.</p></main></body></html>";
+
+  async function writeDocsPair(cwd: string, stub: string): Promise<void> {
+    await fs.mkdir(path.join(cwd, "build", "docs"), { recursive: true });
+    await fs.writeFile(path.join(cwd, "build", "docs", "index.html"), REAL_DOCS, "utf8");
+    await fs.writeFile(path.join(cwd, "build", "docs.html"), stub, "utf8");
+  }
+
+  it("a stub redirecting to its own URL cannot delete the live page under --max-pages", async () => {
+    const { cwd, config } = await createFixture(THREE_PAGES);
+    await writeDocsPair(cwd, '<meta http-equiv="refresh" content="0;url=/docs/">');
+    const { store, pageHashes } = createStatefulMockStore();
+
+    const first = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    // The stub is neither an exclusion nor a failure, so a full run stays authoritative.
+    expect(first.warnings).toEqual([]);
+    expect([...pageHashes.keys()]).toContain("/docs");
+
+    // "build/docs.html" sorts first; a per-file limit loaded only the stub.
+    const limited = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true, maxPages: 1 });
+    expect(limited.pagesDeleted).toBe(0);
+    expect(store.deletePagesByIds).not.toHaveBeenCalled();
+    expect([...pageHashes.keys()]).toContain("/docs");
+  });
+
+  it("an indexed URL is never deleted because another file for it is a redirect stub", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    await writeDocsPair(cwd, '<meta http-equiv="refresh" content="0;url=/documentation">');
+    const { store, pageHashes } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    expect([...pageHashes.keys()]).toContain("/docs");
+
+    // An unrelated failure makes the run non-authoritative, leaving only the
+    // observed-exclusion path able to delete.
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+    for (const maxPages of [undefined, 1]) {
+      const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true, maxPages });
+      expect(stats.pagesDeleted).toBe(0);
+      expect([...pageHashes.keys()]).toContain("/docs");
+    }
+  });
+
+  it("a stub cannot speak for a canonical file that failed to extract", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    await writeDocsPair(cwd, '<meta http-equiv="refresh" content="0;url=/documentation">');
+    const { store, pageHashes } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    await fs.writeFile(path.join(cwd, "build", "docs", "index.html"), EMPTY_MAIN, "utf8");
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.pagesDeleted).toBe(0);
+    expect([...pageHashes.keys()]).toContain("/docs");
+  });
+
+  it("removes every stored chunk of an excluded page, not only its manifest's", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, pageHashes, chunkIds, chunkUrls } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    // An older generation of gamma's sections, no longer in its manifest, and
+    // a manifest-less legacy page record for delta.
+    chunkIds.add("gamma-old-generation");
+    chunkUrls.set("gamma-old-generation", "/docs/gamma");
+    const deltaChunks = [...chunkUrls].filter(([, url]) => url === "/docs/delta").map(([key]) => key);
+    expect(deltaChunks.length).toBeGreaterThan(0);
+    pageHashes.set("/docs/delta", { ...pageHashes.get("/docs/delta")!, chunkKeys: null });
+
+    await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+    config.exclude = ["/docs/delta"];
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+
+    const stats = await (await IndexPipeline.create({ cwd, config, store, })).run({
+      changedOnly: true,
+      acceptLargeDeletion: true
+    });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(chunkIds.has("gamma-old-generation")).toBe(false);
+    for (const key of deltaChunks) expect(chunkIds.has(key)).toBe(false);
+    expect([...chunkUrls.values()]).not.toContain("/docs/gamma");
+    expect([...chunkUrls.values()]).toContain("/docs/beta");
+    expect(stats.deletes).toBe(vi.mocked(store.deleteByIds).mock.calls.at(-1)?.[0].length);
+  });
+
+  it("still removes an excluded page's chunks after its page record is gone", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, pageHashes, chunkIds, chunkUrls } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    const gammaChunks = [...chunkUrls].filter(([, url]) => url === "/docs/gamma").map(([key]) => key);
+    pageHashes.delete("/docs/gamma");
+
+    await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.pagesDeleted).toBe(0);
+    for (const key of gammaChunks) expect(chunkIds.has(key)).toBe(false);
+  });
+
+  it("counts every excluded chunk towards the deletion ratio", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, chunkIds, chunkUrls } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    // Enough orphaned gamma chunks that removing them is most of the index.
+    for (let i = 0; i < 40; i += 1) {
+      chunkIds.add(`gamma-orphan-${i}`);
+      chunkUrls.set(`gamma-orphan-${i}`, "/docs/gamma");
+    }
+    await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    expect(stats.writesRefused?.reason).toBe("max-deletion-ratio");
+    expect(chunkIds.has("gamma-orphan-0")).toBe(true);
+  });
+
+  it("does not delete a custom chunk sharing an excluded URL when the run was not given custom records", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, chunkIds, chunkUrls, chunkCustom } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    chunkIds.add("custom-gamma");
+    chunkUrls.set("custom-gamma", "/docs/gamma");
+    chunkCustom.set("custom-gamma", true);
+    await fs.writeFile(path.join(cwd, "build", "docs", "gamma", "index.html"), NOINDEX_GAMMA, "utf8");
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    expect(chunkIds.has("custom-gamma")).toBe(true);
+  });
+
+  it("does not delete a custom record that failed when the site source observes its URL as excluded", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    const { store, pageHashes, chunkUrls } = createStatefulMockStore();
+    const spec = { url: "/api/spec", title: "API spec", content: "# API\n\nEndpoint documentation." };
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true, customRecords: [spec] });
+    expect(pageHashes.get("/api/spec")?.custom).toBe(true);
+    expect([...chunkUrls.values()]).toContain("/api/spec");
+
+    // The provider returns nothing this time, and the site build happens to
+    // carry a noindex page at the same URL.
+    await fs.mkdir(path.join(cwd, "build", "api", "spec"), { recursive: true });
+    await fs.writeFile(path.join(cwd, "build", "api", "spec", "index.html"), NOINDEX_GAMMA, "utf8");
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({
+      changedOnly: true,
+      customRecords: [{ ...spec, content: "" }]
+    });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(pageHashes.has("/api/spec")).toBe(true);
+    expect([...chunkUrls.values()]).toContain("/api/spec");
+  });
+
+  it("removes a page excluded by source.build.exclude even when the run is not authoritative", async () => {
+    const { cwd, config } = await createFixture(FOUR_PAGES);
+    await fs.writeFile(path.join(cwd, "build", "index.html"), "<html><body><main><p>Home page.</p></main></body></html>", "utf8");
+    config.source.mode = "build";
+    config.source.build = {
+      outputDir: ".svelte-kit/output",
+      paramValues: {},
+      exclude: [],
+      previewTimeout: 5000,
+      discover: false,
+      seedUrls: ["/"],
+      maxPages: 200,
+      maxDepth: 10
+    };
+    const { store, pageHashes, chunkUrls } = createStatefulMockStore();
+    await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+    expect([...pageHashes.keys()]).toContain("/docs/gamma");
+
+    config.source.build.exclude = ["/docs/gamma"];
+    await fs.writeFile(path.join(cwd, "build", "docs", "beta", "index.html"), EMPTY_MAIN, "utf8");
+    const stats = await (await IndexPipeline.create({ cwd, config, store })).run({ changedOnly: true });
+
+    expect(stats.deletionEligible).toBe(false);
+    expect(stats.pagesDeleted).toBe(1);
+    expect([...pageHashes.keys()]).not.toContain("/docs/gamma");
+    expect([...chunkUrls.values()]).not.toContain("/docs/gamma");
   });
 });

@@ -236,7 +236,7 @@ export async function loadCrawledPages(
       // A failed fetch is not evidence the page is gone. Recording it here
       // makes the whole run deletion-ineligible rather than silently
       // presenting a partial crawl as an authoritative snapshot.
-      failures.push({ target: route, reason });
+      failures.push({ target: route, reason, url: normalizeUrlPath(route) });
       logger.warn(`Skipping route ${route}: ${reason}`);
     }
   }

@@ -6,7 +6,7 @@ import matter from "gray-matter";
 import { Logger } from "../../core/logger";
 import type { PageSourceRecord, ResolvedSearchSocketConfig } from "../../types";
 import { normalizeUrlPath } from "../../utils/path";
-import { applyMaxPages, sourceResult, type SourceFailure, type SourceLoadResult } from "./result";
+import { applyMaxPagesByUrl, sourceResult, type SourceFailure, type SourceLoadResult } from "./result";
 
 function filePathToUrl(filePath: string, baseDir: string): string {
   const relative = path.relative(baseDir, filePath).replace(/\\/g, "/");
@@ -968,7 +968,11 @@ export async function loadContentFilesPages(
 
   // Deterministic order before limiting — see static-output for why.
   files.sort();
-  const { selected, limitedBy } = applyMaxPages(files, maxPages);
+  // Limited by URL, not by file: `guide.md` and `guide/index.md` can both
+  // serve one URL. See applyMaxPagesByUrl.
+  const { selected, limitedBy } = applyMaxPagesByUrl(files, maxPages, (filePath) =>
+    filePathToUrl(filePath, baseDir)
+  );
   const pages: PageSourceRecord[] = [];
   const failures: SourceFailure[] = [];
 
@@ -979,7 +983,8 @@ export async function loadContentFilesPages(
     } catch (error) {
       failures.push({
         target: path.relative(cwd, filePath).replace(/\\/g, "/"),
-        reason: error instanceof Error ? error.message : String(error)
+        reason: error instanceof Error ? error.message : String(error),
+        url: filePathToUrl(filePath, baseDir)
       });
       continue;
     }

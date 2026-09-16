@@ -240,6 +240,10 @@
     try {
       if (onSelect && (await onSelect(result)) === false) return;
       const url = buildResultUrl(result);
+      // "" means the result URL failed the safe-link check (an executable
+      // scheme, or one obfuscated with control characters). Never hand that to
+      // the router; leave the list open so the selection visibly did nothing.
+      if (!url) return;
       open = false;
       if (clearOnNavigate) setQuery("");
       await navigate(url);

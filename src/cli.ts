@@ -5,7 +5,7 @@ import { execSync } from "node:child_process";
 import { config as dotenvConfig } from "dotenv";
 import chokidar from "chokidar";
 import fg from "fast-glob";
-import { Command, Option } from "commander";
+import { Command, CommanderError, Option } from "commander";
 import pkg from "../package.json";
 import { writeMinimalConfig, loadConfig, mergeConfig } from "./config/load";
 import { Logger } from "./core/logger";
@@ -18,7 +18,7 @@ import { runPlaygroundServer } from "./playground/server";
 import { SearchEngine } from "./search/engine";
 import { reciprocalRank, mrrReport, type MrrObservation } from "./search/quality-metrics";
 import { testFileSchema } from "./cli/test-schemas";
-import { createUpstashStore } from "./vector";
+import { openUpstashStore } from "./vector";
 import { sanitizeScopeName } from "./utils/text";
 import type { IndexStats, ResolvedSearchSocketConfig, Scope, ScopeInfo, SearchResult } from "./types";
 import type { UpstashSearchStore } from "./vector/upstash";
@@ -120,7 +120,19 @@ interface WatchTarget {
    * output, the config file) count for every event.
    */
   filtered: boolean;
+  /**
+   * Hand-edited source trees (routes, content, the config file) are polled.
+   * With native events, chokidar 5 on macOS intermittently never subscribes
+   * to a directory created after startup, so every later edit inside it is
+   * lost without a trace. Build output is regenerated wholesale, where any
+   * one event is enough, and stays on native events: polling it would stat
+   * every emitted file on each interval.
+   */
+  poll: boolean;
 }
+
+/** Stat interval for polled source roots. */
+const WATCH_POLL_INTERVAL_MS = 1000;
 
 interface WatchPlan {
   targets: WatchTarget[];
@@ -140,7 +152,7 @@ interface WatchPlan {
 function collectWatchPlan(config: ResolvedSearchSocketConfig, cwd: string): WatchPlan {
   // Unfiltered roots go first: if a content root resolves to the same directory,
   // the dedup below keeps this one and the watcher errs towards indexing.
-  const targets: WatchTarget[] = [{ root: path.resolve(cwd, "src/routes"), filtered: false }];
+  const targets: WatchTarget[] = [{ root: path.resolve(cwd, "src/routes"), filtered: false, poll: true }];
   let contentFiles: WatchPlan["contentFiles"];
 
   if (config.source.mode === "content-files" && config.source.contentFiles) {
@@ -149,21 +161,21 @@ function collectWatchPlan(config: ResolvedSearchSocketConfig, cwd: string): Watc
     contentFiles = { baseDir, globs };
 
     for (const task of fg.generateTasks(globs, { cwd: baseDir })) {
-      targets.push({ root: path.resolve(baseDir, task.base), filtered: true });
+      targets.push({ root: path.resolve(baseDir, task.base), filtered: true, poll: true });
     }
   }
 
   if (config.source.mode === "static-output") {
-    targets.push({ root: path.resolve(cwd, config.source.staticOutputDir), filtered: false });
+    targets.push({ root: path.resolve(cwd, config.source.staticOutputDir), filtered: false, poll: false });
   }
 
   if (config.source.mode === "crawl") {
-    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false });
+    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false, poll: true });
   }
 
   if (config.source.mode === "build" && config.source.build) {
-    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false });
-    targets.push({ root: path.resolve(cwd, config.source.build.outputDir), filtered: false });
+    targets.push({ root: path.resolve(cwd, "searchsocket.config.ts"), filtered: false, poll: true });
+    targets.push({ root: path.resolve(cwd, config.source.build.outputDir), filtered: false, poll: false });
   }
 
   const seen = new Set<string>();
@@ -320,13 +332,17 @@ function getRootOptions(command: Command): RootCommandOptions {
 
 /**
  * Stable process exit codes. Machine consumers (CI, the prune workflow) branch
- * on these, so the meanings must not be reassigned.
+ * on these, so the meanings must not be reassigned. Documented in README.md
+ * ("Exit codes") — keep the two in sync.
  */
 const EXIT_OPERATIONAL_FAILURE = 1;
 const EXIT_INVALID_USAGE = 2;
 const EXIT_QUALITY_GATE = 3;
 const EXIT_DESTRUCTIVE_REFUSED = 4;
 const EXIT_BACKEND_UNAVAILABLE = 5;
+
+/** `SearchEngine.search`'s upper bound on `topK`. */
+const MAX_TEST_TOP_K = 100;
 
 async function runIndexCommand(opts: {
   cwd: string;
@@ -349,7 +365,7 @@ async function runIndexCommand(opts: {
    * `searchsocket index` must fail instead of silently doing nothing.
    */
   allowUnconfigured?: boolean;
-}): Promise<void> {
+}): Promise<IndexStats | undefined> {
   const logger = new Logger({
     quiet: opts.quiet,
     verbose: opts.verbose,
@@ -396,12 +412,13 @@ async function runIndexCommand(opts: {
 
   if (opts.json) {
     process.stdout.write(`${JSON.stringify(stats, null, 2)}\n`);
-    return;
+    return stats;
   }
 
   if (!opts.quiet) {
     printIndexSummary(stats);
   }
+  return stats;
 }
 
 async function runInteractiveInit(cwd: string): Promise<void> {
@@ -421,7 +438,7 @@ async function runInteractiveInit(cwd: string): Promise<void> {
   const hasToken = Boolean(process.env.UPSTASH_VECTOR_REST_TOKEN);
 
   if (!hasUrl || !hasToken) {
-    clack.log.warn("Upstash Search credentials not found in environment.");
+    clack.log.warn("Upstash Vector credentials not found in environment.");
 
     const shouldConfigure = await clack.confirm({
       message: "Would you like to configure Upstash credentials now?",
@@ -437,7 +454,7 @@ async function runInteractiveInit(cwd: string): Promise<void> {
       const url = hasUrl
         ? process.env.UPSTASH_VECTOR_REST_URL!
         : await clack.text({
-            message: "Upstash Search REST URL:",
+            message: "Upstash Vector REST URL:",
             placeholder: "https://your-index.upstash.io",
             validate: (v) => (!v ? "URL is required" : undefined),
           });
@@ -450,7 +467,7 @@ async function runInteractiveInit(cwd: string): Promise<void> {
       const token = hasToken
         ? process.env.UPSTASH_VECTOR_REST_TOKEN!
         : await clack.text({
-            message: "Upstash Search REST Token:",
+            message: "Upstash Vector REST Token:",
             placeholder: "AX...",
             validate: (v) => (!v ? "Token is required" : undefined),
           });
@@ -569,6 +586,11 @@ async function runSilentInit(cwd: string): Promise<void> {
 
 const program = new Command();
 
+// Commander exits 1 on a usage error by default, which would collide with the
+// operational-failure code. Settings applied here are inherited by every
+// subcommand added below; main() maps the thrown CommanderError to an exit code.
+program.exitOverride();
+
 program
   .name("searchsocket")
   .description("Semantic site search and MCP retrieval for SvelteKit")
@@ -594,7 +616,7 @@ program
 
 program
   .command("index")
-  .description("Index site content into Upstash Search")
+  .description("Index site content into Upstash Vector")
   .option("--scope <name>", "scope override")
   .option("--changed-only", "only process changed chunks", true)
   .option("--no-changed-only", "re-index regardless of previous manifest")
@@ -613,7 +635,7 @@ program
     const rootOpts = getRootOptions(command);
     const cwd = path.resolve(rootOpts?.cwd ?? process.cwd());
 
-    await runIndexCommand({
+    const stats = await runIndexCommand({
       cwd,
       configPath: rootOpts?.config,
       scope: opts.scope,
@@ -630,6 +652,20 @@ program
       acceptLargeDeletion: opts.acceptLargeDeletion,
       allowUnconfigured: opts.allowUnconfigured
     });
+
+    // A refused run resolves normally and leaves the index frozen at its last
+    // accepted state; exiting 0 would let CI deploy as if it had indexed. A
+    // ratio refusal is a destructive plan refused (resolved by
+    // --accept-large-deletion, which never reaches this branch); an unreadable
+    // robots.txt is an operational failure. Applies to --dry-run as well, which
+    // exists to predict exactly this.
+    if (stats?.writesRefused) {
+      process.stderr.write(`index refused: ${stats.writesRefused.detail}\n`);
+      process.exitCode =
+        stats.writesRefused.reason === "max-deletion-ratio"
+          ? EXIT_DESTRUCTIVE_REFUSED
+          : EXIT_OPERATIONAL_FAILURE;
+    }
   });
 
 program
@@ -646,7 +682,7 @@ program
     let store: UpstashSearchStore;
     let health: { ok: boolean; details?: string } = { ok: false, details: "not checked" };
     try {
-      store = await createUpstashStore(config);
+      store = await openUpstashStore(config);
       health = await store.health();
     } catch (error) {
       health = {
@@ -655,7 +691,7 @@ program
       };
       process.stdout.write(`project: ${config.project.id}\n`);
       process.stdout.write(`backend health: error (${health.details})\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_BACKEND_UNAVAILABLE;
       return;
     }
 
@@ -669,7 +705,7 @@ program
       process.stdout.write(`project: ${config.project.id}\n`);
       process.stdout.write(`resolved scope: ${scope.scopeName}\n`);
       process.stdout.write(`backend health: error (${error instanceof Error ? error.message : "unknown error"})\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_BACKEND_UNAVAILABLE;
       return;
     }
 
@@ -677,6 +713,11 @@ program
     process.stdout.write(`resolved scope: ${scope.scopeName}\n`);
     process.stdout.write(`backend: upstash-vector\n`);
     process.stdout.write(`backend health: ${health.ok ? "ok" : `error (${health.details ?? "n/a"})`}\n`);
+    if (!health.ok) {
+      // The report still prints, but a health check that failed must not read
+      // as success to a script branching on the exit code.
+      process.exitCode = EXIT_BACKEND_UNAVAILABLE;
+    }
 
     if (scopeInfo) {
       process.stdout.write(`last indexed (${scope.scopeName}): ${scopeInfo.lastIndexedAt ?? "never"}\n`);
@@ -705,8 +746,11 @@ program
   .option("--no-playground", "disable playground UI")
   .option("--playground-port <n>", "playground HTTP port", "3337")
   .option("--mcp", "start MCP server (http transport) alongside watcher", false)
-  .option("--mcp-port <n>", "MCP HTTP port", "3338")
-  .option("--mcp-path <path>", "MCP HTTP path", "/mcp")
+  // No Commander defaults: a default would always be passed and shadow
+  // mcp.http.port / mcp.http.path from the config.
+  .option("--mcp-port <n>", "MCP HTTP port (default: mcp.http.port, 3338)")
+  .option("--mcp-path <path>", "MCP HTTP path (default: mcp.http.path, /mcp)")
+  .option("--no-poll", "use native file events for source trees instead of polling them")
   .option("--verbose", "verbose logs", false)
   .action(async (opts, command) => {
     const rootOpts = getRootOptions(command);
@@ -784,10 +828,22 @@ program
     // Only concrete roots are subscribed; relevance is decided per event below,
     // so a file created after startup — in a directory that did not exist at
     // startup — still triggers a reindex.
-    const watcher = chokidar.watch(
-      plan.targets.map((target) => target.root),
-      { ignoreInitial: true }
-    );
+    const pollSources = opts.poll !== false;
+    const polledRoots = plan.targets.filter((target) => pollSources && target.poll).map((target) => target.root);
+    const nativeRoots = plan.targets.filter((target) => !(pollSources && target.poll)).map((target) => target.root);
+    const watchers = [
+      ...(polledRoots.length > 0
+        ? [
+            chokidar.watch(polledRoots, {
+              ignoreInitial: true,
+              usePolling: true,
+              interval: WATCH_POLL_INTERVAL_MS,
+              binaryInterval: WATCH_POLL_INTERVAL_MS
+            })
+          ]
+        : []),
+      ...(nativeRoots.length > 0 ? [chokidar.watch(nativeRoots, { ignoreInitial: true })] : [])
+    ];
 
     let membership = readContentMembership(plan);
     let queued: Array<{ event: string; path: string; filtered: boolean }> = [];
@@ -823,7 +879,7 @@ program
       void run();
     };
 
-    watcher.on("all", (event, changedPath) => {
+    const onWatchEvent = (event: string, changedPath: string): void => {
       if (stopped) return;
 
       const absolute = path.resolve(cwd, changedPath);
@@ -842,12 +898,17 @@ program
         clearTimeout(timer);
       }
       timer = setTimeout(flush, 350);
-    });
+    };
+    for (const watcher of watchers) watcher.on("all", onWatchEvent);
 
     // Chokidar walks the tree before it starts reporting; announcing readiness
     // gives callers (and the test suite) something deterministic to wait for.
-    watcher.on("ready", () => {
-      process.stdout.write("watcher ready\n");
+    // Announced once, when every watcher is ready: chokidar emits "ready" once
+    // per watched root that does not exist yet, which printed it twice.
+    void Promise.all(
+      watchers.map((watcher) => new Promise<void>((resolve) => watcher.once("ready", () => resolve())))
+    ).then(() => {
+      if (!stopped) process.stdout.write("watcher ready\n");
     });
 
     if (opts.mcp) {
@@ -855,7 +916,7 @@ program
         cwd,
         configPath: rootOpts?.config,
         transport: "http",
-        httpPort: parsePositiveInt(opts.mcpPort, "--mcp-port"),
+        httpPort: opts.mcpPort !== undefined ? parsePositiveInt(opts.mcpPort, "--mcp-port") : undefined,
         httpPath: opts.mcpPath
       });
     }
@@ -898,7 +959,7 @@ program
         pending = false;
         queued = [];
 
-        const cleanups = [watcher.close()];
+        const cleanups = watchers.map((watcher) => watcher.close());
         if (closePlayground) cleanups.push(closePlayground());
         void Promise.all(cleanups).then(() => resolve());
       });
@@ -907,12 +968,15 @@ program
 
 program
   .command("clean")
-  .description("Delete local state and optionally delete remote indexes (dry-run by default for remote)")
+  .description(
+    "Delete local state and optionally delete remote indexes " +
+      "(--remote is plan-only, deleting nothing at all, until --apply)"
+  )
   .option("--scope <name>", "scope to delete remotely (defaults to the resolved scope)")
   .option("--remote", "delete remote indexes for a single scope", false)
   .option("--all-scopes", "delete every scope in the project (requires --confirm-project)", false)
   .option("--confirm-project <id>", "confirmation token for --all-scopes; must equal the project id")
-  .option("--apply", "actually perform remote deletions", false)
+  .option("--apply", "actually perform the planned deletions (remote records and local state)", false)
   .option("--keep-local", "do not delete the local state directory", false)
   .action(async (opts, command) => {
     const rootOpts = getRootOptions(command);
@@ -957,10 +1021,22 @@ program
       }
     }
 
+    // A remote clean is plan-first: without --apply it deletes nothing at all,
+    // local state included. The local removal used to run before the dry-run
+    // guard, so `clean --remote` printed "dry-run only" *after* it had already
+    // wiped the local state directory.
+    const planOnly = opts.remote && !opts.apply;
+
     if (!opts.keepLocal) {
       let removal: Awaited<ReturnType<typeof removeStateDir>>;
       try {
-        removal = await removeStateDir(cwd, config.state.dir);
+        // A plan run goes through the same guards with the deletion itself
+        // stubbed out, so the plan is the real decision rather than a second,
+        // drifting prediction of it. It is still a snapshot: a marker file or
+        // the directory itself can change between the plan and the apply.
+        removal = planOnly
+          ? await removeStateDir(cwd, config.state.dir, async () => {})
+          : await removeStateDir(cwd, config.state.dir);
       } catch (error) {
         process.stderr.write(
           `error: ${error instanceof Error ? error.message : String(error)}\n`
@@ -970,12 +1046,20 @@ program
       }
 
       if (removal.removed) {
-        process.stdout.write(`deleted local state directory: ${removal.statePath}\n`);
+        process.stdout.write(
+          planOnly
+            ? `plan: delete local state directory: ${removal.statePath}\n`
+            : `deleted local state directory: ${removal.statePath}\n`
+        );
       } else {
         process.stdout.write(
-          `left local state directory alone: ${removal.statePath} (${removal.reason})\n`
+          planOnly
+            ? `plan: leave local state directory alone: ${removal.statePath} (${removal.reason})\n`
+            : `left local state directory alone: ${removal.statePath} (${removal.reason})\n`
         );
       }
+    } else if (planOnly) {
+      process.stdout.write("plan: keep the local state directory (--keep-local)\n");
     }
 
     if (!opts.remote) return;
@@ -984,10 +1068,11 @@ program
       process.stdout.write(`plan: drop ALL scopes in project ${config.project.id}\n`);
       if (!opts.apply) {
         process.stdout.write("dry-run only. pass --apply to delete.\n");
+        process.stdout.write("nothing has been deleted.\n");
         return;
       }
 
-      const store = await createUpstashStore(config);
+      const store = await openUpstashStore(config);
       await store.dropAllIndexes(config.project.id);
       process.stdout.write(`dropped all remote indexes for project ${config.project.id}\n`);
       return;
@@ -1003,7 +1088,7 @@ program
       return;
     }
 
-    const store = await createUpstashStore(config);
+    const store = await openUpstashStore(config);
     await store.deleteScope(target);
     process.stdout.write(`deleted remote records for scope ${target.scopeName}\n`);
   });
@@ -1032,7 +1117,7 @@ migrate
     let store: UpstashSearchStore;
     let legacy: { pages: string[]; chunks: string[] };
     try {
-      store = await createUpstashStore(config);
+      store = await openUpstashStore(config);
       legacy = await store.scanLegacyRecords(config.project.id);
     } catch (error) {
       process.stderr.write(
@@ -1106,13 +1191,13 @@ program
     let store: UpstashSearchStore;
     let scopes: ScopeInfo[];
     try {
-      store = await createUpstashStore(config);
+      store = await openUpstashStore(config);
       scopes = await store.listScopes(config.project.id);
     } catch (error) {
       process.stderr.write(
         `error: failed to access Upstash Vector: ${error instanceof Error ? error.message : String(error)}\n`
       );
-      process.exitCode = 1;
+      process.exitCode = EXIT_BACKEND_UNAVAILABLE;
       return;
     }
 
@@ -1339,7 +1424,7 @@ program
 
       let store: UpstashSearchStore | null = null;
       try {
-        store = await createUpstashStore(config);
+        store = await openUpstashStore(config);
         const health = await store.health();
         checks.push({
           name: "upstash search connectivity",
@@ -1384,16 +1469,20 @@ program
     }
 
     if (hasFailure) {
-      process.exitCode = 1;
+      process.exitCode = EXIT_OPERATIONAL_FAILURE;
     }
   });
 
 program
   .command("mcp")
   .description("Run SearchSocket MCP server")
-  .option("--transport <transport>", "stdio|http", "stdio")
-  .option("--port <n>", "HTTP port", "3338")
-  .option("--path <path>", "HTTP path", "/mcp")
+  // No Commander defaults: a default would always be passed and shadow
+  // mcp.transport / mcp.http.port / mcp.http.path from the config.
+  .addOption(
+    new Option("--transport <transport>", "transport (default: mcp.transport, stdio)").choices(["stdio", "http"])
+  )
+  .option("--port <n>", "HTTP port (default: mcp.http.port, 3338)")
+  .option("--path <path>", "HTTP path (default: mcp.http.path, /mcp)")
   .addOption(new Option("--access <mode>", "access mode").choices(["public", "private"]))
   .option("--api-key <key>", "API key for public access mode")
   .action(async (opts, command) => {
@@ -1404,7 +1493,7 @@ program
       cwd,
       configPath: rootOpts?.config,
       transport: opts.transport,
-      httpPort: parsePositiveInt(opts.port, "--port"),
+      httpPort: opts.port !== undefined ? parsePositiveInt(opts.port, "--port") : undefined,
       httpPath: opts.path,
       access: opts.access,
       apiKey: opts.apiKey
@@ -1413,14 +1502,27 @@ program
 
 program
   .command("search")
-  .description("Quick CLI search against Upstash Search")
-  .requiredOption("--q <query>", "search query")
+  .description("Quick CLI search against the Upstash Vector index")
+  .argument("[query]", "search query")
+  .option("--q <query>", "search query (alternative to the positional argument)")
   .option("--scope <name>", "scope override")
   .option("--top-k <n>", "top K results", "10")
   .option("--path-prefix <prefix>", "path prefix filter")
-  .action(async (opts, command) => {
+  .action(async (queryArg: string | undefined, opts, command) => {
     const rootOpts = getRootOptions(command);
     const cwd = path.resolve(rootOpts?.cwd ?? process.cwd());
+
+    if (queryArg !== undefined && opts.q !== undefined && queryArg !== opts.q) {
+      process.stderr.write("error: pass the query either as an argument or with --q, not both\n");
+      process.exitCode = EXIT_INVALID_USAGE;
+      return;
+    }
+    const query: string | undefined = queryArg ?? opts.q;
+    if (query === undefined || query.trim() === "") {
+      process.stderr.write('error: a search query is required, e.g. searchsocket search "getting started"\n');
+      process.exitCode = EXIT_INVALID_USAGE;
+      return;
+    }
 
     const engine = await SearchEngine.create({
       cwd,
@@ -1428,7 +1530,7 @@ program
     });
 
     const result = await engine.search({
-      q: opts.q,
+      q: query,
       scope: opts.scope,
       topK: parsePositiveInt(opts.topK, "--top-k"),
       pathPrefix: opts.pathPrefix
@@ -1447,6 +1549,11 @@ program
     const rootOpts = getRootOptions(command);
     const cwd = path.resolve(rootOpts?.cwd ?? process.cwd());
     const topK = parsePositiveInt(opts.topK, "--top-k");
+    // The engine's own bound. Checked here because a per-query rejection would
+    // otherwise be counted as a failed assertion (exit 3) rather than bad usage.
+    if (topK > MAX_TEST_TOP_K) {
+      throw new SearchSocketError("INVALID_REQUEST", `--top-k must be at most ${MAX_TEST_TOP_K}`, 400);
+    }
 
     const filePath = path.resolve(cwd, opts.file);
     let rawContent: string;
@@ -1454,7 +1561,7 @@ program
       rawContent = await fsp.readFile(filePath, "utf8");
     } catch {
       process.stderr.write(`error: test file not found: ${filePath}\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_INVALID_USAGE;
       return;
     }
 
@@ -1463,14 +1570,14 @@ program
       rawJson = JSON.parse(rawContent);
     } catch {
       process.stderr.write(`error: invalid JSON in ${filePath}\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_INVALID_USAGE;
       return;
     }
 
     const parsed = testFileSchema.safeParse(rawJson);
     if (!parsed.success) {
       process.stderr.write(`error: invalid test file: ${parsed.error.issues[0]?.message ?? "unknown error"}\n`);
-      process.exitCode = 1;
+      process.exitCode = EXIT_INVALID_USAGE;
       return;
     }
 
@@ -1480,6 +1587,13 @@ program
       cwd,
       configPath: rootOpts?.config
     });
+    if (!engine.isConfigured()) {
+      process.stderr.write(
+        "error: search backend not configured. Set UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN.\n"
+      );
+      process.exitCode = EXIT_BACKEND_UNAVAILABLE;
+      return;
+    }
 
     let passed = 0;
     let failed = 0;
@@ -1487,6 +1601,10 @@ program
     // Queries whose retrieval threw. They contribute no observation, so the MRR
     // below describes a smaller sample than the test file and says so.
     let retrievalErrors = 0;
+    // Exit codes of the retrieval errors, classified as if each had escaped the
+    // command: a query the engine refused is a test-file defect (2), a backend
+    // failure is 5. Neither is a failed assertion.
+    const retrievalExitCodes = new Set<number>();
 
     for (const tc of testCases) {
       let results: SearchResult[];
@@ -1502,6 +1620,7 @@ program
         process.stdout.write(`FAIL "${tc.query}" → search error: ${msg}\n`);
         failed++;
         retrievalErrors++;
+        retrievalExitCodes.add(exitCodeForError(error));
         continue;
       }
 
@@ -1583,8 +1702,15 @@ program
 
     process.stdout.write(`pass rate: ${total > 0 ? ((passed / total) * 100).toFixed(1) : "0.0"}%\n`);
 
-    if (failed > 0) {
-      process.exitCode = 1;
+    // Assertions only mean something when every query was retrieved, so a
+    // retrieval failure outranks the quality gate.
+    const retrievalExit = [EXIT_INVALID_USAGE, EXIT_BACKEND_UNAVAILABLE, EXIT_OPERATIONAL_FAILURE].find((code) =>
+      retrievalExitCodes.has(code)
+    );
+    if (retrievalExit !== undefined) {
+      process.exitCode = retrievalExit;
+    } else if (failed > 0) {
+      process.exitCode = EXIT_QUALITY_GATE;
     }
   });
 
@@ -1601,7 +1727,7 @@ program
       const available = listAvailableComponents();
       process.stderr.write(`unknown component: ${component}\n`);
       process.stderr.write(`available components: ${available.join(", ")}\n`);
-      process.exit(1);
+      process.exit(EXIT_INVALID_USAGE);
     }
 
     const targetDir = path.resolve(cwd, opts.dir);
@@ -1705,8 +1831,33 @@ async function main(): Promise<void> {
   await program.parseAsync(process.argv);
 }
 
+/** Exit code for an error that escaped a command's own handling. */
+function exitCodeForError(error: unknown): number {
+  if (error instanceof SearchSocketError) {
+    switch (error.code) {
+      case "CONFIG_INVALID":
+      case "CONFIG_MISSING":
+      case "INVALID_REQUEST":
+        return EXIT_INVALID_USAGE;
+      case "VECTOR_BACKEND_UNAVAILABLE":
+      // No backend credentials: `search` builds an engine without a store and
+      // fails on first use, which is the table's "unconfigured backend".
+      case "SEARCH_NOT_CONFIGURED":
+      case "RATE_LIMITED":
+        return EXIT_BACKEND_UNAVAILABLE;
+      default:
+        return EXIT_OPERATIONAL_FAILURE;
+    }
+  }
+  return EXIT_OPERATIONAL_FAILURE;
+}
+
 main().catch((error) => {
+  if (error instanceof CommanderError) {
+    // Commander has already printed the message (or the help/version text).
+    process.exit(error.exitCode === 0 ? 0 : EXIT_INVALID_USAGE);
+  }
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`searchsocket error: ${message}\n`);
-  process.exit(1);
+  process.exit(exitCodeForError(error));
 });

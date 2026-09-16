@@ -741,7 +741,7 @@ describe("GET /api/search/health", () => {
     await expect(response.json()).resolves.toEqual({ ok: true });
   });
 
-  it("returns unhealthy status with details", async () => {
+  it("returns 503 with details when the engine reports unhealthy", async () => {
     const config = makeConfig();
     vi.spyOn(SearchEngine, "create").mockResolvedValue({
       health: vi.fn().mockResolvedValue({ ok: false, details: "store unreachable" })
@@ -755,7 +755,10 @@ describe("GET /api/search/health", () => {
     });
 
     const response = await handle({ event, resolve });
-    expect(response.status).toBe(200);
+    // Previously 200: an uptime check watching status codes read an
+    // unreachable store as a healthy site.
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(response.json()).resolves.toEqual({ ok: false, details: "store unreachable" });
   });
 
@@ -1207,7 +1210,10 @@ describe("searchsocketHandle markdown variant serving", () => {
     expect(await response.text()).toBe("fallback");
   });
 
-  it("propagates non-404 errors from engine.getPage", async () => {
+  it.each([
+    ["a backend outage", new SearchSocketError("VECTOR_BACKEND_UNAVAILABLE", "Upstash unreachable", 503)],
+    ["an unexpected error", new Error("Database error")]
+  ])("falls through to the app's own route on %s instead of failing the request", async (_label, failure) => {
     const config = makeConfig({
       llmsTxt: {
         enable: true,
@@ -1218,14 +1224,19 @@ describe("searchsocketHandle markdown variant serving", () => {
     } as Partial<ResolvedSearchSocketConfig>);
 
     vi.spyOn(SearchEngine, "create").mockResolvedValue({
-      getPage: vi.fn().mockRejectedValue(new SearchSocketError("INTERNAL_ERROR", "Database error", 500))
+      getPage: vi.fn().mockRejectedValue(failure)
     } as unknown as SearchEngine);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
     const handle = searchsocketHandle({ config });
-    const resolve = vi.fn().mockResolvedValue(new Response("fallback"));
+    const resolve = vi.fn().mockResolvedValue(new Response("app markdown"));
     const event = makeEvent({ pathname: "/docs/api.md", method: "GET" });
 
-    await expect(handle({ event, resolve })).rejects.toThrow("Database error");
+    const response = await handle({ event, resolve });
+    expect(resolve).toHaveBeenCalled();
+    expect(await response.text()).toBe("app markdown");
+    // Logged, so an outage is not silent.
+    expect(stderr.mock.calls.map((call) => String(call[0])).join("")).toContain("Markdown variant");
   });
 
   it("does not intercept POST requests to .md paths", async () => {

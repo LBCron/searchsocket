@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { searchsocketHandle } from "../src/sveltekit/handle";
+import { PRIVILEGED_SEARCH_FIELDS, searchsocketHandle } from "../src/sveltekit/handle";
+import { createSearchClient } from "../src/client";
 import { SearchEngine } from "../src/search/engine";
 import { createDefaultConfig } from "../src/config/defaults";
-import type { ResolvedSearchSocketConfig, SearchResponse } from "../src/types";
+import type { ResolvedSearchSocketConfig, SearchRequest, SearchResponse } from "../src/types";
 
 /**
  * Release-blocking invariant: a browser request may not choose which scope it
@@ -393,5 +394,166 @@ describe("page retrieval does not disclose repository paths", () => {
     const body = (await response.json()) as { frontmatter: Record<string, unknown> };
     expect(body.frontmatter.routeFile).toBeUndefined();
     expect(body.frontmatter.title).toBe("Auth");
+  });
+});
+
+/**
+ * `SearchEngine.search` applies `rankingOverrides` whenever `debug` is true, so
+ * an anonymous POST could retune the site's ranking for its own request. The
+ * engine keeps the capability for the CLI, MCP and the local playground, which
+ * call it directly; the public HTTP surface refuses the fields outright.
+ */
+describe("debug ranking overrides are not a public capability", () => {
+  it("refuses an anonymous POST that enables ranking overrides", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({
+        pathname: "/api/search",
+        method: "POST",
+        body: {
+          q: "test",
+          debug: true,
+          rankingOverrides: { ranking: { weights: { titleMatch: 100 } } }
+        }
+      }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_REQUEST" } });
+  });
+
+  // The field is refused for being present, not for being enabled, so there is
+  // no shape of body that gets it as far as the engine.
+  it.each([
+    ["debug alone", { q: "test", debug: true }],
+    ["debug disabled but present", { q: "test", debug: false }],
+    ["overrides without debug", { q: "test", rankingOverrides: { ranking: { enableDepthBoost: false } } }],
+    ["a non-boolean debug", { q: "test", debug: "true" }],
+    ["a null override", { q: "test", rankingOverrides: null }]
+  ])("refuses a POST carrying %s", async (_label, body) => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({ pathname: "/api/search", method: "POST", body }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("refuses the same fields on GET, which never read them", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({
+        pathname: "/api/search",
+        method: "GET",
+        searchParams: { q: "test", debug: "true" }
+      }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("leaves an ordinary POST untouched", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({ pathname: "/api/search", method: "POST", body: { q: "test", topK: 5 } }),
+      resolve
+    });
+
+    expect(response.status).toBe(200);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ q: "test", topK: 5 }));
+  });
+});
+
+/**
+ * Release-blocking invariant: the fields the server refuses are the fields the
+ * client strips.
+ *
+ * They are two separate literals in two files — `PRIVILEGED_SEARCH_FIELDS` in
+ * `src/sveltekit/handle.ts` and `PRIVILEGED_REQUEST_FIELDS` in
+ * `src/client.ts`. Add one to the server's list alone and type-correct browser
+ * code starts getting a 403 it cannot see coming; drop one from the server's
+ * list alone and the client quietly discards a field that is now legitimate.
+ *
+ * The server's list is read directly (it is module-private to the package —
+ * `src/sveltekit.ts` re-exports this module by name and does not list it). The
+ * client's is checked behaviourally, through a mock fetch, because
+ * `src/client.ts` *is* the `searchsocket/client` entry point: anything exported
+ * from it is public API, and a test is not a reason to widen that.
+ */
+describe("the privileged-field lists cannot drift apart", () => {
+  /** A plausible value per field, so the request is realistic rather than a bare key. */
+  const SAMPLE_VALUES: Record<string, unknown> = {
+    debug: true,
+    rankingOverrides: { ranking: { enableDepthBoost: false } }
+  };
+
+  it.each(PRIVILEGED_SEARCH_FIELDS)("the client strips %s before sending", async (field) => {
+    const sample = SAMPLE_VALUES[field];
+    // A field the server refuses but this table has never heard of is itself
+    // the drift: it means the server's list grew and nothing here followed.
+    expect(sample, `add a sample value for the new privileged field "${field}"`).toBeDefined();
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => SAMPLE_RESPONSE
+    });
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    await client.search({ q: "test", [field]: sample } as SearchRequest);
+
+    const init = vi.mocked(mockFetch).mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(field in body).toBe(false);
+    expect(body.q).toBe("test");
+  });
+
+  it("what the client actually sends is accepted by the server", async () => {
+    // The two halves joined end to end: strip on the way out, refuse on the way
+    // in. A request carrying every privileged field at once must still reach
+    // the engine once the client has been through it.
+    const captured: { body?: string } = {};
+    const mockFetch = vi.fn(async (_url: string, init: RequestInit) => {
+      captured.body = init.body as string;
+      return { ok: true, json: async () => SAMPLE_RESPONSE };
+    });
+    const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
+
+    const request = { q: "test", topK: 5 } as Record<string, unknown>;
+    for (const field of PRIVILEGED_SEARCH_FIELDS) request[field] = SAMPLE_VALUES[field];
+    await client.search(request as unknown as SearchRequest);
+
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({
+        pathname: "/api/search",
+        method: "POST",
+        body: JSON.parse(captured.body!)
+      }),
+      resolve
+    });
+
+    expect(response.status).toBe(200);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ q: "test", topK: 5 }));
   });
 });

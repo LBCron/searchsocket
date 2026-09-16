@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { IndexPipeline } from "../src/indexing/pipeline";
 import { createDefaultConfig } from "../src/config/defaults";
 import { SearchSocketError } from "../src/errors";
-import { PAGE_CHUNK_KEYS_FIELD, UpstashSearchStore } from "../src/vector/upstash";
+import { PAGE_CHUNK_COUNT_FIELD, PAGE_CHUNK_KEYS_FIELD, UpstashSearchStore } from "../src/vector/upstash";
 import { INDEX_SCHEMA_VERSION, chunkId, pageId } from "../src/vector/ids";
 import { METADATA_BYTE_BUDGET, metadataByteSize } from "../src/utils/structured-meta";
 import { Logger } from "../src/core/logger";
@@ -716,6 +716,9 @@ describe("the pipeline writes a manifest that matches what it wrote", () => {
 
     // Never a prefix passing as complete: the whole list or none of it.
     expect(page[PAGE_CHUNK_KEYS_FIELD]).toBeUndefined();
+    // The count survives, so a reader can tell this page from a pre-manifest
+    // one and verify a page-filtered lookup against it.
+    expect(page[PAGE_CHUNK_COUNT_FIELD]).toBe(chunkCount);
     expect(warnings.some((message) => message.includes(`Omitted "${PAGE_CHUNK_KEYS_FIELD}"`))).toBe(
       true
     );
@@ -730,5 +733,96 @@ describe("the pipeline writes a manifest that matches what it wrote", () => {
         type: "page"
       })
     ).toBeLessThanOrEqual(METADATA_BYTE_BUDGET);
+  });
+});
+
+describe("a current-schema page whose manifest was omitted for size", () => {
+  const SECTIONS = 1_400;
+  const FILLER = 6_000;
+
+  /** A 1,400-section page with a chunk count but no manifest, in a scope past the scan ceiling. */
+  function oversizedPageCorpus(opts: { chunkCount: boolean }) {
+    const chunks: FakeRecord[] = [];
+    for (let ordinal = 0; ordinal < SECTIONS; ordinal += 1) {
+      chunks.push(chunkRecord(alpha, { key: `big-${ordinal}`, url: "/big", ordinal, text: `Big ${ordinal}.` }));
+    }
+    for (let i = 0; i < FILLER; i += 1) {
+      chunks.push(chunkRecord(alpha, { key: `filler-${i}`, url: `/other/${i}`, ordinal: 0, text: "Unrelated." }));
+    }
+    const page = pageRecord(alpha, { url: "/big" });
+    if (opts.chunkCount) page.metadata[PAGE_CHUNK_COUNT_FIELD] = SECTIONS;
+    return { pages: [page], chunks };
+  }
+
+  /** A query that honours the url/ordinal filter, optionally dropping matches as an approximate search may. */
+  function withFilteredQuery(fake: ReturnType<typeof createFakeIndex>, all: FakeRecord[], drop = 0) {
+    let queries = 0;
+    fake.chunksNs.query.mockImplementation((async (opts: { filter: string; topK: number }) => {
+      queries += 1;
+      const url = /url = '([^']*)'/.exec(opts.filter)?.[1];
+      const lo = Number(/ordinal >= (\d+)/.exec(opts.filter)?.[1]);
+      const hi = Number(/ordinal < (\d+)/.exec(opts.filter)?.[1]);
+      const matches = all.filter((record) => {
+        const meta = record.metadata as { url: string; ordinal: number };
+        return meta.url === url && meta.ordinal >= lo && meta.ordinal < hi;
+      });
+      return matches.slice(drop).slice(0, opts.topK);
+    }) as never);
+    return () => queries;
+  }
+
+  it("is read with page-filtered queries, not a scope scan", async () => {
+    const records = oversizedPageCorpus({ chunkCount: true });
+    const fake = createFakeIndex(records);
+    const queries = withFilteredQuery(fake, records.chunks);
+
+    const page = await createStore(fake.index).getPage("/big", alpha);
+
+    expect(page?.markdown).toContain("Big 0.");
+    expect(page?.markdown).toContain("Big 1399.");
+    expect(fake.counts.chunkRange).toBe(0);
+    expect(queries()).toBe(3);
+  });
+
+  it("does not trust a filtered query that comes back short, and says reindexing will not help", async () => {
+    const records = oversizedPageCorpus({ chunkCount: true });
+    const fake = createFakeIndex(records);
+    withFilteredQuery(fake, records.chunks, 1);
+
+    const error = await createStore(fake.index).getPage("/big", alpha).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SearchSocketError);
+    expect((error as Error).message).toContain("Reindexing will not change this");
+  });
+
+  it.each([
+    ["stale chunks share ordinals with live ones", ["stale-0", "stale-1", "cur-1"]],
+    ["a stale chunk sits past the chunk count", ["cur-0", "cur-1", "stale-5"]]
+  ])("does not trust a filtered query whose count matches when %s", async (_label, returned) => {
+    const chunks = [
+      chunkRecord(alpha, { key: "cur-0", url: "/small", ordinal: 0, text: "Current zero." }),
+      chunkRecord(alpha, { key: "cur-1", url: "/small", ordinal: 1, text: "Current one." }),
+      chunkRecord(alpha, { key: "cur-2", url: "/small", ordinal: 2, text: "Current two." }),
+      chunkRecord(alpha, { key: "stale-0", url: "/small", ordinal: 0, text: "Stale zero." }),
+      chunkRecord(alpha, { key: "stale-1", url: "/small", ordinal: 1, text: "Stale one." }),
+      chunkRecord(alpha, { key: "stale-5", url: "/small", ordinal: 5, text: "Stale five." })
+    ];
+    const page = pageRecord(alpha, { url: "/small" });
+    page.metadata[PAGE_CHUNK_COUNT_FIELD] = 3;
+    const fake = createFakeIndex({ pages: [page], chunks });
+    const byKey = new Map(chunks.map((record) => [record.metadata.chunkKey as string, record]));
+    fake.chunksNs.query.mockImplementation((async () => returned.map((key) => byKey.get(key)!)) as never);
+
+    await createStore(fake.index).getPage("/small", alpha);
+
+    expect(fake.chunksNs.query).toHaveBeenCalledTimes(1);
+    // The filtered answer was rejected in favour of the bounded scan.
+    expect(fake.counts.chunkRange).toBeGreaterThan(0);
+  });
+
+  it("still tells a pre-manifest page to reindex", async () => {
+    const fake = createFakeIndex(oversizedPageCorpus({ chunkCount: false }));
+    const error = await createStore(fake.index).getPage("/big", alpha).catch((e: unknown) => e);
+    expect((error as Error).message).toContain("searchsocket index --force");
+    expect(fake.chunksNs.query).not.toHaveBeenCalled();
   });
 });

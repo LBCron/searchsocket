@@ -89,25 +89,47 @@
     <ul class="ss-search__results-list" aria-busy={loading}>
       {#each results as result, index (index)}
         {@const subResults = showSubResults ? subResultsFor(result, maxVisibleSubResults) : []}
+        {@const href = buildResultUrl(result)}
         <li class="ss-search__results-item">
-          <a class="ss-search__link" href={buildResultUrl(result)}>
-            <SearchResultRow
-              {result}
-              {query}
-              {showSnippets}
-              {showBreadcrumbs}
-              {showSectionTitle}
-            />
-          </a>
+          <!--
+            `buildResultUrl` returns "" for a URL that is not safe to navigate to
+            (an executable scheme, or one obfuscated with control characters).
+            Such a row still renders, so nothing silently disappears, but it is
+            plain text rather than a link.
+          -->
+          {#if href}
+            <a class="ss-search__link" href={href}>
+              <SearchResultRow
+                {result}
+                {query}
+                {showSnippets}
+                {showBreadcrumbs}
+                {showSectionTitle}
+              />
+            </a>
+          {:else}
+            <span class="ss-search__link ss-search__link--unavailable">
+              <SearchResultRow
+                {result}
+                {query}
+                {showSnippets}
+                {showBreadcrumbs}
+                {showSectionTitle}
+              />
+            </span>
+          {/if}
 
-          {#if subResults.length > 0}
+          {#if href && subResults.length > 0}
             <ul class="ss-search__subresults">
               {#each subResults as chunk}
-                <li>
-                  <a class="ss-search__subresult-link" href={buildResultUrl(chunkAsResult(result, chunk))}>
-                    {chunk.sectionTitle}
-                  </a>
-                </li>
+                {@const subHref = buildResultUrl(chunkAsResult(result, chunk))}
+                {#if subHref}
+                  <li>
+                    <a class="ss-search__subresult-link" href={subHref}>
+                      {chunk.sectionTitle}
+                    </a>
+                  </li>
+                {/if}
               {/each}
             </ul>
           {/if}

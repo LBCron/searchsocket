@@ -1,16 +1,30 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createJiti } from "jiti";
+import { z } from "zod";
 import { searchSocketConfigSchema } from "./schema";
 import { createDefaultConfig } from "./defaults";
 import type { ParsedSearchSocketConfig } from "./schema";
 import type { ResolvedSearchSocketConfig, SearchSocketConfig, SourceMode } from "../types";
 import { SearchSocketError } from "../errors";
 
+/**
+ * Settings supplied outside the config file — CLI flags — that must be part of
+ * the config before it is validated. Applied after validation, a flag such as
+ * `--api-key` would arrive too late to satisfy a check it exists to satisfy.
+ */
+export interface ConfigOverrides {
+  mcp?: {
+    access?: "public" | "private";
+    apiKey?: string;
+  };
+}
+
 export interface LoadConfigOptions {
   cwd?: string;
   configPath?: string;
   allowMissing?: boolean;
+  overrides?: ConfigOverrides;
 }
 
 function inferProjectId(cwd: string): string {
@@ -55,12 +69,29 @@ function detectSourceMode(cwd: string, config: ResolvedSearchSocketConfig, parse
 /**
  * Config keys that no longer exist, mapped to what to do instead.
  *
- * Zod strips unknown keys silently, so without this a config that still sets a
- * removed option looks accepted while the option does nothing — which is how
- * `search.dualSearch` and `search.pageSearchWeight` came to be tuned by users
- * despite having no effect on the default search path for several releases.
+ * The schema rejects unknown keys, but "unrecognized key" says nothing about
+ * what to do next. This runs first so a key that used to exist gets a migration
+ * message instead — `search.dualSearch` and `search.pageSearchWeight` were tuned
+ * by users for several releases despite having no effect.
  */
 const REMOVED_CONFIG_KEYS: Array<{ path: string; reason: string }> = [
+  {
+    path: "transform.output",
+    reason:
+      "Markdown was the only accepted value and nothing read this option; extraction " +
+      "always produces Markdown. Delete it."
+  },
+  {
+    path: "chunking.strategy",
+    reason:
+      '"hybrid" was the only accepted value and nothing read this option; chunking is ' +
+      "always heading-aware with length limits. Delete it and tune chunking.maxChars, " +
+      "chunking.overlapChars and chunking.minChars instead."
+  },
+  {
+    path: "analytics",
+    reason: "Search analytics were removed and this option does nothing. Delete it."
+  },
   {
     path: "search.dualSearch",
     reason:
@@ -157,10 +188,108 @@ function assertNoRemovedKeys(rawConfig: SearchSocketConfig): void {
 
   const details = found.map((entry) => `  ${entry.path}\n    ${entry.reason}`).join("\n");
   throw new SearchSocketError(
-    "CONFIG_MISSING",
+    "CONFIG_INVALID",
     `searchsocket.config.ts sets options that have been removed:\n${details}\n\n` +
       "See https://github.com/gregpriday/searchsocket/blob/main/docs/migration-0.8.md"
   );
+}
+
+type ConfigIssue = z.core.$ZodIssue;
+
+function formatIssuePath(segments: ReadonlyArray<PropertyKey>): string {
+  let out = "";
+  for (const segment of segments) {
+    if (typeof segment === "number") {
+      out += `[${segment}]`;
+    } else {
+      const key = String(segment);
+      out += /^[A-Za-z_$][\w$]*$/.test(key) ? (out ? `.${key}` : key) : `[${JSON.stringify(key)}]`;
+    }
+  }
+  return out || "(root)";
+}
+
+/** Keys the schema accepts at an object path, for did-you-mean suggestions. */
+function knownKeysAt(segments: ReadonlyArray<PropertyKey>): string[] {
+  let current: z.ZodType = searchSocketConfigSchema;
+  for (const segment of [...segments, undefined]) {
+    while (current instanceof z.ZodOptional) {
+      current = current.unwrap() as z.ZodType;
+    }
+    if (segment === undefined) break;
+    if (!(current instanceof z.ZodObject)) return [];
+    const next = (current.shape as Record<string, z.ZodType>)[String(segment)];
+    if (!next) return [];
+    current = next;
+  }
+  return current instanceof z.ZodObject ? Object.keys(current.shape) : [];
+}
+
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const above = row[j]!;
+      row[j] = Math.min(
+        row[j]! + 1,
+        row[j - 1]! + 1,
+        diagonal + (a[i - 1]!.toLowerCase() === b[j - 1]!.toLowerCase() ? 0 : 1)
+      );
+      diagonal = above;
+    }
+  }
+  return row[b.length]!;
+}
+
+function suggestKey(unknown: string, known: string[]): string | undefined {
+  let best: string | undefined;
+  let bestDistance = Infinity;
+  for (const candidate of known) {
+    const distance = editDistance(unknown, candidate);
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best !== undefined && bestDistance <= Math.max(2, Math.floor(unknown.length / 3)) ? best : undefined;
+}
+
+function formatConfigIssues(issues: ReadonlyArray<ConfigIssue>): string {
+  const lines: string[] = [];
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      const known = knownKeysAt(issue.path);
+      for (const key of issue.keys) {
+        const suggestion = suggestKey(key, known);
+        const hint = suggestion ? ` Did you mean \`${formatIssuePath([...issue.path, suggestion])}\`?` : "";
+        lines.push(`  ${formatIssuePath([...issue.path, key])}: unknown option.${hint}`);
+      }
+      continue;
+    }
+    if (issue.code === "invalid_key" && issue.issues.length > 0) {
+      for (const inner of issue.issues) {
+        lines.push(`  ${formatIssuePath(issue.path)}: ${inner.message}`);
+      }
+      continue;
+    }
+    lines.push(`  ${formatIssuePath(issue.path)}: ${issue.message}`);
+  }
+  return lines.join("\n");
+}
+
+function applyOverrides(rawConfig: SearchSocketConfig, overrides: ConfigOverrides | undefined): SearchSocketConfig {
+  const mcp = overrides?.mcp;
+  if (!mcp || (mcp.access === undefined && mcp.apiKey === undefined)) return rawConfig;
+  return {
+    ...rawConfig,
+    mcp: {
+      ...rawConfig.mcp,
+      ...(mcp.access !== undefined ? { access: mcp.access } : {}),
+      ...(mcp.apiKey !== undefined ? { http: { ...rawConfig.mcp?.http, apiKey: mcp.apiKey } } : {})
+    }
+  };
 }
 
 export function mergeConfig(cwd: string, rawConfig: SearchSocketConfig): ResolvedSearchSocketConfig {
@@ -173,11 +302,9 @@ export function mergeConfig(cwd: string, rawConfig: SearchSocketConfig): Resolve
 
   const parseResult = searchSocketConfigSchema.safeParse(rawConfig);
   if (!parseResult.success) {
-    const issues = parseResult.error.issues
-      .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
-      .join("\n");
+    const issues = formatConfigIssues(parseResult.error.issues);
     throw new SearchSocketError(
-      "CONFIG_MISSING",
+      "CONFIG_INVALID",
       `Invalid searchsocket.config.ts:\n${issues}`
     );
   }
@@ -330,7 +457,7 @@ export function mergeConfig(cwd: string, rawConfig: SearchSocketConfig): Resolve
     if (!resolvedKey) {
       throw new SearchSocketError(
         "CONFIG_MISSING",
-        '`mcp.access` is "public" but no API key is configured. Set `mcp.http.apiKey` or `mcp.http.apiKeyEnv`.'
+        '`mcp.access` is "public" but no API key is configured. Set `mcp.http.apiKey` or `mcp.http.apiKeyEnv`, or pass --api-key to `searchsocket mcp`.'
       );
     }
   }
@@ -378,11 +505,11 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Resol
 
   if (!fs.existsSync(configPath)) {
     if (options.allowMissing) {
-      return mergeConfig(cwd, {
+      return mergeConfig(cwd, applyOverrides({
         source: {
           mode: "static-output"
         }
-      });
+      }, options.overrides));
     }
 
     throw new SearchSocketError(
@@ -392,10 +519,22 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Resol
   }
 
   const jiti = createJiti(cwd, { interopDefault: true });
-  const loaded = (await jiti.import(configPath)) as SearchSocketConfig;
+  let loaded: SearchSocketConfig;
+  try {
+    loaded = (await jiti.import(configPath)) as SearchSocketConfig;
+  } catch (error) {
+    // A syntax error or a throw while the file evaluates is a broken config,
+    // not an operational failure; untyped, it escaped as exit 1 instead of 2.
+    if (error instanceof SearchSocketError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new SearchSocketError("CONFIG_INVALID", `Failed to load configuration file ${configPath}: ${detail}`, {
+      status: 500,
+      cause: error
+    });
+  }
   const raw = (loaded as { default?: SearchSocketConfig }).default ?? loaded;
 
-  return mergeConfig(cwd, raw);
+  return mergeConfig(cwd, applyOverrides(raw, options.overrides));
 }
 
 export function writeMinimalConfig(cwd: string): string {

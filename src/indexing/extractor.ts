@@ -221,7 +221,29 @@ function preprocessImages(
  */
 const SYNTHETIC_ORIGIN = "https://searchsocket.local";
 
-export type ExclusionReason = "noindex" | "zero-weight";
+/**
+ * - `noindex` / `zero-weight`: the author asked for the page to be absent.
+ * - `ignored`: the whole content root carries the ignore attribute.
+ * - `redirect`: a prerendered redirect stub — a meta refresh with no content.
+ */
+export type ExclusionReason = "noindex" | "zero-weight" | "ignored" | "redirect";
+
+/**
+ * The target of a `<meta http-equiv="refresh" content="N; url=…">`, or null
+ * when the document has none. A refresh without a URL reloads the same page and
+ * is not a redirect, so it does not count.
+ */
+function findMetaRefreshTarget($: CheerioAPI): string | null {
+  let target: string | null = null;
+  $("meta[http-equiv]").each((_i, el) => {
+    if (target !== null) return;
+    if (($(el).attr("http-equiv") ?? "").trim().toLowerCase() !== "refresh") return;
+    const content = $(el).attr("content") ?? "";
+    const match = /^\s*\d*(?:\.\d*)?\s*[;,]?\s*url\s*=\s*['"]?([^'"\s]+)/i.exec(content);
+    if (match?.[1]) target = match[1];
+  });
+  return target;
+}
 
 /**
  * Why extraction could not produce a page.
@@ -234,10 +256,64 @@ export interface ExtractionFailure {
   detail: string;
 }
 
+/**
+ * Why a document was passed over without saying anything about its URL.
+ *
+ * - `self-redirect`: a redirect stub whose target is the page's own URL once
+ *   normalized — `docs.html` redirecting to `/docs/`, whose content lives in
+ *   `docs/index.html`. Both files map to `/docs`, so reading the stub as an
+ *   exclusion of `/docs` would delete the live page it points at. It is not a
+ *   failure either: a site that emits such a stub on every build would
+ *   otherwise never be allowed to prune.
+ */
+export type SkipReason = "self-redirect";
+
 export type ExtractionResult =
   | { status: "indexed"; page: ExtractedPage }
-  | { status: "excluded"; reason: ExclusionReason }
+  | { status: "excluded"; reason: ExclusionReason; detail?: string }
+  | { status: "skipped"; reason: SkipReason; detail?: string }
   | { status: "failed"; error: ExtractionFailure };
+
+/**
+ * Tags whose text is never page content, so a document holding nothing else
+ * has no meaningful body.
+ */
+const NON_CONTENT_TAGS = "script, style, noscript, template";
+
+/**
+ * Whether the ORIGINAL document, before any configured drop or ignore rule,
+ * carries body text.
+ *
+ * A redirect stub is recognised from this rather than from the extraction
+ * result. Deciding it after `dropSelectors` had run meant a selector mistake
+ * that emptied a real page carrying `<meta http-equiv="refresh" content="60;url=/next">`
+ * turned an extraction failure — which protects the index — into a redirect
+ * exclusion that deleted the page.
+ */
+function documentHasBodyText($: CheerioAPI): boolean {
+  const body = $("body").first().clone();
+  body.find(NON_CONTENT_TAGS).remove();
+  return normalizeText(body.text() || "").length > 0;
+}
+
+/**
+ * The normalized same-site path a redirect target resolves to, or null when it
+ * leaves the site or cannot be parsed. Relative targets resolve against the
+ * page's own URL, as a browser would.
+ */
+function resolveInternalRedirectPath(
+  target: string,
+  pageBaseUrl: URL,
+  internalOrigins: Set<string>
+): string | null {
+  try {
+    const resolved = new URL(target, pageBaseUrl);
+    if (!internalOrigins.has(resolved.origin)) return null;
+    return normalizeUrlPath(resolved.pathname);
+  } catch {
+    return null;
+  }
+}
 
 export function extractFromHtmlResult(
   url: string,
@@ -259,13 +335,6 @@ export function extractFromHtmlResult(
       // A malformed baseUrl simply contributes no extra origin.
     }
   }
-
-  const title =
-    $("meta[property='og:title']").attr("content")?.trim() ||
-    normalizeText($(`${config.extract.mainSelector} h1`).first().text() || "") ||
-    $("meta[name='twitter:title']").attr("content")?.trim() ||
-    normalizeText($("title").first().text() || "") ||
-    normalizedUrl;
 
   if (config.extract.respectRobotsNoindex) {
     const robots = $("meta[name='robots']").attr("content") ?? "";
@@ -325,9 +394,28 @@ export function extractFromHtmlResult(
     ? keywordsRaw.split(",").map((k) => k.trim()).filter(Boolean)
     : undefined;
 
-  const root = $(config.extract.mainSelector).first().length
+  const mainMatched = $(config.extract.mainSelector).first().length > 0;
+  const root = mainMatched
     ? $(config.extract.mainSelector).first().clone()
     : $("body").first().clone();
+
+  // Author markup on the content root itself. `find()` only searches
+  // descendants, so `<main data-search-ignore>` used to keep every word of the
+  // region its author asked to be ignored. Ignoring the whole content root is a
+  // deliberate statement that the page has nothing to index — an exclusion, not
+  // a failure that would make the run non-authoritative.
+  if (root.is(`[${config.extract.ignoreAttr}]`)) {
+    return { status: "excluded", reason: "ignored" };
+  }
+
+  // Drops that match the root itself empty it: that is a selector
+  // misconfiguration, and the empty-content failure below reports it as one.
+  const dropsRoot =
+    config.extract.dropTags.some((tagName) => root.is(tagName)) ||
+    config.extract.dropSelectors.some((selector) => root.is(selector));
+  if (dropsRoot) {
+    root.empty();
+  }
 
   for (const tagName of config.extract.dropTags) {
     root.find(tagName).remove();
@@ -338,6 +426,19 @@ export function extractFromHtmlResult(
   }
 
   root.find(`[${config.extract.ignoreAttr}]`).remove();
+
+  // Derived only now, from the cleaned root. Reading the `h1` before the drops
+  // ran made a heading inside a dropSelectors/ignore region the page's public
+  // title. Taken before image preprocessing so alt text replacing an `<img>`
+  // inside the heading does not leak into it — the same text the heading had.
+  // Only a matched mainSelector supplies a heading, as before: the body
+  // fallback would otherwise promote any stray `h1` in site chrome.
+  const title =
+    $("meta[property='og:title']").attr("content")?.trim() ||
+    (mainMatched ? normalizeText(root.find("h1").first().text() || "") : "") ||
+    $("meta[name='twitter:title']").attr("content")?.trim() ||
+    normalizeText($("title").first().text() || "") ||
+    normalizedUrl;
 
   // Replace <img> elements with descriptive text before Turndown
   preprocessImages(root, $, config.extract.imageDescAttr);
@@ -405,6 +506,28 @@ export function extractFromHtmlResult(
   const markdown = normalizeMarkdown(turndown.turndown(root.html() ?? ""));
 
   if (!normalizeText(markdown)) {
+    // A prerendered redirect has no content by design. SvelteKit writes a
+    // `redirect()` from a prerendered route as exactly
+    // `<script>location.href="…";</script><meta http-equiv="refresh" content="0;url=…">`,
+    // and treating that as a failed extraction made one redirect route disable
+    // stale-record pruning for the whole site. Recognised only here — after
+    // extraction produced nothing — so a real page that merely carries a meta
+    // refresh alongside its content is still indexed as a page.
+    //
+    // Stub-ness is judged on the original document, independently of the
+    // extraction config: only a document with no body text at all is a stub.
+    // A page that became empty because a drop rule removed its content is a
+    // failed extraction whatever meta refresh it carries.
+    const redirectTarget = findMetaRefreshTarget($);
+    if (redirectTarget !== null && !documentHasBodyText($)) {
+      const detail = `redirects to ${redirectTarget}`;
+      const targetPath = resolveInternalRedirectPath(redirectTarget, pageBaseUrl, internalOrigins);
+      if (targetPath === normalizedUrl) {
+        return { status: "skipped", reason: "self-redirect", detail };
+      }
+      return { status: "excluded", reason: "redirect", detail };
+    }
+
     // Not an exclusion: the page exists but nothing survived extraction.
     // Most often a mainSelector/dropSelectors regression.
     return {

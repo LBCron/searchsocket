@@ -24,6 +24,11 @@ Publishing is fully automated: pushing a `v*` tag to GitHub triggers
 **There is no NPM token anywhere** — nothing to configure, but also nothing to
 fall back on if the workflow itself breaks.
 
+The workflow picks the npm dist-tag from the tag itself: a version containing a
+hyphen (`1.0.0-rc.1`) publishes to **`next`**, everything else to **`latest`**.
+So a prerelease tag is safe to push — it cannot take `latest` away from the
+stable release — and installing one is `npm install searchsocket@next`.
+
 Your job is everything that happens before that tag exists, and verifying what
 happens after.
 
@@ -69,9 +74,14 @@ If the user passed an explicit bump or version, use it. Otherwise read every
 commit since the last tag and apply Conventional Commits:
 
 - `BREAKING CHANGE:` in a body, or `!` after the type (`feat!:`) → **major**
-  (while `0.x`, a breaking change is a **minor** bump)
 - any `feat:` → **minor**
 - otherwise → **patch**
+
+SearchSocket is past 1.0, so this is plain semver: a breaking change to the
+public API, config schema, CLI flags or exit codes, MCP tool contract, or HTTP
+response shape is a major bump, never a minor one. If a commit changes any of
+those without a `!`/`BREAKING CHANGE:` marker, treat it as breaking anyway and
+say so.
 
 State the detected bump and the resulting version before acting on it. If
 nothing has landed since the last tag, say so and stop.
@@ -79,14 +89,14 @@ nothing has landed since the last tag, say so and stop.
 ## Step 3 — Cut the release branch
 
 ```bash
-git switch -c release/0.8.0 develop
+git switch -c release/1.1.0 develop
 ```
 
 For a hotfix (an urgent fix on top of what is already published, skipping
 whatever is unreleased on develop):
 
 ```bash
-git switch -c hotfix/0.7.2 main
+git switch -c hotfix/1.0.1 main
 ```
 
 Everything after this point is identical for both, except the branch name.
@@ -94,7 +104,7 @@ Everything after this point is identical for both, except the branch name.
 ## Step 4 — Bump the version
 
 ```bash
-npm version 0.8.0 --no-git-tag-version
+npm version 1.1.0 --no-git-tag-version
 ```
 
 This edits `package.json` only. It does **not** touch the CHANGELOG (do that by
@@ -107,7 +117,7 @@ root package version, so `--frozen-lockfile` in CI stays happy.
 previous version's heading:
 
 ```markdown
-## [0.8.0] - YYYY-MM-DD
+## [1.1.0] - YYYY-MM-DD
 
 ### Added
 ### Changed
@@ -133,33 +143,34 @@ the fix can be committed before continuing.
 pnpm run typecheck
 pnpm run build
 pnpm run test
-npm pack --dry-run
+pnpm run check:package
 ```
 
-`npm pack --dry-run` is not optional theatre. The `./svelte` subpath ships **raw
-source**, not bundled output, so it can silently break when an import is added
-to `src/svelte/*`. Check the file list for:
+`check:package` (`scripts/check-package.mjs`, run after the build) is not
+optional theatre — `pnpm run test` exercises the source tree, which resolves
+imports the tarball may not ship. It reads the `npm pack --dry-run` file list and
+fails when:
 
-- `dist/` present, `dist/**/*.map` absent
-- `src/svelte/` present
-- **every non-`src/svelte` file that `src/svelte/*` imports at runtime** is also
-  in the tarball (currently `src/types.ts` and `src/utils/structured-meta.ts`)
+- any `exports` or `bin` target in `package.json` is not packed
+- a file imported (transitively) by the raw-source `./svelte` subpath is not
+  packed — that subpath ships **source**, so a new relative import in
+  `src/svelte/*` needs adding to `files`; this exact gap shipped broken in v0.7.1
+- a browser entry (`searchsocket/client`, `searchsocket/scroll`) imports a Node
+  builtin or uses `require`/`createRequire` (a text scan, not a browser build)
+- a source map, `.env` file, or test file would be published
 
-If `src/svelte` gained a new relative import, add that file to `files` in
-`package.json` before releasing. This exact gap shipped broken in v0.7.1.
-
-The build output goes to stdout and will corrupt any attempt to pipe
-`npm pack --dry-run` into a JSON parser — read the `npm notice` lines instead.
+The publish workflow runs the same check, but a failure there happens after the
+tag is pushed, so run it here.
 
 ## Step 7 — Commit and push the release branch
 
 ```bash
 git add package.json CHANGELOG.md
-git commit -m "chore: prepare for v0.8.0 release"
-git push -u origin release/0.8.0
+git commit -m "chore: prepare for v1.1.0 release"
+git push -u origin release/1.1.0
 ```
 
-Pushing the branch lets CI run the Node 20/22/24 matrix against the exact commit
+Pushing the branch lets CI run the Node 22/24 matrix against the exact commit
 that is about to become the tag. Wait for it:
 
 ```bash
@@ -173,10 +184,10 @@ published yet, so this is a free checkpoint.
 
 ```bash
 git switch main
-git merge --no-ff release/0.8.0 -m "chore: release v0.8.0"
-git tag -a v0.8.0 -m "Release version 0.8.0"
+git merge --no-ff release/1.1.0 -m "chore: release v1.1.0"
+git tag -a v1.1.0 -m "Release version 1.1.0"
 git push origin main
-git push origin v0.8.0
+git push origin v1.1.0
 ```
 
 The tag push starts the publish workflow. Watch it:
@@ -185,6 +196,12 @@ The tag push starts the publish workflow. Watch it:
 gh run watch --exit-status
 ```
 
+After publishing it smoke-tests the release from the registry: it installs the
+exact version and checks that the dist-tag it chose (`latest`, or `next` for a
+prerelease) really resolves to it. Both steps retry, because registry metadata
+converges a little behind the publish — a transient failure early in the run is
+not yet a failed release.
+
 ## Step 9 — Merge back to develop
 
 Do this even if the publish is still running — `develop` must carry the version
@@ -192,23 +209,23 @@ bump and the CHANGELOG entry, and for a hotfix it must carry the fix itself.
 
 ```bash
 git switch develop
-git merge --no-ff release/0.8.0 -m "chore: merge release v0.8.0 back into develop"
+git merge --no-ff release/1.1.0 -m "chore: merge release v1.1.0 back into develop"
 git push origin develop
-git push origin --delete release/0.8.0
-git branch -d release/0.8.0
+git push origin --delete release/1.1.0
+git branch -d release/1.1.0
 ```
 
 ## Step 10 — Verify and announce
 
 ```bash
-npm view searchsocket version          # must equal the released version
-npm view searchsocket dist-tags
+npm view searchsocket dist-tags        # `latest` — or `next` for a prerelease —
+                                       # must equal the released version
 ```
 
 Then publish the GitHub release using the CHANGELOG section as the body:
 
 ```bash
-gh release create v0.8.0 --title "v0.8.0" --notes "<the CHANGELOG section>"
+gh release create v1.1.0 --title "v1.1.0" --notes "<the CHANGELOG section>"
 ```
 
 Report to the user: the version, the NPM URL
@@ -240,8 +257,8 @@ The tag already exists on `main` and cannot be reused for a different artifact.
 - `release/*` — from `develop`, merges to **both** `main` and `develop`.
 - `hotfix/*` — from `main`, merges to **both** `main` and `develop`.
 - Branch prefixes are stored in git config: `git config --get-regexp '^gitflow\.'`
-- CI (`ci.yml`) runs typecheck → build → test on Node 20/22/24; publish uses
-  Node 24. Keep the matrix in step with `engines.node` (`>=20.19.0`).
+- CI (`ci.yml`) runs typecheck → build → test → check:package on Node 22 and 24;
+  publish uses Node 24. Keep the matrix in step with `engines.node` (`>=22.12.0`).
 - This repo *is* the `searchsocket` package, so its own bin is never linked into
   `node_modules/.bin`. Invoke the CLI as `node dist/cli.js`, never
   `pnpm searchsocket` — the latter only appears to work on a machine with a

@@ -14,30 +14,51 @@ export type {
   IndexingHooks,
   IndexOptions,
   IndexStats,
+  IndexWriteRefusal,
+  OutgoingLink,
+  PageHit,
   PageRecord,
+  RankingOverrides,
+  RelatedPage,
   RelatedPagesResult,
+  RelationshipType,
   ResolvedSearchSocketConfig,
   RunWarning,
   Scope,
   ScopeInfo,
+  ScopeMode,
+  ScoreBreakdown,
   SearchRequest,
   SearchResponse,
   SearchResult,
   SearchResultChunk,
   SearchSocketConfig,
+  SiteStructureResult,
+  SiteTreeNode,
+  SourceMode,
   VectorHit
 } from "./types";
 
-export type { SearchSocketErrorCode } from "./errors";
+export type { SearchSocketErrorCode, SearchSocketErrorOptions } from "./errors";
 export { SearchSocketError } from "./errors";
 
-export { loadConfig, mergeConfig, mergeConfigServerless } from "./config/load";
-export { isServerless } from "./core/serverless";
-export { resolveScope } from "./core/scope";
+/**
+ * The logger `SearchEngineOptions.logger` and `IndexPipelineOptions.logger`
+ * accept. Construct one to control verbosity, JSON output or stderr-only mode.
+ */
+export type { LoggerOptions } from "./core/logger";
+export { Logger } from "./core/logger";
+
+export type { ConfigOverrides, LoadConfigOptions } from "./config/load";
+export { loadConfig, mergeConfig } from "./config/load";
+export type { IndexPipelineOptions } from "./indexing/pipeline";
 export { IndexPipeline } from "./indexing/pipeline";
+export type { SearchEngineOptions } from "./search/engine";
 export { SearchEngine } from "./search/engine";
-export { runMcpServer } from "./mcp/server";
+export { MAX_PATH_LENGTH, MAX_QUERY_LENGTH } from "./search/limits";
+export type { SearchSocketAutoIndexOptions, SearchSocketHandleOptions } from "./sveltekit";
 export { searchsocketHandle, searchsocketVitePlugin } from "./sveltekit";
+export type { SearchClient, SearchClientOptions } from "./client";
 export { createSearchClient } from "./client";
 
 /**
@@ -49,12 +70,25 @@ export { INDEX_SCHEMA_VERSION } from "./vector/ids";
 /**
  * Storage access.
  *
- * `createUpstashStore` is the supported way to obtain a store. The concrete
- * `UpstashSearchStore` class is no longer exported from the root: it was public
- * only by accident, and exposing it made its internals — batching, ID encoding,
- * scan strategy — part of the package's compatibility surface. There is no
- * exported subpath for it and the bundler emits no separate file, so the class
- * is not reachable from the published package at all. If you need it, work from
- * the source in the repository and expect it to change.
+ * `createUpstashStore` is the supported way to obtain a store, and it is typed
+ * as `SearchStore`: the operations `SearchEngine` (`SearchStoreReader`) and
+ * `IndexPipeline` (`SearchStoreWriter`) actually call. Those interfaces are the
+ * compatibility surface; anything else the Upstash implementation does —
+ * batching, ID encoding, scan strategy, the CLI's administrative and migration
+ * operations — is not, and is free to change. A custom store passed as
+ * `SearchEngineOptions.store` or `IndexPipelineOptions.store` must implement
+ * the matching interface and keep every read and write inside the given scope.
  */
+export type {
+  ChunkHashEntry,
+  ChunkInventoryEntry,
+  PageHashEntry,
+  RetrievalConstraints,
+  SearchStore,
+  SearchStoreReader,
+  SearchStoreWriter,
+  StoreMetadataUpdate,
+  StoreQueryOptions,
+  StoreRecord
+} from "./vector";
 export { createUpstashStore } from "./vector";

@@ -176,9 +176,11 @@ reports `deletionEligible: false` and deletes nothing. If you relied on
 `--max-pages` runs pruning the index, that never worked safely — it deleted every
 page beyond the limit.
 
-**`clean --remote` is a dry run** until you add `--apply`, and deletes a single
-scope rather than the whole project. Project-wide deletion needs
-`--all-scopes --confirm-project <id>`.
+**`clean --remote` is plan-only** until you add `--apply` — it deletes nothing at
+all, the local state directory included, and prints the plan instead. It deletes a
+single scope rather than the whole project; project-wide deletion needs
+`--all-scopes --confirm-project <id>`. On an applied run, `--keep-local` still
+leaves the local state directory alone. Plain `clean` (no `--remote`) is unchanged.
 
 **`prune` fails closed.** It refuses to run when the remote branch list cannot be
 trusted — a shallow clone, no configured remotes, or an empty `--scopes-file`.

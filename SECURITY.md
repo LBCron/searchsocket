@@ -4,8 +4,9 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.10.x | Yes |
-| 0.8.x – 0.9.x | No — upgrade to 0.10 |
+| 1.0.x | Yes |
+| 0.11.x | Security fixes only, until three months after the 1.0.0 release |
+| 0.8.x – 0.10.x | No — upgrade to 1.0 |
 | ≤ 0.7.x | No — upgrade, see [docs/migration-0.8.md](docs/migration-0.8.md) |
 
 ## Reporting a vulnerability

@@ -4,8 +4,9 @@ import { resolveScope } from "../core/scope";
 import { ensureStateDirs } from "../core/state";
 import { SearchSocketError } from "../errors";
 import { createUpstashStore } from "../vector";
-import type { ChunkHashEntry } from "../vector/upstash";
-import { PAGE_CHUNK_KEYS_FIELD, UpstashSearchStore } from "../vector/upstash";
+import type { ChunkHashEntry, ChunkInventoryEntry } from "../vector/upstash";
+import { PAGE_CHUNK_COUNT_FIELD, PAGE_CHUNK_KEYS_FIELD } from "../vector/upstash";
+import type { SearchStoreWriter } from "../vector/store";
 import { buildChunkEmbeddingHash, buildEmbeddingText, chunkPage } from "./chunker";
 import { extractFromHtmlResult, extractFromMarkdownResult } from "./extractor";
 import { buildRoutePatterns, mapUrlToRoute } from "./route-mapper";
@@ -32,6 +33,7 @@ import type {
   IndexingHooks,
   IndexOptions,
   IndexStats,
+  IndexWriteRefusal,
   RunWarning,
   PageRecord,
   ResolvedSearchSocketConfig,
@@ -269,7 +271,15 @@ function withChunkManifest(
   chunkKeys: string[] | null
 ): Record<string, unknown> {
   if (!chunkKeys) return metadata;
-  return { ...metadata, [PAGE_CHUNK_KEYS_FIELD]: [...chunkKeys] };
+  // The count travels with the manifest and, unlike it, is never omitted for
+  // size: a page too large to list its keys still tells a reader how many
+  // sections to expect, which is what lets that reader find them without a
+  // scope scan and tells it the page is not a pre-manifest leftover.
+  return {
+    ...metadata,
+    [PAGE_CHUNK_KEYS_FIELD]: [...chunkKeys],
+    [PAGE_CHUNK_COUNT_FIELD]: chunkKeys.length
+  };
 }
 
 /**
@@ -440,7 +450,7 @@ function fitMetadataToBudget(
       `Omitted "${omittable}" from ${budget.kind} ${id} (${budget.url}): ` +
         `${Array.isArray(dropped) ? `${dropped.length} entries` : "it"} would not fit the ` +
         `${METADATA_BYTE_BUDGET}-byte metadata limit. The page still reads correctly; ` +
-        "retrieving it falls back to scanning the scope for its chunks."
+        "retrieving it finds its chunks by a page-filtered lookup instead, falling back to a bounded scope scan."
     );
   }
   if (size <= METADATA_BYTE_BUDGET) return fitted;
@@ -506,11 +516,11 @@ function planWrite(
   };
 }
 
-interface IndexPipelineOptions {
+export interface IndexPipelineOptions {
   cwd?: string;
   configPath?: string;
   config?: ResolvedSearchSocketConfig;
-  store?: UpstashSearchStore;
+  store?: SearchStoreWriter;
   logger?: Logger;
   hooks?: IndexingHooks;
 }
@@ -518,14 +528,14 @@ interface IndexPipelineOptions {
 export class IndexPipeline {
   private readonly cwd: string;
   private readonly config: ResolvedSearchSocketConfig;
-  private readonly store: UpstashSearchStore;
+  private readonly store: SearchStoreWriter;
   private readonly logger: Logger;
   private readonly hooks: IndexingHooks;
 
   private constructor(options: {
     cwd: string;
     config: ResolvedSearchSocketConfig;
-    store: UpstashSearchStore;
+    store: SearchStoreWriter;
     logger: Logger;
     hooks: IndexingHooks;
   }) {
@@ -552,6 +562,20 @@ export class IndexPipeline {
 
   getConfig(): ResolvedSearchSocketConfig {
     return this.config;
+  }
+
+  /**
+   * Every stored chunk in the scope with its provenance and, when the store
+   * can say, the URL of the page it belongs to. A store without
+   * `scanChunkInventory` reports no URLs, and exclusion cleanup then falls
+   * back to page manifests.
+   */
+  private async scanChunkInventory(scope: Scope): Promise<Map<string, ChunkInventoryEntry>> {
+    if (this.store.scanChunkInventory) {
+      return this.store.scanChunkInventory(scope);
+    }
+    const ids = await this.store.scanChunkIds(scope);
+    return new Map([...ids].map(([key, custom]) => [key, { custom, url: null }]));
   }
 
   async run(rawOptions: IndexOptions = {}): Promise<IndexStats> {
@@ -646,6 +670,37 @@ export class IndexPipeline {
     const filterStart = stageStart();
     let filteredSourcePages = sourcePages;
 
+    // Pages this run positively observed and deliberately kept out: a config
+    // `exclude` match, a robots.txt block, noindex, zero weight, an ignored
+    // content root or a redirect stub. Unlike a page that is merely absent,
+    // each of these is direct evidence about that one URL, so removing its old
+    // records does not depend on the run having seen the rest of the site —
+    // see the deletion gate below.
+    const observedExcludedUrls = new Set<string>();
+
+    // URLs about which some part of this run's evidence says "this page is
+    // live" or "this page could not be read". A second source file for the
+    // same URL claiming exclusion is then not evidence about the page: a
+    // redirect stub `docs.html` must not delete the `docs/index.html` beside
+    // it, and a stub cannot speak for a canonical file that failed to load or
+    // extract. Pages that end up indexed are added once extraction is done.
+    const exclusionVetoedUrls = new Set<string>();
+    for (const failure of sourceLoad.failures) {
+      if (failure.url) exclusionVetoedUrls.add(normalizeUrlPath(failure.url));
+    }
+
+    // URLs a source-level exclude rule (`source.build.exclude`) removed before
+    // the pipeline ever saw them. Same standing as a top-level `exclude` match.
+    const sourceExcludedUrls = sourceLoad.excludedUrls ?? [];
+    for (const url of sourceExcludedUrls) {
+      observedExcludedUrls.add(normalizeUrlPath(url));
+    }
+    if (sourceExcludedUrls.length > 0) {
+      this.logger.debug(
+        `${sourceExcludedUrls.length} URL${sourceExcludedUrls.length === 1 ? "" : "s"} excluded by source exclude patterns`
+      );
+    }
+
     // Apply top-level exclude patterns (works across all source modes)
     if (this.config.exclude.length > 0) {
       const beforeExclude = filteredSourcePages.length;
@@ -653,6 +708,7 @@ export class IndexPipeline {
         const url = normalizeUrlPath(p.url);
         if (matchUrlPatterns(url, this.config.exclude)) {
           this.logger.debug(`Excluding ${url} (matched exclude pattern)`);
+          observedExcludedUrls.add(url);
           return false;
         }
         return true;
@@ -719,6 +775,7 @@ export class IndexPipeline {
           const url = normalizeUrlPath(p.url);
           if (isBlockedByRobots(url, robotsRules!)) {
             this.logger.debug(`Excluding ${url} (blocked by robots.txt)`);
+            observedExcludedUrls.add(url);
             return false;
           }
           return true;
@@ -745,10 +802,27 @@ export class IndexPipeline {
         ? extractFromHtmlResult(sourcePage.url, sourcePage.html, this.config)
         : extractFromMarkdownResult(sourcePage.url, sourcePage.markdown ?? "", sourcePage.title);
 
+      if (result.status === "skipped") {
+        // Says nothing about the URL either way — see SkipReason. Neither an
+        // exclusion (it would delete the canonical page it points at) nor a
+        // failure (it is a normal build artifact).
+        const detail = result.detail ? `: ${result.detail}` : "";
+        this.logger.debug(`Skipping ${normalizeUrlPath(sourcePage.url)} (${result.reason}${detail})`);
+        continue;
+      }
+
       if (result.status === "excluded") {
-        // An explicit noindex or zero weight is an authoritative removal
-        // signal: the author asked for this page to be absent.
-        this.logger.debug(`Excluding ${sourcePage.url} (${result.reason})`);
+        // An explicit noindex, zero weight, ignored root or redirect stub is an
+        // authoritative removal signal: the page is meant to be absent.
+        const detail = result.detail ? `: ${result.detail}` : "";
+        if (result.reason === "redirect") {
+          // Said at info level: a redirect route is a normal part of a site,
+          // but a silent skip would leave people wondering where the page went.
+          this.logger.info(`Skipping redirect stub ${normalizeUrlPath(sourcePage.url)}${detail}`);
+        } else {
+          this.logger.debug(`Excluding ${sourcePage.url} (${result.reason}${detail})`);
+        }
+        observedExcludedUrls.add(normalizeUrlPath(sourcePage.url));
         continue;
       }
 
@@ -763,6 +837,7 @@ export class IndexPipeline {
           kind: "extraction-failure",
           detail: `${sourcePage.url}: ${result.error.detail}`
         });
+        exclusionVetoedUrls.add(normalizeUrlPath(sourcePage.url));
         continue;
       }
 
@@ -820,6 +895,10 @@ export class IndexPipeline {
             kind: "extraction-failure",
             detail: `custom record ${normalizedUrl}: empty content`
           });
+          // Nor may a site page that happens to be excluded at the same URL
+          // speak for it: the provider failed, so nothing here says the page
+          // should go.
+          exclusionVetoedUrls.add(normalizedUrl);
           continue;
         }
 
@@ -893,6 +972,9 @@ export class IndexPipeline {
         configWeight === 0 || page.weight === 0 ? 0 : page.weight ?? configWeight;
       if (effectiveWeight === 0) {
         this.logger.debug(`Excluding ${page.url} (zero weight)`);
+        // Custom records are the caller's; their removal follows the
+        // customRecords contract, not this site-exclusion path.
+        if (!page.custom) observedExcludedUrls.add(normalizeUrlPath(page.url));
         continue;
       }
       indexablePages.push(page);
@@ -1337,7 +1419,8 @@ export class IndexPipeline {
     // Scan for stale chunk IDs that no longer exist in the current set.
     // Uses range() scan which may include extra IDs, but deletion of
     // non-existent IDs is safe and idempotent.
-    const existingChunkIds = await this.store.scanChunkIds(scope);
+    const chunkInventory = await this.scanChunkInventory(scope);
+    const existingChunkIds = new Map([...chunkInventory].map(([key, entry]) => [key, entry.custom]));
     const staleChunkCandidates = [...existingChunkIds.entries()]
       .filter(([chunkKey, isCustom]) => {
         if (currentChunkMap.has(chunkKey)) return false;
@@ -1359,14 +1442,68 @@ export class IndexPipeline {
     const dangerousOperations: string[] = [];
     let deletionEligible = runWarnings.length === 0;
 
+    // Deletions of pages this run positively observed as excluded. These do not
+    // rest on the run's view being complete: "robots.txt blocks /private" is
+    // evidence about /private whether or not some unrelated page failed to
+    // extract. Gating them on completeness meant one unrelated warning kept
+    // explicitly excluded content public indefinitely.
+    //
+    // Indexed wins: a URL this run also indexed is live whatever another file
+    // for it said, and so is one whose other file failed to load or extract.
+    //
+    // Source limits are applied per URL (see applyMaxPagesByUrl), so a limited
+    // run that loaded a URL loaded every file behind it and its verdict about
+    // that URL is as complete as an unlimited run's. That is why observed
+    // exclusions are still recorded under `--max-pages`.
+    for (const page of pages) exclusionVetoedUrls.add(page.url);
+    const exclusionEvidenceUrls = new Set(
+      [...observedExcludedUrls].filter((url) => !exclusionVetoedUrls.has(url))
+    );
+
+    const staleCandidateSet = new Set(staleCandidateUrls);
+    const staleChunkCandidateSet = new Set(staleChunkCandidates);
+    const excludedPageUrls = [...exclusionEvidenceUrls].filter((url) => staleCandidateSet.has(url)).sort();
+
+    // Every stored chunk of an excluded URL, not just the ones its page record
+    // lists. The manifest names only the latest generation, a page written
+    // before manifests existed has none, and once the page record is deleted
+    // nothing would find the rest again — they would stay searchable forever.
+    // The chunk inventory carries each chunk's URL, so match on that. Only
+    // stale candidates qualify, which keeps this run's own chunks and, when
+    // the run was not given custom records, every custom chunk.
+    const excludedChunkKeySet = new Set<string>();
+    for (const [key, entry] of chunkInventory) {
+      if (entry.url !== null && exclusionEvidenceUrls.has(entry.url) && staleChunkCandidateSet.has(key)) {
+        excludedChunkKeySet.add(key);
+      }
+    }
+    // A store that cannot report chunk URLs still has the manifest to go on.
+    for (const url of excludedPageUrls) {
+      const manifest = existingPageHashes.get(url)?.chunkKeys;
+      if (!manifest) continue;
+      for (const key of manifest) {
+        if (staleChunkCandidateSet.has(key)) excludedChunkKeySet.add(key);
+      }
+    }
+    const excludedChunkKeys = [...excludedChunkKeySet].sort();
+    const hasExclusionDeletions = excludedPageUrls.length > 0 || excludedChunkKeys.length > 0;
+
     if (!deletionEligible) {
       this.logger.warn(
-        `Run is not authoritative (${runWarnings.length} warning${runWarnings.length === 1 ? "" : "s"}); no records will be deleted.`
+        `Run is not authoritative (${runWarnings.length} warning${runWarnings.length === 1 ? "" : "s"}); ` +
+          (hasExclusionDeletions
+            ? "only records of pages this run observed as excluded may be deleted."
+            : "no records will be deleted.")
       );
       for (const warning of runWarnings) {
         this.logger.warn(`  ${warning.kind}: ${warning.detail}`);
       }
     }
+
+    // An unreadable robots.txt means the run cannot tell which pages are
+    // excluded, so no exclusion it did observe is complete either: nothing is
+    // deleted, observed or not.
+    let exclusionDeletionsAllowed = !exclusionPolicyUnknown;
 
     // An authoritative run whose *site source* produced zero pages is almost
     // always a broken source config rather than a genuinely emptied site.
@@ -1375,9 +1512,14 @@ export class IndexPipeline {
     // count: custom records are supplied by the caller and would otherwise
     // mask a total source failure, letting every real page be deleted while
     // the count stayed comfortably non-zero.
+    //
+    // It also blocks exclusion deletions: an `exclude: ["/**"]` typo or a
+    // `Disallow: /` produces exactly this shape, and is just as much a broken
+    // config as an empty build directory.
     const siteSourceEmpty = sitePageCount === 0;
-    if (deletionEligible && siteSourceEmpty && !options.allowEmpty) {
+    if ((deletionEligible || (exclusionDeletionsAllowed && hasExclusionDeletions)) && siteSourceEmpty && !options.allowEmpty) {
       deletionEligible = false;
+      exclusionDeletionsAllowed = false;
       const detail =
         `site source produced 0 pages (${existingPageHashes.size} page(s) and ` +
         `${existingChunkIds.size} chunk(s) exist remotely); pass --allow-empty to delete them`;
@@ -1385,6 +1527,14 @@ export class IndexPipeline {
       runWarnings.push({ kind: "source-failure", detail });
       dangerousOperations.push(`refused-empty-deletion: ${detail}`);
     }
+
+    // The deletions this run intends, before the ratio guard has its say.
+    let deletedPageUrls = deletionEligible
+      ? staleCandidateUrls
+      : exclusionDeletionsAllowed
+        ? excludedPageUrls
+        : [];
+    let deletes = deletionEligible ? staleChunkCandidates : exclusionDeletionsAllowed ? excludedChunkKeys : [];
 
     // Guard against a mass deletion caused by a change the completeness checks
     // cannot see — e.g. every URL silently gaining a prefix, which looks like a
@@ -1397,6 +1547,12 @@ export class IndexPipeline {
     // intended, so it satisfies the ratio guard for that case on its own.
     // Requiring `--accept-large-deletion` as well would contradict its help text.
     //
+    // Observed exclusions count towards the ratio. They are positive evidence
+    // about each page, but the guard exists for mistakes that look legitimate,
+    // and a mis-scoped exclude pattern or robots rule is exactly that: every
+    // page it matches is "observed as excluded". Letting them bypass the guard
+    // would make it the one mass deletion the guard cannot stop.
+    //
     // A refusal here also stops the run's *additions*. Withholding only the
     // deletions left the replacement records written, which enlarges the
     // inventory the ratio is measured against: an identical rerun then saw the
@@ -1405,13 +1561,14 @@ export class IndexPipeline {
     // mutation is what keeps a refused plan refused however often it is
     // repeated, and leaves the index exactly as it was last accepted.
     let indexMutationRefused = false;
+    let refusalDetail = "";
     const ratioGuardSatisfied =
       options.acceptLargeDeletion || (options.allowEmpty === true && siteSourceEmpty);
-    if (deletionEligible && !ratioGuardSatisfied) {
+    if ((deletedPageUrls.length > 0 || deletes.length > 0) && !ratioGuardSatisfied) {
       const maxRatio = this.config.indexing.maxDeletionRatio;
       const checks: Array<{ label: string; stale: number; existing: number }> = [
-        { label: "pages", stale: staleCandidateUrls.length, existing: existingPageHashes.size },
-        { label: "chunks", stale: staleChunkCandidates.length, existing: existingChunkIds.size }
+        { label: "pages", stale: deletedPageUrls.length, existing: existingPageHashes.size },
+        { label: "chunks", stale: deletes.length, existing: existingChunkIds.size }
       ];
       for (const check of checks) {
         if (check.stale === 0 || check.existing === 0) continue;
@@ -1419,10 +1576,13 @@ export class IndexPipeline {
         if (ratio > maxRatio) {
           deletionEligible = false;
           indexMutationRefused = true;
+          deletedPageUrls = [];
+          deletes = [];
           const detail =
             `would delete ${check.stale} of ${check.existing} ${check.label} ` +
             `(${Math.round(ratio * 100)}% > ${Math.round(maxRatio * 100)}% limit); ` +
             "no records were written; pass --accept-large-deletion to proceed";
+          refusalDetail = detail;
           this.logger.warn(`Refusing deletion: ${detail}`);
           runWarnings.push({ kind: "source-failure", detail });
           dangerousOperations.push(`refused-large-deletion: ${detail}`);
@@ -1431,14 +1591,12 @@ export class IndexPipeline {
       }
     }
 
-
-    const deletedPageUrls = deletionEligible ? staleCandidateUrls : [];
-    const deletes = deletionEligible ? staleChunkCandidates : [];
-
-    if (!deletionEligible && (staleCandidateUrls.length > 0 || staleChunkCandidates.length > 0)) {
+    const skippedPageDeletes = staleCandidateUrls.length - deletedPageUrls.length;
+    const skippedChunkDeletes = staleChunkCandidates.length - deletes.length;
+    if (skippedPageDeletes > 0 || skippedChunkDeletes > 0) {
       this.logger.warn(
-        `Skipping deletion of ${staleCandidateUrls.length} stale page(s) and ` +
-          `${staleChunkCandidates.length} stale chunk(s) — run is not authoritative.`
+        `Skipping deletion of ${skippedPageDeletes} stale page(s) and ` +
+          `${skippedChunkDeletes} stale chunk(s) — run is not authoritative.`
       );
     }
 
@@ -1471,6 +1629,18 @@ export class IndexPipeline {
     // would dilute the ratio the next run measures) and an unknown exclusion
     // policy (writing could publish a page robots.txt meant to exclude).
     const writesBlocked = indexMutationRefused || exclusionPolicyUnknown;
+    // Reported on the stats so a caller cannot mistake a refused run for a
+    // successful one: both resolve normally, and the index is left exactly as
+    // it was. Set on dry runs too — a dry run exists to predict what a real run
+    // would do, and a real run would refuse.
+    const writesRefused: IndexWriteRefusal | null = indexMutationRefused
+      ? { reason: "max-deletion-ratio", detail: refusalDetail }
+      : exclusionPolicyUnknown
+        ? {
+            reason: "robots-unavailable",
+            detail: "robots.txt could not be read, so the run cannot tell which pages are excluded"
+          }
+        : null;
 
     if (writesBlocked && !options.dryRun) {
       const reason = indexMutationRefused
@@ -1653,6 +1823,7 @@ export class IndexPipeline {
       routeBestEffort,
       stageTimingsMs,
       deletionEligible,
+      writesRefused,
       warnings: runWarnings,
       dangerousOperations
     };

@@ -4,7 +4,7 @@ import fg from "fast-glob";
 import type { PageSourceRecord } from "../../../types";
 import { staticHtmlFileToUrl } from "../../../utils/path";
 import { matchUrlPatterns } from "../../../utils/pattern";
-import { applyMaxPages, sourceResult, type SourceFailure, type SourceLoadResult } from "../result";
+import { applyMaxPagesByUrl, sourceResult, type SourceFailure, type SourceLoadResult } from "../result";
 
 /**
  * Universal skip list for SvelteKit prerendered output across adapters.
@@ -51,11 +51,21 @@ export async function loadPrerenderedPages(
 
   // Exclusions are applied before the page budget: an excluded page must not
   // consume a slot that a page the user actually wants indexed needed.
+  //
+  // The excluded URLs are reported, not just dropped: an explicit source-level
+  // exclude is evidence about that URL, and the pipeline removes its old
+  // records through the same guarded path as a top-level `exclude` match.
+  const excludedUrls = new Set<string>();
   const candidates = htmlFiles
     .map((filePath) => ({ filePath, url: staticHtmlFileToUrl(filePath, outputDir) }))
-    .filter((candidate) => !matchUrlPatterns(candidate.url, exclude));
+    .filter((candidate) => {
+      if (!matchUrlPatterns(candidate.url, exclude)) return true;
+      excludedUrls.add(candidate.url);
+      return false;
+    });
 
-  const { selected, limitedBy } = applyMaxPages(candidates, maxPages);
+  // Limited by URL, not by file: see applyMaxPagesByUrl.
+  const { selected, limitedBy } = applyMaxPagesByUrl(candidates, maxPages, (candidate) => candidate.url);
 
   const pages: PageSourceRecord[] = [];
   const failures: SourceFailure[] = [];
@@ -66,7 +76,8 @@ export async function loadPrerenderedPages(
     } catch (error) {
       failures.push({
         target: path.relative(cwd, filePath).replace(/\\/g, "/"),
-        reason: error instanceof Error ? error.message : String(error)
+        reason: error instanceof Error ? error.message : String(error),
+        url
       });
       continue;
     }
@@ -84,6 +95,7 @@ export async function loadPrerenderedPages(
     // cover, so they do not count as discovered — same as manifest mode.
     discoveredCount: candidates.length,
     failures,
-    limitedBy
+    limitedBy,
+    excludedUrls
   });
 }

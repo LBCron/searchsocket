@@ -111,6 +111,32 @@ describe("searchsocketScrollToText", () => {
     expect(h2.scrollIntoView).not.toHaveBeenCalled();
   });
 
+  it("falls back to the _ssk heading when the _sskt phrase is not on the page", () => {
+    // The shape older indexes produced: a snippet excerpted from the embedding
+    // prefix, naming a phrase the page never contains.
+    const h2 = makeHeading("h2", "Creating worktrees from issues");
+    document.body.appendChild(makeHeading("h1", "Create and Link Worktrees"));
+    document.body.appendChild(h2);
+
+    searchsocketScrollToText(
+      makeNavigation({
+        _ssk: "Creating worktrees from issues",
+        _sskt: "Create and Link Worktrees Daintree Docs — Creating worktrees from issues Creating"
+      })
+    );
+
+    expect(h2.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("falls back to _ssk when _sskt is blank", () => {
+    const h2 = makeHeading("h2", "Configuration");
+    document.body.appendChild(h2);
+
+    searchsocketScrollToText(makeNavigation({ _ssk: "Configuration", _sskt: "   " }));
+
+    expect(h2.scrollIntoView).toHaveBeenCalled();
+  });
+
   it("does nothing when no match exists", () => {
     const h1 = makeHeading("h1", "Unrelated Title");
     document.body.appendChild(h1);
@@ -396,3 +422,105 @@ describe("searchsocketScrollToText", () => {
     expect(p2.querySelector(".ssk-highlight")).not.toBeNull();
   });
 });
+
+// A documentation page repeats every heading in its table of contents, ahead of
+// the content. The first occurrence in document order is then a TOC link, and a
+// search result for that section scrolled to the list instead of the section.
+describe("searchsocketScrollToText with a table of contents", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  function tocLink(text: string): HTMLAnchorElement {
+    const a = document.createElement("a");
+    a.textContent = text;
+    (a as any).scrollIntoView = vi.fn();
+    return a;
+  }
+
+  it("prefers the section heading over an earlier table-of-contents entry outside nav", () => {
+    // An inline "On this page" list is often a <details>, not a <nav>.
+    const details = document.createElement("details");
+    const link = tocLink("The confirm button");
+    details.appendChild(link);
+    const heading = makeHeading("h3", "The confirm button");
+    document.body.append(details, makeHeading("h2", "Deleting a Worktree"), heading);
+
+    searchsocketScrollToText(makeNavigation({ _ssk: "The confirm button", _sskt: "The confirm button" }));
+
+    expect(heading.scrollIntoView).toHaveBeenCalled();
+    expect(link.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("finds body text under the section heading rather than an earlier mention", () => {
+    const intro = document.createElement("p");
+    intro.textContent = "Open the dialog from the card menu.";
+    (intro as any).scrollIntoView = vi.fn();
+    const section = makeHeading("h2", "Deleting");
+    const body = document.createElement("p");
+    body.textContent = "Open the dialog from the card menu.";
+    (body as any).scrollIntoView = vi.fn();
+    document.body.append(intro, section, body);
+
+    searchsocketScrollToText(makeNavigation({ _ssk: "Deleting", _sskt: "Open the dialog from the card menu" }));
+
+    expect(body.scrollIntoView).toHaveBeenCalled();
+    expect(intro.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("skips a nav match when the heading is not on the page", () => {
+    const nav = document.createElement("nav");
+    const link = tocLink("Configuration options");
+    nav.appendChild(link);
+    const para = document.createElement("p");
+    para.textContent = "Configuration options live in one file.";
+    (para as any).scrollIntoView = vi.fn();
+    document.body.append(nav, para);
+
+    searchsocketScrollToText(makeNavigation({ _sskt: "Configuration options" }));
+
+    expect(para.scrollIntoView).toHaveBeenCalled();
+    expect(link.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a nav match when it is the only one", () => {
+    const nav = document.createElement("nav");
+    const link = tocLink("Only in navigation");
+    nav.appendChild(link);
+    document.body.append(nav);
+
+    searchsocketScrollToText(makeNavigation({ _sskt: "Only in navigation" }));
+
+    expect(link.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("does not treat a heading inside nav as the section anchor", () => {
+    const nav = document.createElement("nav");
+    const navHeading = makeHeading("h2", "Setup");
+    nav.appendChild(navHeading);
+    const heading = makeHeading("h2", "Setup");
+    document.body.append(nav, heading);
+
+    searchsocketScrollToText(makeNavigation({ _ssk: "Setup" }));
+
+    expect(heading.scrollIntoView).toHaveBeenCalled();
+    expect(navHeading.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("stays fast when a phrase repeats across thousands of text nodes in navigation", () => {
+    const nav = document.createElement("nav");
+    nav.innerHTML = "<span>common phrase </span>".repeat(60_000);
+    const para = document.createElement("p");
+    para.textContent = "The common phrase in the body.";
+    para.scrollIntoView = vi.fn();
+    document.body.append(nav, para);
+
+    const started = performance.now();
+    searchsocketScrollToText(makeNavigation({ _sskt: "common phrase" }));
+    const elapsed = performance.now() - started;
+
+    expect(para.scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(2000);
+  });
+});
+

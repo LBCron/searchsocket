@@ -1,6 +1,6 @@
 {
   "name": "searchsocket",
-  "version": "0.11.0",
+  "version": "1.0.0",
   "description": "Semantic site search and MCP retrieval for SvelteKit static sites",
   "license": "MIT",
   "author": "Greg Priday <greg@siteorigin.com>",
@@ -37,24 +37,44 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./sveltekit": {
-      "types": "./dist/sveltekit.d.ts",
-      "import": "./dist/sveltekit.js",
-      "require": "./dist/sveltekit.cjs"
+      "import": {
+        "types": "./dist/sveltekit.d.ts",
+        "default": "./dist/sveltekit.js"
+      },
+      "require": {
+        "types": "./dist/sveltekit.d.cts",
+        "default": "./dist/sveltekit.cjs"
+      }
     },
     "./client": {
-      "types": "./dist/client.d.ts",
-      "import": "./dist/client.js",
-      "require": "./dist/client.cjs"
+      "import": {
+        "types": "./dist/client.d.ts",
+        "default": "./dist/client.js"
+      },
+      "require": {
+        "types": "./dist/client.d.cts",
+        "default": "./dist/client.cjs"
+      }
     },
     "./scroll": {
-      "types": "./dist/scroll.d.ts",
-      "import": "./dist/scroll.js",
-      "require": "./dist/scroll.cjs"
+      "import": {
+        "types": "./dist/scroll.d.ts",
+        "default": "./dist/scroll.js"
+      },
+      "require": {
+        "types": "./dist/scroll.d.cts",
+        "default": "./dist/scroll.cjs"
+      }
     },
     "./svelte": {
       "types": "./src/svelte/index.svelte.ts",
@@ -87,32 +107,32 @@
   },
   "packageManager": "pnpm@10.29.2",
   "dependencies": {
-    "@clack/prompts": "^1.2.0",
-    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@clack/prompts": "^1.8.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@upstash/vector": "^1.2.3",
     "cheerio": "^1.2.0",
     "chokidar": "^5.0.0",
     "commander": "^14.0.3",
-    "dotenv": "^17.3.1",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "fast-glob": "^3.3.3",
     "gray-matter": "^4.0.3",
-    "jiti": "^2.6.1",
-    "magicast": "^0.5.2",
-    "p-limit": "^7.3.0",
-    "turndown": "^7.2.2",
+    "jiti": "^2.7.0",
+    "magicast": "^0.5.5",
+    "p-limit": "^7.3.2",
+    "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2",
-    "zod": "^4.3.6"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/express": "^5.0.6",
-    "@types/node": "^25.2.2",
+    "@types/node": "^25.9.7",
     "@types/turndown": "^5.0.6",
     "jsdom": "^28.1.0",
-    "svelte": "^5.55.1",
+    "svelte": "^5.57.0",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.11"
   }
 }

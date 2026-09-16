@@ -55,12 +55,10 @@ export interface SearchSocketConfig {
     respectRobotsNoindex?: boolean;
   };
   transform?: {
-    output?: "markdown";
     preserveCodeBlocks?: boolean;
     preserveTables?: boolean;
   };
   chunking?: {
-    strategy?: "hybrid";
     maxChars?: number;
     overlapChars?: number;
     minChars?: number;
@@ -211,12 +209,10 @@ export interface ResolvedSearchSocketConfig {
     respectRobotsNoindex: boolean;
   };
   transform: {
-    output: "markdown";
     preserveCodeBlocks: boolean;
     preserveTables: boolean;
   };
   chunking: {
-    strategy: "hybrid";
     maxChars: number;
     overlapChars: number;
     minChars: number;
@@ -573,6 +569,19 @@ export interface RunWarning {
   detail: string;
 }
 
+/**
+ * Why an indexing run refused to mutate the index.
+ *
+ * - `max-deletion-ratio`: the planned deletions exceeded
+ *   `indexing.maxDeletionRatio`; resolve with `acceptLargeDeletion`.
+ * - `robots-unavailable`: robots.txt was configured to be respected but could
+ *   not be read, so no write could be proven safe.
+ */
+export interface IndexWriteRefusal {
+  reason: "max-deletion-ratio" | "robots-unavailable";
+  detail: string;
+}
+
 export interface IndexStats {
   pagesProcessed: number;
   pagesChanged: number;
@@ -590,6 +599,13 @@ export interface IndexStats {
    * intentionally left in place.
    */
   deletionEligible: boolean;
+  /**
+   * Non-null when a safety check refused the whole index mutation: nothing was
+   * written or deleted (or, on a dry run, nothing would be). The run still
+   * resolves normally, so callers that gate a deploy on indexing must check
+   * this — the index is frozen at its last accepted state until it is resolved.
+   */
+  writesRefused: IndexWriteRefusal | null;
   /** Every reason the run's view of the source may be partial. */
   warnings: RunWarning[];
   /**
