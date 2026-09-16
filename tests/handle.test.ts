@@ -741,7 +741,7 @@ describe("GET /api/search/health", () => {
     await expect(response.json()).resolves.toEqual({ ok: true });
   });
 
-  it("returns unhealthy status with details", async () => {
+  it("returns 503 with details when the engine reports unhealthy", async () => {
     const config = makeConfig();
     vi.spyOn(SearchEngine, "create").mockResolvedValue({
       health: vi.fn().mockResolvedValue({ ok: false, details: "store unreachable" })
@@ -755,7 +755,10 @@ describe("GET /api/search/health", () => {
     });
 
     const response = await handle({ event, resolve });
-    expect(response.status).toBe(200);
+    // Previously 200: an uptime check watching status codes read an
+    // unreachable store as a healthy site.
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(response.json()).resolves.toEqual({ ok: false, details: "store unreachable" });
   });
 

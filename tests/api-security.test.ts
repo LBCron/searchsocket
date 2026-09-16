@@ -395,3 +395,88 @@ describe("page retrieval does not disclose repository paths", () => {
     expect(body.frontmatter.title).toBe("Auth");
   });
 });
+
+/**
+ * `SearchEngine.search` applies `rankingOverrides` whenever `debug` is true, so
+ * an anonymous POST could retune the site's ranking for its own request. The
+ * engine keeps the capability for the CLI, MCP and the local playground, which
+ * call it directly; the public HTTP surface refuses the fields outright.
+ */
+describe("debug ranking overrides are not a public capability", () => {
+  it("refuses an anonymous POST that enables ranking overrides", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({
+        pathname: "/api/search",
+        method: "POST",
+        body: {
+          q: "test",
+          debug: true,
+          rankingOverrides: { ranking: { weights: { titleMatch: 100 } } }
+        }
+      }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_REQUEST" } });
+  });
+
+  // The field is refused for being present, not for being enabled, so there is
+  // no shape of body that gets it as far as the engine.
+  it.each([
+    ["debug alone", { q: "test", debug: true }],
+    ["debug disabled but present", { q: "test", debug: false }],
+    ["overrides without debug", { q: "test", rankingOverrides: { ranking: { enableDepthBoost: false } } }],
+    ["a non-boolean debug", { q: "test", debug: "true" }],
+    ["a null override", { q: "test", rankingOverrides: null }]
+  ])("refuses a POST carrying %s", async (_label, body) => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({ pathname: "/api/search", method: "POST", body }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("refuses the same fields on GET, which never read them", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({
+        pathname: "/api/search",
+        method: "GET",
+        searchParams: { q: "test", debug: "true" }
+      }),
+      resolve
+    });
+
+    expect(response.status).toBe(403);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("leaves an ordinary POST untouched", async () => {
+    const search = stubEngine();
+    const handle = searchsocketHandle({ config: makeConfig() });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+
+    const response = await handle({
+      event: makeEvent({ pathname: "/api/search", method: "POST", body: { q: "test", topK: 5 } }),
+      resolve
+    });
+
+    expect(response.status).toBe(200);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ q: "test", topK: 5 }));
+  });
+});

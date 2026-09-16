@@ -644,3 +644,180 @@ describe("InMemoryRateLimiter", () => {
     expect(limiter.check("a")).toBe(false);
   });
 });
+
+describe("GET query parameters are validated as whole values", () => {
+  async function get(search: string, engineSearch?: ReturnType<typeof vi.fn>) {
+    const config = makeConfig();
+    mockEngine(engineSearch ? { search: engineSearch } : {});
+
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const event = makeRealEvent({ pathname: `${config.api.path}${search}`, method: "GET" });
+
+    return handle({ event, resolve });
+  }
+
+  // `Number.parseInt` scanned a prefix and accepted whatever it could read, so
+  // each of these used to be answered as a number the caller never asked for.
+  it.each([
+    ["topK=10abc", "trailing text"],
+    ["topK=1.5", "a fraction"],
+    ["topK=1e3", "exponent notation"],
+    ["topK=0x10", "a radix prefix"],
+    ["topK=-1", "a negative"],
+    ["topK=0", "zero"],
+    ["topK=101", "above the engine's ceiling"],
+    ["topK=", "an empty value"],
+    ["topK=Infinity", "a non-finite value"],
+    ["topK=NaN", "NaN"]
+  ])("rejects ?%s (%s) with 400", async (param) => {
+    const response = await get(`?q=test&${param}`);
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_REQUEST" } });
+  });
+
+  it.each([
+    ["maxSubResults=3x", "trailing text"],
+    ["maxSubResults=2.5", "a fraction"],
+    ["maxSubResults=-2", "a negative"],
+    ["maxSubResults=21", "above the ceiling"]
+  ])("rejects ?%s (%s) with 400", async (param) => {
+    const response = await get(`?q=test&${param}`);
+    expect(response.status).toBe(400);
+  });
+
+  it("still accepts plain integers inside the bounds", async () => {
+    const search = vi.fn().mockResolvedValue({
+      q: "test",
+      scope: "main",
+      results: [],
+      meta: { timingsMs: { search: 0, total: 0 } }
+    });
+
+    const response = await get("?q=test&topK=100&maxSubResults=20", search);
+    expect(response.status).toBe(200);
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({ topK: 100, maxSubResults: 20 })
+    );
+  });
+});
+
+describe("duplicate singleton query parameters are refused", () => {
+  async function get(search: string) {
+    const config = makeConfig();
+    mockEngine();
+
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const event = makeRealEvent({ pathname: `${config.api.path}${search}`, method: "GET" });
+
+    return handle({ event, resolve });
+  }
+
+  // `URLSearchParams.get` returns the first value and drops the rest, so the
+  // second `topK` here used to be silently ignored rather than decided on.
+  it.each(["q=a&q=b", "q=a&topK=1&topK=99", "q=a&scope=x&scope=y", "q=a&groupBy=page&groupBy=chunk"])(
+    "rejects ?%s with 400",
+    async (search) => {
+      const response = await get(`?${search}`);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "INVALID_REQUEST" } });
+    }
+  );
+
+  it("rejects an identical repeat, not only a conflicting one", async () => {
+    const response = await get("?q=a&topK=5&topK=5");
+    expect(response.status).toBe(400);
+  });
+
+  it("keeps tags repeatable", async () => {
+    const search = vi.fn().mockResolvedValue({
+      q: "a",
+      scope: "main",
+      results: [],
+      meta: { timingsMs: { search: 0, total: 0 } }
+    });
+    const config = makeConfig();
+    mockEngine({ search });
+
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const event = makeRealEvent({
+      pathname: `${config.api.path}?q=a&tags=foo&tags=bar`,
+      method: "GET"
+    });
+
+    const response = await handle({ event, resolve });
+    expect(response.status).toBe(200);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ tags: ["foo", "bar"] }));
+  });
+
+  it("rejects a repeated ?scope= on the page route", async () => {
+    const config = makeConfig();
+    mockEngine();
+
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const event = makeRealEvent({
+      pathname: `${config.api.path}/pages/docs/install?scope=a&scope=b`,
+      method: "GET"
+    });
+
+    const response = await handle({ event, resolve });
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("a 429 says when to come back", () => {
+  it("carries Retry-After, no-store and a CORS expose header on the REST route", async () => {
+    mockEngine();
+
+    const config = makeConfig((c) => {
+      c.api.rateLimit = { windowMs: 60_000, max: 1 };
+      c.api.cors.allowOrigins = ["https://site.example"];
+    });
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const search = () =>
+      makeRealEvent({
+        pathname: `${config.api.path}?q=test`,
+        method: "GET",
+        headers: { origin: "https://site.example" }
+      });
+
+    expect((await handle({ event: search(), resolve })).status).toBe(200);
+
+    const limited = await handle({ event: search(), resolve });
+    expect(limited.status).toBe(429);
+    // The limiter already knows its reset time; a cross-origin caller needs the
+    // expose header to be allowed to read it.
+    expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(limited.headers.get("cache-control")).toBe("no-store");
+    expect(limited.headers.get("access-control-expose-headers")).toBe("retry-after");
+  });
+
+  it("carries the same hint on the MCP route", async () => {
+    mockEngine();
+
+    const config = makeConfig((c) => {
+      c.api.rateLimit = { windowMs: 60_000, max: 1 };
+      c.mcp.handle.access = "public";
+    });
+    const handle = searchsocketHandle({ config });
+    const resolve = vi.fn().mockResolvedValue(new Response("ok"));
+    const mcpEvent = () =>
+      makeRealEvent({
+        pathname: "/api/mcp",
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 })
+      });
+
+    expect((await handle({ event: mcpEvent(), resolve })).status).toBe(200);
+
+    const limited = await handle({ event: mcpEvent(), resolve });
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(limited.headers.get("cache-control")).toBe("no-store");
+  });
+});

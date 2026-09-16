@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import nodePath from "node:path";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { z } from "zod";
 import { createDefaultConfig } from "../config/defaults";
 import { loadConfig, mergeConfig } from "../config/load";
 import { Logger } from "../core/logger";
@@ -90,6 +91,21 @@ export class InMemoryRateLimiter {
   /** Test/introspection hook: how many client windows are currently held. */
   get size(): number {
     return this.buckets.size;
+  }
+
+  /**
+   * Whole seconds until this key's window resets, for `Retry-After`.
+   *
+   * The limiter already knows when it will forgive a caller; a 429 that does
+   * not say so leaves a well-behaved client guessing. Read-only — it must not
+   * disturb the window `check` just consumed.
+   */
+  retryAfterSeconds(key: string): number | undefined {
+    const bucket = this.buckets.get(key);
+    if (!bucket) return undefined;
+
+    const remaining = bucket.resetAt - Date.now();
+    return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
   }
 
   private sweep(now: number): void {
@@ -339,19 +355,28 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
     // `serveMarkdownVariants` on, every `.md` GET already costs an engine
     // lookup, and leaving the one anonymous surface that does retrieval work
     // uncounted is worse than occasionally 429-ing a shared path.
-    if (rateLimiter && !rateLimiter.check(clientKey(event))) {
+    const limitedKey = rateLimiter ? clientKey(event) : undefined;
+    if (rateLimiter && limitedKey !== undefined && !rateLimiter.check(limitedKey)) {
+      const retryAfter = rateLimiter.retryAfterSeconds(limitedKey);
+      const retryHeader: Record<string, string> =
+        retryAfter === undefined ? {} : { "retry-after": String(retryAfter) };
+
       if (isMcpRoute) {
-        return mcpErrorResponse(429, -32000, "Rate limit exceeded");
+        return mcpErrorResponse(429, -32000, "Rate limit exceeded", retryHeader);
       }
+
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        ...retryHeader
+      };
 
       return withCors(
         new Response(
           JSON.stringify(toErrorPayload(new SearchSocketError("RATE_LIMITED", "Rate limit exceeded", 429))),
           {
             status: 429,
-            headers: {
-              "content-type": "application/json"
-            }
+            headers
           }
         ),
         event.request,
@@ -410,7 +435,7 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
         return withCors(
           new Response(JSON.stringify(toErrorPayload(new SearchSocketError("INVALID_REQUEST", "Not found", 404))), {
             status: 404,
-            headers: { "content-type": "application/json" }
+            headers: { "content-type": "application/json", "cache-control": "no-store" }
           }),
           event.request,
           config
@@ -426,7 +451,7 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
         new Response(JSON.stringify(toErrorPayload(new SearchSocketError("INVALID_REQUEST", "Method not allowed", 405))), {
           status: 405,
           // RFC 9110 requires Allow on a 405.
-          headers: { "content-type": "application/json", allow: "GET, POST, OPTIONS" }
+          headers: { "content-type": "application/json", "cache-control": "no-store", allow: "GET, POST, OPTIONS" }
         }),
         event.request,
         config
@@ -438,8 +463,11 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
       return withCors(
         new Response(JSON.stringify(payload), {
           status,
+          // Error responses are as uncacheable as the success paths: a shared
+          // cache holding a 403 or a 429 would hand it to the next caller.
           headers: {
-            "content-type": "application/json"
+            "content-type": "application/json",
+            "cache-control": "no-store"
           }
         }),
         event.request,
@@ -505,14 +533,19 @@ function searchUnavailableResponse(): Response {
   });
 }
 
-function mcpErrorResponse(status: number, code: number, message: string): Response {
+function mcpErrorResponse(
+  status: number,
+  code: number,
+  message: string,
+  extraHeaders: Record<string, string> = {}
+): Response {
   return new Response(
     JSON.stringify({
       jsonrpc: "2.0",
       error: { code, message },
       id: null
     }),
-    { status, headers: { "content-type": "application/json" } }
+    { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...extraHeaders } }
   );
 }
 
@@ -616,12 +649,111 @@ async function readBoundedJsonBody(request: any, bodyLimit: number): Promise<unk
   return parsed;
 }
 
+/**
+ * Fields that retune ranking for a single request.
+ *
+ * `SearchEngine.search` honours `rankingOverrides` whenever `debug` is true, so
+ * an anonymous POST used to be able to reweight the site's ranking for its own
+ * request simply by naming them in the body. They stay on the engine's own API
+ * — the CLI and the local playground call it directly — but the public HTTP
+ * surface refuses them, present at all, on GET and POST alike.
+ * Refusing the *field* rather than the enabled value is what makes the rule
+ * unbypassable: `debug: false` with overrides attached is not a special case to
+ * reason about, it is simply not accepted here.
+ */
+const PRIVILEGED_SEARCH_FIELDS = ["debug", "rankingOverrides"] as const;
+
+function assertNoPrivilegedFields(has: (field: string) => boolean): void {
+  for (const field of PRIVILEGED_SEARCH_FIELDS) {
+    if (has(field)) {
+      throw new SearchSocketError(
+        "INVALID_REQUEST",
+        `"${field}" is not accepted on this endpoint.`,
+        403
+      );
+    }
+  }
+}
+
+/**
+ * Query parameters that carry exactly one value.
+ *
+ * `URLSearchParams.get` returns the first occurrence and silently drops the
+ * rest, so `?topK=1&topK=99` was answered as `topK=1` with no policy behind it.
+ * A repeat is now refused outright — equal or not — because the alternative is
+ * a contract that depends on parser order. `tags` is deliberately absent: it is
+ * the one parameter meant to repeat.
+ */
+const SINGLETON_SEARCH_PARAMS = ["q", "topK", "scope", "pathPrefix", "groupBy", "maxSubResults"] as const;
+
+function assertSingletonParams(params: URLSearchParams, names: readonly string[]): void {
+  for (const name of names) {
+    if (params.getAll(name).length > 1) {
+      throw new SearchSocketError(
+        "INVALID_REQUEST",
+        `Query parameter "${name}" may only be supplied once`,
+        400
+      );
+    }
+  }
+}
+
+/**
+ * Bounds for the numeric query parameters.
+ *
+ * These mirror `requestSchema` in `src/search/engine.ts`, which re-validates
+ * every request: the engine remains the contract, and this exists only so a
+ * bad parameter is refused before any engine or backend work is done. Keep the
+ * two in step.
+ */
+const NUMBER_PARAM_MAX = {
+  topK: 100,
+  maxSubResults: 20
+} as const;
+
+const NUMBER_PARAM_SCHEMAS = {
+  topK: z.number().int().positive().max(NUMBER_PARAM_MAX.topK),
+  maxSubResults: z.number().int().positive().max(NUMBER_PARAM_MAX.maxSubResults)
+} as const;
+
+/** A whole decimal integer and nothing else — no trailing text, no exponent, no radix prefix. */
+const INTEGER_PARAM_PATTERN = /^[+-]?\d+$/;
+
+/**
+ * Parse a numeric query parameter as a whole value.
+ *
+ * `Number.parseInt` scans a prefix and stops at the first character it cannot
+ * use, so `topK=10abc` was accepted as 10, `topK=1.5` as 1 and `topK=1e3` as 1
+ * — every one of them a value the caller never asked for. (`0x10` parsed to 0
+ * and was refused, but by the positivity check rather than on its merits.)
+ * Anything that is not exactly an integer is now a 400.
+ */
+function parseNumberParam(name: keyof typeof NUMBER_PARAM_SCHEMAS, raw: string): number {
+  const trimmed = raw.trim();
+  const value = INTEGER_PARAM_PATTERN.test(trimmed) ? Number(trimmed) : Number.NaN;
+  const parsed = NUMBER_PARAM_SCHEMAS[name].safeParse(value);
+
+  if (!parsed.success) {
+    throw new SearchSocketError(
+      "INVALID_REQUEST",
+      `${name} must be an integer between 1 and ${NUMBER_PARAM_MAX[name]}`,
+      400
+    );
+  }
+
+  return parsed.data;
+}
+
 async function handleGetSearch(
   event: any,
   config: ResolvedSearchSocketConfig,
   getEngine: () => Promise<SearchEngine>
 ): Promise<Response> {
-  const params = event.url.searchParams;
+  const params: URLSearchParams = event.url.searchParams;
+
+  assertSingletonParams(params, SINGLETON_SEARCH_PARAMS);
+  assertNoPrivilegedFields((field) => params.has(field));
+
   const q = params.get("q");
 
   if (!q || q.trim() === "") {
@@ -632,11 +764,7 @@ async function handleGetSearch(
 
   const topK = params.get("topK");
   if (topK !== null) {
-    const parsed = Number.parseInt(topK, 10);
-    if (Number.isNaN(parsed) || parsed < 1) {
-      throw new SearchSocketError("INVALID_REQUEST", "topK must be a positive integer", 400);
-    }
-    searchRequest.topK = parsed;
+    searchRequest.topK = parseNumberParam("topK", topK);
   }
 
   const scope = resolveRequestedScope(params.get("scope"), config);
@@ -655,11 +783,7 @@ async function handleGetSearch(
 
   const maxSubResults = params.get("maxSubResults");
   if (maxSubResults !== null) {
-    const parsed = Number.parseInt(maxSubResults, 10);
-    if (Number.isNaN(parsed) || parsed < 1 || parsed > 20) {
-      throw new SearchSocketError("INVALID_REQUEST", "maxSubResults must be a positive integer between 1 and 20", 400);
-    }
-    searchRequest.maxSubResults = parsed;
+    searchRequest.maxSubResults = parseNumberParam("maxSubResults", maxSubResults);
   }
 
   const tags = params.getAll("tags");
@@ -684,11 +808,18 @@ async function handleGetHealth(
   getEngine: () => Promise<SearchEngine>
 ): Promise<Response> {
   const engine = await getEngine();
+
+  // An unhealthy engine used to be reported as HTTP 200 with `ok: false`, so
+  // every uptime check that watches status codes — which is most of them —
+  // read an unreachable or unconfigured store as a healthy site. The body is
+  // unchanged (and still the redacted one); only the status now tells the
+  // truth. 503 matches the status `getEngine` already throws when the engine
+  // cannot be created at all.
   const result = await engine.health();
 
   return withCors(
     new Response(JSON.stringify(result), {
-      status: 200,
+      status: result.ok ? 200 : 503,
       headers: { "content-type": "application/json", "cache-control": "no-store" }
     }),
     event.request,
@@ -710,7 +841,11 @@ async function handleGetPage(
     throw new SearchSocketError("INVALID_REQUEST", "Malformed page path", 400);
   }
 
-  const scope = resolveRequestedScope(event.url.searchParams?.get("scope"), config);
+  // Same singleton policy as the search route: one `?scope=` or none.
+  const pageParams: URLSearchParams | undefined = event.url.searchParams;
+  if (pageParams) assertSingletonParams(pageParams, ["scope"]);
+
+  const scope = resolveRequestedScope(pageParams?.get("scope"), config);
   const engine = await getEngine();
   const result = await engine.getPage(pagePath, scope);
 
@@ -757,6 +892,12 @@ async function handlePostSearch(
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new SearchSocketError("INVALID_REQUEST", "Request body must be a JSON object", 400);
   }
+
+  // `in`, not `Object.hasOwn`: zod reads inherited properties too, so an own-
+  // property check would miss a body whose fields sit on a prototype. JSON can
+  // never produce that shape — `{"__proto__": …}` parses to an ordinary own key
+  // — but the guard should not depend on the adapter that handed us the body.
+  assertNoPrivilegedFields((field) => field in body);
 
   const engine = await getEngine();
   const searchRequest = body as SearchRequest;
@@ -988,6 +1129,10 @@ function buildCorsHeaders(request: Request, config: ResolvedSearchSocketConfig):
     "access-control-allow-origin": wildcard ? "*" : origin,
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "content-type",
+    // A CORS-filtered response hides every header but the safelisted ones, so
+    // a cross-origin client could see the 429 but not the hint telling it when
+    // to come back.
+    "access-control-expose-headers": "retry-after",
     // Required when the origin is reflected: without it a shared cache can
     // serve one origin's allow-origin header to a different origin.
     ...(wildcard ? {} : { vary: "Origin" })
