@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| 0.10.x | Yes |
-| 0.8.x – 0.9.x | No — upgrade to 0.10 |
+| 0.11.x | Yes |
+| 0.8.x – 0.10.x | No — upgrade to 0.11 |
 | ≤ 0.7.x | No — upgrade, see [docs/migration-0.8.md](docs/migration-0.8.md) |
 
 ## Reporting a vulnerability

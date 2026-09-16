@@ -67,7 +67,7 @@ git config (`git config --get-regexp '^gitflow\.'`).
 
 `.github/workflows/ci.yml` runs typecheck → build → test → check:package on Node 22 and 24 for pushes to
 `main`/`develop`/`release/*`/`hotfix/*` and PRs into `main` or `develop`. Keep the matrix in sync
-with `engines.node` in package.json (currently `>=22.0.0` — Node 20 reached end of life in March 2026).
+with `engines.node` in package.json (currently `>=22.12.0` — Node 20 reached end of life in March 2026).
 
 `.github/workflows/searchsocket-prune.yml` no-ops unless `UPSTASH_VECTOR_REST_URL` and
 `UPSTASH_VECTOR_REST_TOKEN` repo secrets are set. Note it invokes the CLI as `node dist/cli.js`,

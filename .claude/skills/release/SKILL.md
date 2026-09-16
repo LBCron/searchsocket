@@ -24,6 +24,11 @@ Publishing is fully automated: pushing a `v*` tag to GitHub triggers
 **There is no NPM token anywhere** — nothing to configure, but also nothing to
 fall back on if the workflow itself breaks.
 
+The workflow picks the npm dist-tag from the tag itself: a version containing a
+hyphen (`1.0.0-rc.1`) publishes to **`next`**, everything else to **`latest`**.
+So a prerelease tag is safe to push — it cannot take `latest` away from the
+stable release — and installing one is `npm install searchsocket@next`.
+
 Your job is everything that happens before that tag exists, and verifying what
 happens after.
 
@@ -159,7 +164,7 @@ git commit -m "chore: prepare for v0.8.0 release"
 git push -u origin release/0.8.0
 ```
 
-Pushing the branch lets CI run the Node 20/22/24 matrix against the exact commit
+Pushing the branch lets CI run the Node 22/24 matrix against the exact commit
 that is about to become the tag. Wait for it:
 
 ```bash
@@ -185,6 +190,12 @@ The tag push starts the publish workflow. Watch it:
 gh run watch --exit-status
 ```
 
+After publishing it smoke-tests the release from the registry: it installs the
+exact version and checks that the dist-tag it chose (`latest`, or `next` for a
+prerelease) really resolves to it. Both steps retry, because registry metadata
+converges a little behind the publish — a transient failure early in the run is
+not yet a failed release.
+
 ## Step 9 — Merge back to develop
 
 Do this even if the publish is still running — `develop` must carry the version
@@ -201,8 +212,8 @@ git branch -d release/0.8.0
 ## Step 10 — Verify and announce
 
 ```bash
-npm view searchsocket version          # must equal the released version
-npm view searchsocket dist-tags
+npm view searchsocket dist-tags        # `latest` — or `next` for a prerelease —
+                                       # must equal the released version
 ```
 
 Then publish the GitHub release using the CHANGELOG section as the body:
@@ -240,8 +251,8 @@ The tag already exists on `main` and cannot be reused for a different artifact.
 - `release/*` — from `develop`, merges to **both** `main` and `develop`.
 - `hotfix/*` — from `main`, merges to **both** `main` and `develop`.
 - Branch prefixes are stored in git config: `git config --get-regexp '^gitflow\.'`
-- CI (`ci.yml`) runs typecheck → build → test on Node 20/22/24; publish uses
-  Node 24. Keep the matrix in step with `engines.node` (`>=20.19.0`).
+- CI (`ci.yml`) runs typecheck → build → test → check:package on Node 22 and 24;
+  publish uses Node 24. Keep the matrix in step with `engines.node` (`>=22.12.0`).
 - This repo *is* the `searchsocket` package, so its own bin is never linked into
   `node_modules/.bin`. Invoke the CLI as `node dist/cli.js`, never
   `pnpm searchsocket` — the latter only appears to work on a machine with a
