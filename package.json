@@ -1,6 +1,6 @@
 {
   "name": "searchsocket",
-  "version": "0.11.0",
+  "version": "1.0.0",
   "description": "Semantic site search and MCP retrieval for SvelteKit static sites",
   "license": "MIT",
   "author": "Greg Priday <greg@siteorigin.com>",

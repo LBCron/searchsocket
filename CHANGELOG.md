@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-09-16
 
-The 1.0 candidate. A final review ran every surface against the one production
+The first stable release. A final review ran every surface against the one production
 deployment, a SvelteKit site on Vercel, and against its live index. It found that a
 single prerendered redirect page had quietly switched off pruning for four weeks,
 leaving over a thousand stale sections searchable. Most of this release closes that
@@ -807,7 +807,7 @@ Initial public release.
 - **Request validation** with Zod schemas
 - **Rate limiting** and CORS configuration for the search API
 
-[Unreleased]: https://github.com/gregpriday/searchsocket/compare/v0.11.0...HEAD
+[1.0.0]: https://github.com/gregpriday/searchsocket/compare/v0.11.0...v1.0.0
 [0.11.0]: https://github.com/gregpriday/searchsocket/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/gregpriday/searchsocket/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/gregpriday/searchsocket/compare/v0.8.0...v0.9.0
