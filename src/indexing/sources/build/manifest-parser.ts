@@ -4,6 +4,7 @@ import { SearchSocketError } from "../../../errors";
 import { Logger } from "../../../core/logger";
 import { matchUrlPatterns } from "../../../utils/pattern";
 import { normalizeUrlPath } from "../../../utils/path";
+import type { SourceFailure } from "../result";
 
 export interface ManifestRoute {
   id: string;
@@ -79,52 +80,170 @@ export async function parseManifest(cwd: string, outputDir: string): Promise<Man
   return routes;
 }
 
+/** Options for {@link expandRoutes} beyond the build-level exclude list. */
+export interface ExpandRoutesOptions {
+  /**
+   * Further patterns, in practice the top-level `exclude`, that are applied
+   * later by the pipeline rather than here. They matter to one decision only:
+   * a dynamic route they provably cover does not need `paramValues`, because
+   * every page it can produce would be excluded anyway. Reporting it as an
+   * expansion failure disabled pruning for good over pages nobody wanted.
+   * Concrete URLs are NOT filtered by these; the pipeline does that, and
+   * records each one as an observed exclusion.
+   */
+  coverageExclude?: string[];
+  /**
+   * Receives every concrete URL that `exclude` removed, so the caller can
+   * report them as observed exclusions rather than as silent absences.
+   */
+  excludedUrls?: Set<string>;
+}
+
+/**
+ * Expand manifest routes into concrete URLs.
+ *
+ * A dynamic route this cannot enumerate — no `paramValues`, or a value that does
+ * not fit the route's parameters — is pushed onto `failures` as well as logged.
+ * Those pages exist on the site but are missing from the inventory, and an
+ * inventory treated as complete would delete their records as removed. Callers
+ * that drive deletion must pass `failures` into the source result; a route that
+ * is genuinely not meant to be indexed belongs in `exclude` instead.
+ *
+ * A dynamic route is only excused from needing `paramValues` when a pattern provably covers
+ * every URL it can produce (see {@link routeProvablyExcluded}). Matching the
+ * route's literal id as if it were a URL let `/docs/*` "exclude"
+ * `/docs/[...slug]`, whose `/docs/a/b` pages the pattern does not match.
+ */
 export function expandRoutes(
   routes: ManifestRoute[],
   paramValues: Record<string, string[]>,
   exclude: string[],
-  logger: Logger
+  logger: Logger,
+  failures: SourceFailure[] = [],
+  options: ExpandRoutesOptions = {}
 ): ExpandedRoute[] {
   const expanded: ExpandedRoute[] = [];
+  const coverageExclude = options.coverageExclude ?? [];
 
   for (const route of routes) {
     const url = routeIdToUrl(route.id);
 
-    if (isExcluded(url, exclude)) continue;
-
     if (!route.isDynamic) {
+      if (isExcluded(url, exclude)) {
+        options.excludedUrls?.add(normalizeUrlPath(url));
+        continue;
+      }
       expanded.push({ url, routeFile: route.routeFile });
       continue;
     }
 
+    // Every URL the route can produce is excluded, here or by a pattern the
+    // pipeline applies later, so nothing can be missing from the inventory and
+    // lacking paramValues is not a failure. Supplied values are still expanded:
+    // at the source they are reported through `excludedUrls`, downstream they
+    // reach the pipeline, and either way an already-indexed page is recorded as
+    // an observed exclusion instead of silently staying in the index.
+    const excludedDownstream =
+      routeProvablyExcluded(url, exclude) || routeProvablyExcluded(url, coverageExclude);
+
     // Look up param values by route ID first, then by URL (handles layout group mismatch)
     const values = paramValues[route.id] ?? paramValues[url];
     if (!values || values.length === 0) {
+      if (excludedDownstream) {
+        logger.debug(`Skipping dynamic route ${route.id}: every URL it can produce is excluded.`);
+        continue;
+      }
       logger.warn(
         `Skipping dynamic route ${route.id}: no paramValues provided. ` +
-          `Add paramValues["${route.id}"] or paramValues["${url}"] to your build config.`
+          `Add paramValues["${route.id}"] or paramValues["${url}"] to your build config, ` +
+          "or exclude the route. Stale records will not be deleted until it is resolved."
       );
+      failures.push({
+        target: route.id,
+        reason: "dynamic route has no paramValues, so its pages were not enumerated"
+      });
       continue;
     }
 
     for (const value of values) {
       const expandedUrl = expandDynamicUrl(url, value);
       if (expandedUrl === null) {
+        if (excludedDownstream) continue;
         logger.warn(
           `Skipping value "${value}" for dynamic route ${route.id}: values are consumed ` +
             "one path segment per parameter, so a two-parameter route needs a value like " +
             '"guides/quickstart".'
         );
+        failures.push({
+          target: route.id,
+          reason: `paramValues entry "${value}" does not fit the route's parameters`
+        });
         continue;
       }
 
-      if (!isExcluded(expandedUrl, exclude)) {
+      if (isExcluded(expandedUrl, exclude)) {
+        options.excludedUrls?.add(expandedUrl);
+      } else {
         expanded.push({ url: expandedUrl, routeFile: route.routeFile });
       }
     }
   }
 
   return expanded;
+}
+
+/**
+ * Whether one of `patterns` matches EVERY URL a dynamic route can produce.
+ *
+ * Mirrors `matchUrlPattern` semantics, and answers `true` only when that is
+ * provable from the route's shape — an unprovable case must fall through to
+ * "needs paramValues", never to "excluded", or real pages would silently drop
+ * out of the inventory.
+ *
+ * - `/**` covers every route.
+ * - `/p/**` covers a route whose leading segments are exactly the literal
+ *   segments of `/p`: parameters after them can add or drop segments, but every
+ *   result is `/p` or lies below it. A parameter inside those leading segments
+ *   (`/[[lang]]/p/...`) could change them, so it does not count.
+ * - `/p/*` covers a route of exactly one more segment than `/p`, with the same
+ *   literal leading segments, whose last segment always renders as one
+ *   non-empty segment: no rest parameter (it may span or vanish), and either
+ *   some literal text or a required parameter (an optional one may vanish).
+ * - An exact pattern never covers a dynamic route.
+ */
+export function routeProvablyExcluded(routeUrl: string, patterns: string[]): boolean {
+  // Segments are split exactly as `matchUrlPattern` compares them: empty
+  // segments are kept, so `/docs//**` (prefix `/docs/`) is not mistaken for
+  // `/docs/**`. Dropping them proved coverage the matcher never applied.
+  const stripTrailing = (p: string): string => (p !== "/" && p.endsWith("/") ? p.slice(0, -1) : p);
+  const segments = stripTrailing(routeUrl).split("/");
+  const isLiteral = (segment: string): boolean => !segment.includes("[");
+  const leadingLiteralsMatch = (prefixSegments: string[]): boolean =>
+    prefixSegments.every((segment, i) => segments[i] !== undefined && isLiteral(segments[i]!) && segments[i] === segment);
+
+  for (const pattern of patterns) {
+    const norm = stripTrailing(pattern);
+
+    if (norm.endsWith("/**")) {
+      if (norm === "/**") return true;
+      const prefixSegments = norm.slice(0, -3).split("/");
+      if (segments.length >= prefixSegments.length && leadingLiteralsMatch(prefixSegments)) return true;
+      continue;
+    }
+
+    if (norm.endsWith("/*")) {
+      const prefixSegments = norm.slice(0, -2).split("/");
+      if (segments.length !== prefixSegments.length + 1 || !leadingLiteralsMatch(prefixSegments)) continue;
+      const plan = planSegment(segments[segments.length - 1]!);
+      const hasRest = plan.params.some((param) => param.kind === "rest" || param.kind === "optional-rest");
+      const alwaysPresent =
+        plan.literals.some((literal) => literal.length > 0) ||
+        plan.params.some((param) => param.kind === "required");
+      if (!hasRest && alwaysPresent) return true;
+    }
+  }
+
+  return false;
 }
 
 type ParamKind = "required" | "optional" | "rest" | "optional-rest";

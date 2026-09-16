@@ -20,12 +20,15 @@ import type {
   SiteTreeNode,
   VectorHit
 } from "../types";
-import type { RetrievalConstraints, UpstashSearchStore } from "../vector/upstash";
+import type { RetrievalConstraints } from "../vector/upstash";
+import type { SearchStoreReader } from "../vector/store";
 import { matchesPathPrefix, matchesTags, planRetrievalConstraints } from "../vector/upstash";
 import { Logger } from "../core/logger";
 import type { RankedHit, RankedPage } from "./ranking";
 import { diceScore, compositeScore, dominantRelationshipType } from "./related-pages";
 import { toSnippet, queryAwareExcerpt } from "../utils/text";
+import { MAX_PATH_LENGTH, MAX_QUERY_LENGTH } from "./limits";
+import { chunkDisplayText, pageSummaryChunkKey, stripEmbeddingPrefix } from "../indexing/chunker";
 import { buildMetaFilterString, UnsafeFilterValueError } from "../utils/structured-meta";
 import pLimit from "p-limit";
 
@@ -88,10 +91,14 @@ const rankingOverridesSchema = z
   .optional();
 
 const requestSchema = z.object({
-  q: z.string().trim().min(1),
+  q: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_QUERY_LENGTH, `Query must be at most ${MAX_QUERY_LENGTH} characters`),
   topK: z.number().int().positive().max(100).optional(),
   scope: z.string().optional(),
-  pathPrefix: z.string().optional(),
+  pathPrefix: z.string().max(MAX_PATH_LENGTH).optional(),
   tags: z.array(z.string()).optional(),
   filters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
   groupBy: z.enum(["page", "chunk"]).optional(),
@@ -101,6 +108,18 @@ const requestSchema = z.object({
 });
 
 const MAX_SITE_STRUCTURE_PAGES = 2000;
+
+/**
+ * A result's `chunkText`: the indexed section text without the embedding
+ * prefix, which describes the record to the embedder and is not part of the
+ * section. The prefix is only removed when the index is configured to write
+ * one — otherwise a body that opens with the page title would lose it. Unlike
+ * the snippet, a page summary keeps its full text here.
+ */
+function storedBodyText(hit: VectorHit, config: ResolvedSearchSocketConfig): string {
+  if (!config.chunking.prependTitle) return hit.metadata.chunkText;
+  return stripEmbeddingPrefix(hit.metadata.chunkText, hit.metadata.title, hit.metadata.sectionTitle);
+}
 
 function makeNode(url: string, depth: number): SiteTreeNode {
   return { url, title: "", depth, routeFile: "", isIndexed: false, childCount: 0, children: [] };
@@ -196,7 +215,7 @@ export interface SearchEngineOptions {
   cwd?: string;
   configPath?: string;
   config?: ResolvedSearchSocketConfig;
-  store?: UpstashSearchStore;
+  store?: SearchStoreReader;
   /**
    * Sink for retrieval warnings. Defaults to a stderr-only logger: a truncated
    * retrieval is rare but must never pass unremarked, and stderr is the one
@@ -209,13 +228,13 @@ export interface SearchEngineOptions {
 export class SearchEngine {
   private readonly cwd: string;
   private readonly config: ResolvedSearchSocketConfig;
-  private readonly store: UpstashSearchStore | null;
+  private readonly store: SearchStoreReader | null;
   private readonly logger: Logger;
 
   private constructor(options: {
     cwd: string;
     config: ResolvedSearchSocketConfig;
-    store: UpstashSearchStore | null;
+    store: SearchStoreReader | null;
     logger?: Logger;
   }) {
     this.cwd = options.cwd;
@@ -224,7 +243,7 @@ export class SearchEngine {
     this.logger = options.logger ?? new Logger({ stderrOnly: true });
   }
 
-  private requireStore(): UpstashSearchStore {
+  private requireStore(): SearchStoreReader {
     if (!this.store) {
       throw new SearchSocketError(
         "SEARCH_NOT_CONFIGURED",
@@ -243,7 +262,7 @@ export class SearchEngine {
     const cwd = path.resolve(options.cwd ?? process.cwd());
     const config = options.config ?? (await loadConfig({ cwd, configPath: options.configPath }));
 
-    let store: UpstashSearchStore | null;
+    let store: SearchStoreReader | null;
     if (options.store !== undefined) {
       store = options.store;
     } else {
@@ -537,7 +556,7 @@ export class SearchEngine {
 
       // Build snippet from best chunk, or fall back to page description
       const snippet = bestChunk
-        ? (query ? queryAwareExcerpt(bestChunk.metadata.chunkText, query) : toSnippet(bestChunk.metadata.chunkText))
+        ? this.excerptFor(bestChunk, query)
         : (page.description || page.title);
 
       const result: SearchResult = {
@@ -545,14 +564,14 @@ export class SearchEngine {
         title: page.title,
         sectionTitle: bestChunk?.metadata.sectionTitle || undefined,
         snippet,
-        chunkText: bestChunk?.metadata.chunkText || undefined,
+        chunkText: bestChunk ? storedBodyText(bestChunk, this.config) || undefined : undefined,
         score: Number(page.finalScore.toFixed(6)),
         routeFile: page.routeFile,
         chunks: chunks.length > 0
           ? chunks.slice(0, maxSubResults).map((c) => ({
               sectionTitle: c.metadata.sectionTitle || undefined,
-              snippet: query ? queryAwareExcerpt(c.metadata.chunkText, query) : toSnippet(c.metadata.chunkText),
-              chunkText: c.metadata.chunkText || undefined,
+              snippet: this.excerptFor(c, query),
+              chunkText: storedBodyText(c, this.config) || undefined,
               headingPath: c.metadata.headingPath,
               score: Number(c.score.toFixed(6))
             }))
@@ -577,12 +596,23 @@ export class SearchEngine {
     });
   }
 
+  /** A snippet from a stored chunk's readable text, never its embedding prefix. */
+  private excerptFor(hit: VectorHit, query?: string): string {
+    const text = chunkDisplayText(hit.metadata, {
+      prependTitle: this.config.chunking.prependTitle,
+      // Recognised by record identity, never by shape: a headingless body chunk
+      // may begin with the page title too.
+      isPageSummary: hit.id === pageSummaryChunkKey(hit.metadata.url)
+    });
+    return query ? queryAwareExcerpt(text, query) : toSnippet(text);
+  }
+
   private ensureSnippet(hit: RankedHit, query?: string): string {
     const chunkText = hit.hit.metadata.chunkText;
-    if (query && chunkText) return queryAwareExcerpt(chunkText, query);
+    if (query && chunkText) return this.excerptFor(hit.hit, query);
     const snippet = hit.hit.metadata.snippet;
     if (snippet && snippet.length >= 30) return snippet;
-    if (chunkText) return toSnippet(chunkText);
+    if (chunkText) return this.excerptFor(hit.hit);
     return snippet || "";
   }
 
@@ -611,7 +641,7 @@ export class SearchEngine {
           title: hit.metadata.title,
           sectionTitle: hit.metadata.sectionTitle || undefined,
           snippet: this.ensureSnippet({ hit, finalScore }, query),
-          chunkText: hit.metadata.chunkText || undefined,
+          chunkText: storedBodyText(hit, this.config) || undefined,
           score: Number(finalScore.toFixed(6)),
           routeFile: hit.metadata.routeFile
         };
@@ -820,6 +850,14 @@ export class SearchEngine {
   }
 
   private resolveInputPath(pathOrUrl: string): string {
+    if (pathOrUrl.length > MAX_PATH_LENGTH) {
+      throw new SearchSocketError(
+        "INVALID_REQUEST",
+        `Page path must be at most ${MAX_PATH_LENGTH} characters`,
+        400
+      );
+    }
+
     try {
       if (/^https?:\/\//.test(pathOrUrl)) {
         return normalizeUrlPath(new URL(pathOrUrl).pathname);

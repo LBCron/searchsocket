@@ -70,6 +70,10 @@ describe("createSearch response validation", () => {
         // "empty" for a valid response with no rows, "success" otherwise —
         // either way the store settled instead of rejecting.
         expect(["success", "empty"]).toContain(search.status);
+        if (testCase.urls) expect(search.results.map((r) => r.url)).toEqual(testCase.urls);
+        if (testCase.chunkCounts) {
+          expect(search.results.map((r) => r.chunks?.length ?? 0)).toEqual(testCase.chunkCounts);
+        }
       } else {
         expect(search.error?.message).toBe("Invalid search response");
         expect(search.results).toEqual([]);
@@ -82,7 +86,8 @@ describe("createSearch response validation", () => {
     const fetchImpl = fetchReturning({
       q: "test",
       scope: "main",
-      results: [{ url: "javascript:alert(1)", title: "A", snippet: "x", score: 1 }],
+      // A broken envelope: the one thing still refused outright.
+      results: null,
       meta: { timingsMs: { search: 0, total: 0 } }
     });
     const search = tracked(createSearch({ fetchImpl, debounce: 10 }));

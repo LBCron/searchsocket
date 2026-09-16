@@ -830,16 +830,27 @@ interface SearchResultChunk {
 
 ### Response validation
 
-Both the client and the `createSearch` store check the whole response shape before
-handing it on. On a 2xx response, a JSON `null` body, an error page that happened to
-parse, `results: null`, a non-finite `score`, a malformed chunk, an unsafe result URL,
-or a `meta.timingsMs` missing a finite `search` or `total` is rejected as
+Both the client and the `createSearch` store validate a response before handing it on,
+at two levels.
+
+The **envelope** has to be well-formed. On a 2xx response, a JSON `null` body, an error
+page that happened to parse, a missing `q` or `scope`, `results: null`, or a
+`meta.timingsMs` missing a finite `search` or `total` is rejected as
 `Invalid search response` — an error state, not an empty result set. (A non-2xx
 response takes the earlier branch and surfaces the endpoint's own error message, or
-`Search failed`.) Either way the client
-throws and the store sets `search.error` and moves to `status: "error"`, rather than
-showing "no matches" for what is actually a broken endpoint. A rejected response is never
-written to the result cache.
+`Search failed`.) Either way the client throws and the store sets `search.error` and
+moves to `status: "error"`, rather than showing "no matches" for what is actually a
+broken endpoint. A rejected response is never written to the result cache.
+
+Individual **rows** are dropped rather than failing the search. A result with a
+non-finite `score`, a wrong-typed field, or a URL that is not safe to navigate to is
+removed, and so is a malformed chunk within an otherwise valid result; the rest of the
+response is returned. One bad record in the index costs that row, not the search box.
+
+To apply the same rules to a response you fetched yourself, import them from
+`searchsocket/client` (or `searchsocket/svelte`): `parseSearchResponse(payload)` returns
+the cleaned response, or `null` for a broken envelope, and `isSearchResponse(payload)` is
+a strict type guard that is `true` only when no row would be dropped.
 
 A custom endpoint therefore has to return the documented envelope in full:
 

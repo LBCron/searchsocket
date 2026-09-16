@@ -406,10 +406,18 @@ export function searchsocketHandle(options: SearchSocketHandleOptions = {}) {
           headers: { "content-type": "text/markdown; charset=utf-8" }
         });
       } catch (error) {
-        if (error instanceof SearchSocketError && error.status === 404) {
+        if (error instanceof SearchSocketError && (error.status === 404 || error.status === 400)) {
           return resolve(event);
         }
-        throw error;
+        // A `.md` path is also a URL the application may serve itself. An
+        // outage of the search backend must not turn those routes into 500s,
+        // so the variant is best-effort: log the failure and let the app
+        // answer as though the hook were not installed.
+        logger.warn(
+          `Markdown variant for ${JSON.stringify(rawPath)} unavailable, passing the request through: ` +
+            (error instanceof SearchSocketError ? error.code : "INTERNAL_ERROR")
+        );
+        return resolve(event);
       }
     }
 
@@ -1066,6 +1074,17 @@ async function handleMcpRequest(
       }
       // Matches the transport's own wording for an unparseable body.
       return mcpErrorResponse(400, -32700, "Parse error: Invalid JSON");
+    }
+
+    // The transport still accepts a JSON-RPC batch and dispatches every message
+    // in it concurrently, so one small anonymous POST carrying hundreds of
+    // `tools/call search` messages fanned out into hundreds of backend queries
+    // — the rate limit counts requests, not messages. The MCP specification has
+    // dropped batching, so refusing it costs a conforming client nothing. Every
+    // body the transport reads passes through here: a content type this branch
+    // skips is one the transport answers with 415 before reading.
+    if (Array.isArray(parsedBody)) {
+      return mcpErrorResponse(400, -32600, "Invalid Request: JSON-RPC batching is not supported");
     }
   }
 

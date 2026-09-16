@@ -1,58 +1,149 @@
-# Using SearchSocket MCP with Claude Code over HTTP
+# Using SearchSocket MCP with Claude Code
 
-SearchSocket exposes an MCP endpoint through its SvelteKit hook handler. Once your site is deployed to Vercel, Cloudflare, Netlify, or any other platform, the MCP endpoint is available at `/api/mcp` — ready for Claude Code to connect to.
+SearchSocket can serve its index to Claude Code (and any other MCP client) in two ways:
 
-This is the recommended setup: deploy your site, index on build, and point Claude Code at the production endpoint. The index stays current with every deploy, and there's nothing to run locally.
+- **Over HTTP from your deployed site.** `searchsocketHandle()` can mount an MCP route
+  at `/api/mcp`. The index refreshes with every deploy and nothing runs locally.
+- **Over stdio from a local process.** `searchsocket mcp` reads your Upstash
+  credentials and answers on stdin/stdout. Nothing has to be deployed.
 
-## Why HTTP?
+Neither is on without configuration. In particular, the HTTP route is **not**
+available on a deployed site by default:
 
-- **Always up to date** — the index refreshes on every deploy, so Claude Code always searches current content
-- **No local process** — the MCP server runs inside your deployed SvelteKit app
-- **Works everywhere** — connect to production, staging, or preview deployments
-- **Serverless-compatible** — each request is a stateless JSON-RPC POST, no persistent connection needed
-- **No env vars in MCP config** — credentials live in your hosting platform's environment, not in `.mcp.json`
+- `mcp.enable` defaults to `NODE_ENV !== "production"`, so a production build does not
+  mount the route at all until you set `mcp.enable: true`.
+- Once mounted, the route **fails closed**. With `mcp.handle.access: "private"` (the
+  default) and no key configured, every call answers **503**. MCP results include
+  repository paths (`routeFile`), indexed section text, and any scope the caller names,
+  so an unauthenticated route is never served by accident.
+- `mcp.handle.access: "public"` is the deliberate opt-out: anonymous callers get a
+  redacted result set instead of a 503.
 
-## Server-side setup
+Pick one of the complete setups below. All three assume the index has already been
+built (`searchsocket index`, or the Vite plugin with `SEARCHSOCKET_AUTO_INDEX=1` in
+your build environment — the plugin does not index unless it is enabled).
 
-The MCP endpoint is enabled automatically when you use `searchsocketHandle()` in your SvelteKit hooks. No additional configuration is required for local development.
+## Setup A: local stdio
 
-In `src/hooks.server.ts`:
+The simplest setup, and the one `searchsocket init` writes for you. Claude Code starts
+`searchsocket mcp` itself; there is no route to deploy and no key to manage.
 
-```ts
-import { searchsocketHandle } from "searchsocket/sveltekit";
+`.mcp.json` in your project root:
 
-export const handle = searchsocketHandle();
-```
-
-The default MCP endpoint path is `/api/mcp`. You can customize it and add API key authentication via config:
-
-```ts
-export const handle = searchsocketHandle({
-  rawConfig: {
-    // ... other config
-    mcp: {
-      enable: true,                  // defaults to NODE_ENV !== 'production'
-      handle: {
-        path: '/api/mcp',            // default
-        // Required. Without a key the endpoint answers 503 — it exposes
-        // repository paths, indexed page markdown, and arbitrary scopes.
-        apiKeyEnv: 'SEARCHSOCKET_MCP_API_KEY',
-        enableJsonResponse: true     // default, required for serverless
+```json
+{
+  "mcpServers": {
+    "searchsocket": {
+      "command": "npx",
+      "args": ["searchsocket", "mcp"],
+      "env": {
+        "UPSTASH_VECTOR_REST_URL": "${UPSTASH_VECTOR_REST_URL}",
+        "UPSTASH_VECTOR_REST_TOKEN": "${UPSTASH_VECTOR_REST_TOKEN}"
       }
     }
   }
-});
+}
 ```
 
-The transport uses `WebStandardStreamableHTTPServerTransport` from `@modelcontextprotocol/sdk` with `enableJsonResponse: true`, making it fully stateless and serverless-compatible. Each request is an independent JSON-RPC POST — no session or persistent connection is needed.
+Claude Code expands `${VAR}` from the environment it was started in, so export both
+Upstash variables in your shell. The standalone server runs on loopback and returns
+full, unredacted results — it is your own machine talking to your own index.
+`mcp.transport` in config (default `stdio`) is used when `--transport` is not passed.
 
-## Claude Code configuration
+## Setup B: deployed, private (API key)
 
-Claude Code supports remote HTTP MCP servers natively. Add a `.mcp.json` file to your project root.
+Use this when the agents connecting are your own: they get full results, including
+`routeFile`, and anyone without the key is refused.
 
-### Deployed site (recommended)
+**1. Config.** `searchsocket.config.ts`:
 
-Point to your deployed site:
+```ts
+import type { SearchSocketConfig } from "searchsocket";
+
+export default {
+  project: { id: "my-site", baseUrl: "https://your-site.com" },
+  source: { mode: "build" },
+  mcp: {
+    enable: true, // required: the default is off in production
+    handle: {
+      path: "/api/mcp", // default
+      access: "private", // default
+      apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY"
+    }
+  }
+} satisfies SearchSocketConfig;
+```
+
+**2. Hook.** `src/hooks.server.ts`:
+
+```ts
+import { searchsocketHandle } from "searchsocket/sveltekit";
+import config from "../searchsocket.config";
+
+export const handle = searchsocketHandle({ rawConfig: config });
+```
+
+Passing the config object in bundles it with the server, which is what serverless
+hosts need — they cannot read `searchsocket.config.ts` from disk at runtime.
+
+**3. Secret.** Generate a key and add it to your hosting platform's environment, next
+to the Upstash credentials:
+
+```bash
+openssl rand -hex 32
+# then, e.g. on Vercel:
+vercel env add SEARCHSOCKET_MCP_API_KEY production
+```
+
+`apiKeyEnv` reads `process.env`. Under `vite dev`, `.env` files are not loaded into
+`process.env`; to test locally either export the variable in your shell or pass
+`mcp.handle.apiKey: env.SEARCHSOCKET_MCP_API_KEY` using `$env/dynamic/private`.
+
+**4. Client.** `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "searchsocket": {
+      "type": "http",
+      "url": "https://your-site.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SEARCHSOCKET_MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Each developer exports `SEARCHSOCKET_MCP_API_KEY` in the shell that launches Claude
+Code, so the key is never committed. A missing or wrong key is a **401**; a deployment
+with no key configured is a **503**.
+
+## Setup C: deployed, anonymous public
+
+Use this when the indexed pages are public documentation and you want any agent to
+query them without a credential.
+
+`searchsocket.config.ts`:
+
+```ts
+import type { SearchSocketConfig } from "searchsocket";
+
+export default {
+  project: { id: "my-site", baseUrl: "https://your-site.com" },
+  source: { mode: "build" },
+  mcp: {
+    enable: true,
+    handle: {
+      access: "public",
+      // Optional. When set, a caller presenting this key still gets full results.
+      apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY"
+    }
+  }
+} satisfies SearchSocketConfig;
+```
+
+`src/hooks.server.ts` is the same as in Setup B. `.mcp.json` needs no headers:
 
 ```json
 {
@@ -65,54 +156,36 @@ Point to your deployed site:
 }
 ```
 
-The index stays current automatically — every deploy rebuilds the index via the Vite plugin.
+What public access changes:
 
-### Local development
+- A caller sending **no** `Authorization` header is served, but `routeFile`,
+  `chunkText` and `breakdown` are stripped from every tool result and any `scope`
+  argument is ignored — the same fields the browser search API withholds.
+- A caller sending a **valid** bearer key gets full results, so your own editing
+  agents can keep using Setup B's `.mcp.json` against the same route.
+- A caller sending a **wrong** key still gets a 401, not a silent downgrade.
 
-During development, you can point to your local dev server instead:
+## Transport details
+
+The route uses `WebStandardStreamableHTTPServerTransport` from
+`@modelcontextprotocol/sdk` with `mcp.handle.enableJsonResponse: true` (the default).
+Each request is an independent JSON-RPC POST with a JSON response — no session and no
+persistent connection — so it works on serverless hosts. GET and DELETE answer 405.
+
+All route options are listed under [MCP in the config reference](config.md#mcp).
+
+## Approving the server in Claude Code
+
+Claude Code asks before it first uses a server from a project `.mcp.json`. To approve
+it for the project, and to let its tools run without a prompt each time, add to
+`.claude/settings.json`:
 
 ```json
 {
-  "mcpServers": {
-    "searchsocket": {
-      "type": "http",
-      "url": "http://localhost:5173/api/mcp"
-    }
+  "enabledMcpjsonServers": ["searchsocket"],
+  "permissions": {
+    "allow": ["mcp__searchsocket"]
   }
-}
-```
-
-Make sure your dev server is running (`pnpm dev`) before starting Claude Code.
-
-### With API key authentication
-
-Pass the configured key via a Bearer token header:
-
-```json
-{
-  "mcpServers": {
-    "searchsocket": {
-      "type": "http",
-      "url": "https://your-site.com/api/mcp",
-      "headers": {
-        "Authorization": "Bearer ${SEARCHSOCKET_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-The `${SEARCHSOCKET_API_KEY}` syntax references an environment variable so you don't hardcode secrets in `.mcp.json`.
-
-### Auto-approving the MCP server
-
-By default, Claude Code prompts for approval when an MCP tool is invoked. To skip the prompt, add the server to `.claude/settings.json`:
-
-```json
-{
-  "allowedMcpServers": [
-    { "serverName": "searchsocket" }
-  ]
 }
 ```
 
@@ -167,34 +240,34 @@ Parameters:
 - `scope` (string) — index scope
 - `topK` (number, 1-25) — max related pages to return
 
-## Stdio alternative
+## Running the standalone server over HTTP
 
-For local development, you can also use stdio transport which spawns a local SearchSocket process:
+`searchsocket mcp --transport http` serves the same tools from a local process instead
+of your SvelteKit app. Port and path come from `--port` / `--path`, falling back to
+`mcp.http.port` (default `3338`) and `mcp.http.path` (default `/mcp`). It binds to
+loopback unless `mcp.access` is `"public"`, which requires a key from
+`mcp.http.apiKey`, `mcp.http.apiKeyEnv`, or `--api-key`:
 
-```json
-{
-  "mcpServers": {
-    "searchsocket": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["searchsocket", "mcp"],
-      "env": {
-        "UPSTASH_VECTOR_REST_URL": "${UPSTASH_VECTOR_REST_URL}",
-        "UPSTASH_VECTOR_REST_TOKEN": "${UPSTASH_VECTOR_REST_TOKEN}"
-      }
-    }
-  }
-}
+```bash
+pnpm searchsocket mcp --transport http
+pnpm searchsocket mcp --transport http --access public --api-key "$SEARCHSOCKET_MCP_API_KEY"
 ```
 
-This approach requires Upstash credentials in the MCP config and runs a separate process. The HTTP approach avoids both of these requirements.
+Put a reverse proxy terminating HTTPS in front of a public standalone server.
 
 ## Verifying the connection
 
-After configuring `.mcp.json`, restart Claude Code and verify the tools are available:
+After configuring `.mcp.json`, restart Claude Code and check the server is connected:
 
 ```bash
 claude mcp list
 ```
 
-You should see `searchsocket` listed with its three tools. You can then use natural language to search your site content directly from Claude Code — for example, "search my docs for authentication" or "find the source file for the getting started page".
+You should see `searchsocket` with its three tools. If it fails to connect:
+
+- **503** from the HTTP route — no key is configured and access is private. Set
+  `mcp.handle.apiKeyEnv` in config *and* the variable in the deployment environment,
+  or use Setup C.
+- **404** from the HTTP route — `mcp.enable` is not `true` in production, or the hook
+  is not installed.
+- **401** — the `Authorization` header is missing or does not match the deployed key.

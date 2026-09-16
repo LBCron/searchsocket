@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig, mergeConfig, mergeConfigServerless } from "../src/config/load";
 import { createDefaultConfig } from "../src/config/defaults";
+import { SearchSocketError } from "../src/errors";
 
 const tempDirs: string[] = [];
 
@@ -244,16 +245,18 @@ describe("mergeConfig", () => {
   });
 
   describe("removed options", () => {
-    // Zod strips unknown keys silently, so a config still setting one of these
-    // would look accepted while the option did nothing — exactly how
-    // search.pageSearchWeight came to be tuned despite having no effect.
+    // A removed key must get a migration message, not the generic unknown-key
+    // error — search.pageSearchWeight was tuned for releases despite having no effect.
     it.each([
       ["search.dualSearch", { search: { dualSearch: false } }],
       ["search.pageSearchWeight", { search: { pageSearchWeight: 0.5 } }],
       ["embedding.batchSize", { embedding: { batchSize: 50 } }],
       ["embedding.model", { embedding: { model: "some-model" } }],
       ["embedding.dimensions", { embedding: { dimensions: 768 } }],
-      ["embedding.taskType", { embedding: { taskType: "RETRIEVAL_QUERY" } }]
+      ["embedding.taskType", { embedding: { taskType: "RETRIEVAL_QUERY" } }],
+      ["transform.output", { transform: { output: "markdown" } }],
+      ["chunking.strategy", { chunking: { strategy: "hybrid" } }],
+      ["analytics", { analytics: { enabled: true } }]
     ])("rejects %s with a migration message", async (key, raw) => {
       const dir = await makeTempDir();
       await fs.mkdir(path.join(dir, "build"), { recursive: true });
@@ -424,16 +427,151 @@ describe("mergeConfig mcp.handle.access", () => {
   });
 });
 
-describe("mergeConfig legacy analytics field", () => {
-  it("silently strips removed analytics field from user config", async () => {
+describe("mergeConfig strict keys", () => {
+  async function buildDir(): Promise<string> {
     const dir = await makeTempDir();
     await fs.mkdir(path.join(dir, "build"), { recursive: true });
+    return dir;
+  }
 
+  function captureError(fn: () => unknown): SearchSocketError {
+    try {
+      fn();
+    } catch (error) {
+      expect(error).toBeInstanceOf(SearchSocketError);
+      return error as SearchSocketError;
+    }
+    throw new Error("expected a throw");
+  }
+
+  it("rejects an unknown nested key, naming its path and the likely intended key", async () => {
+    const dir = await buildDir();
+    const error = captureError(() => mergeConfig(dir, { ranking: { minScoreRaito: 0.5 } } as never));
+    expect(error.code).toBe("CONFIG_INVALID");
+    expect(error.message).toContain("ranking.minScoreRaito: unknown option");
+    expect(error.message).toContain("Did you mean `ranking.minScoreRatio`?");
+  });
+
+  it("rejects an unknown top-level key without inventing a suggestion", async () => {
+    const dir = await buildDir();
+    const error = captureError(() => mergeConfig(dir, { zzzzzz: true } as never));
+    expect(error.code).toBe("CONFIG_INVALID");
+    expect(error.message).toContain("zzzzzz: unknown option.");
+    expect(error.message).not.toContain("Did you mean");
+  });
+
+  it("rejects unknown keys deep inside mcp.handle", async () => {
+    const dir = await buildDir();
+    const error = captureError(() =>
+      mergeConfig(dir, { mcp: { handle: { apiKeyEnvv: "X" } } } as never)
+    );
+    expect(error.message).toContain("mcp.handle.apiKeyEnvv");
+    expect(error.message).toContain("`mcp.handle.apiKeyEnv`");
+  });
+
+  it("reports a removed key with its migration message rather than as unknown", async () => {
+    const dir = await buildDir();
+    const error = captureError(() => mergeConfig(dir, { analytics: { enabled: true } } as never));
+    expect(error.code).toBe("CONFIG_INVALID");
+    expect(error.message).toMatch(/have been removed/);
+    expect(error.message).not.toContain("unknown option");
+  });
+
+  it("reports schema violations as CONFIG_INVALID", async () => {
+    const dir = await buildDir();
+    const error = captureError(() => mergeConfig(dir, { upstash: { batchSize: -1 } }));
+    expect(error.code).toBe("CONFIG_INVALID");
+    expect(error.message).toContain("upstash.batchSize");
+  });
+
+  it("loads the full shape a real SvelteKit site uses, including runtime-only keys", async () => {
+    // Mirrors daintree-website's searchsocket.config.ts plus the rawConfig its
+    // server hook adds (mcp.handle.apiKey, upstash credentials).
+    const dir = await makeTempDir();
     const merged = mergeConfig(dir, {
-      analytics: { enabled: true }
-    } as any);
+      project: { id: "daintree-website", baseUrl: "https://daintree.org" },
+      source: { mode: "build" },
+      api: { path: "/api/search" },
+      exclude: ["/docs/old-page", "/copytree"],
+      extract: { dropSelectors: [".nav-blur", ".docs-sidebar"] },
+      mcp: {
+        enable: true,
+        handle: { path: "/api/mcp", access: "public", apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY", apiKey: "k" }
+      },
+      ranking: {
+        minScoreRatio: 0.7,
+        pageWeights: { "/": 0.95, "/download": 1.05, "/docs/**": 1.05 },
+        weights: { depth: 0.01, incomingLinks: 0.03 }
+      },
+      upstash: { url: "https://example.upstash.io", token: "t" }
+    });
+    expect(merged.ranking.pageWeights["/docs/**"]).toBe(1.05);
+    expect(merged.mcp.handle.access).toBe("public");
+  });
+});
 
-    expect(merged).not.toHaveProperty("analytics");
+describe("mergeConfig URL patterns", () => {
+  async function buildDir(): Promise<string> {
+    const dir = await makeTempDir();
+    await fs.mkdir(path.join(dir, "build"), { recursive: true });
+    return dir;
+  }
+
+  it.each([
+    ["exclude", { exclude: ["/**/private/**"] }, "exclude[0]"],
+    ["exclude partial segment", { exclude: ["/draft-*.html"] }, "exclude[0]"],
+    ["source.build.exclude", { source: { build: { exclude: ["/api/{a,b}"] } } }, "source.build.exclude[0]"],
+    ["ranking.pageWeights key", { ranking: { pageWeights: { "docs/**": 2 } } }, 'ranking.pageWeights["docs/**"]']
+  ])("rejects an unsupported pattern in %s", async (_label, raw, pathText) => {
+    const dir = await buildDir();
+    let caught: unknown;
+    try {
+      mergeConfig(dir, raw as never);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SearchSocketError);
+    expect((caught as SearchSocketError).code).toBe("CONFIG_INVALID");
+    expect((caught as SearchSocketError).message).toContain(pathText);
+    expect((caught as SearchSocketError).message).toContain("Supported URL patterns");
+  });
+
+  it("accepts every supported form", async () => {
+    const dir = await buildDir();
+    expect(() =>
+      mergeConfig(dir, {
+        exclude: ["/", "/admin", "/admin/", "/api/*", "/drafts/**", "/*", "/**"],
+        ranking: { pageWeights: { "/docs/**": 1.1, "/blog/*": 0.9 } }
+      })
+    ).not.toThrow();
+  });
+});
+
+describe("loadConfig overrides", () => {
+  it("applies an --api-key override before the public-access key check", async () => {
+    const dir = await makeTempDir();
+    await fs.mkdir(path.join(dir, "build"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "searchsocket.config.ts"),
+      'export default { mcp: { access: "public" } };\n',
+      "utf8"
+    );
+
+    await expect(loadConfig({ cwd: dir })).rejects.toThrow(/no API key is configured/);
+
+    const config = await loadConfig({ cwd: dir, overrides: { mcp: { apiKey: "SECRET" } } });
+    expect(config.mcp.access).toBe("public");
+    expect(config.mcp.http.apiKey).toBe("SECRET");
+  });
+
+  it("lets --access override the configured mode", async () => {
+    const dir = await makeTempDir();
+    const config = await loadConfig({
+      cwd: dir,
+      allowMissing: true,
+      overrides: { mcp: { access: "public", apiKey: "k" } }
+    });
+    expect(config.mcp.access).toBe("public");
   });
 });
 

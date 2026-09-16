@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import type { ResolvedSearchSocketConfig, Scope } from "../types";
 import { sanitizeScopeName } from "../utils/text";
 import { assertSafeName } from "../vector/ids";
+import { SearchSocketError } from "../errors";
 
 function resolveRawScopeName(config: ResolvedSearchSocketConfig, cwd?: string): string {
   if (config.scope.mode === "fixed") {
@@ -11,7 +12,7 @@ function resolveRawScopeName(config: ResolvedSearchSocketConfig, cwd?: string): 
   if (config.scope.mode === "env") {
     const value = process.env[config.scope.envVar];
     if (!value) {
-      throw new Error(`Scope mode is env but ${config.scope.envVar} is not set.`);
+      throw new SearchSocketError("CONFIG_MISSING", `Scope mode is env but ${config.scope.envVar} is not set.`);
     }
 
     return value;

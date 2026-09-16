@@ -14,7 +14,7 @@
  * ```svelte
  * <script>
  *   import { afterNavigate } from '$app/navigation';
- *   import { searchsocketScrollToText } from 'searchsocket/sveltekit';
+ *   import { searchsocketScrollToText } from 'searchsocket/scroll';
  *   afterNavigate(searchsocketScrollToText);
  * </script>
  * ```
@@ -139,42 +139,97 @@ interface MatchOffsets {
   end: number;
 }
 
-function findMatch(fullText: string, needle: string): MatchOffsets | null {
-  const regex = buildNeedleRegex(needle);
-  if (regex) {
-    const m = regex.exec(fullText);
-    if (m && typeof m.index === "number") {
-      return { start: m.index, end: m.index + m[0].length };
+/**
+ * The first match of `needle` at or after `from` that `accept` allows, in
+ * document order. The strict pattern is used when it matches anywhere; the
+ * lenient one (zero separators between tokens, for adjacent DOM nodes) only
+ * when it does not. Stops at the first accepted match rather than collecting
+ * every occurrence on the page.
+ */
+function findMatch(
+  fullText: string,
+  needle: string,
+  from = 0,
+  accept: (match: MatchOffsets) => boolean = () => true
+): MatchOffsets | null {
+  for (const source of [buildNeedleRegex(needle), buildLenientRegex(needle)]) {
+    if (!source) continue;
+    const regex = new RegExp(source.source, source.flags.includes("g") ? source.flags : `${source.flags}g`);
+    regex.lastIndex = from;
+    let first: MatchOffsets | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(fullText))) {
+      if (m[0].length === 0) {
+        regex.lastIndex++;
+        continue;
+      }
+      const match = { start: m.index, end: m.index + m[0].length };
+      if (accept(match)) return match;
+      first ??= match;
     }
+    // Nothing acceptable, but the pattern did match: fall back to its first
+    // occurrence rather than trying the lenient pattern.
+    if (first) return first;
   }
+  return null;
+}
 
-  // Lenient pass: allow zero separators between tokens (handles adjacent DOM nodes)
-  const lenient = buildLenientRegex(needle);
-  if (lenient) {
-    const m = lenient.exec(fullText);
-    if (m && typeof m.index === "number") {
-      return { start: m.index, end: m.index + m[0].length };
-    }
+/**
+ * Text inside navigation chrome. A documentation page's "On this page" list
+ * repeats every heading ahead of the content, so the first occurrence of a
+ * section title in document order is usually a table-of-contents link, not the
+ * section.
+ */
+const NAVIGATION_SELECTOR = 'nav, aside, [role="navigation"]';
+
+/**
+ * The text node containing `offset`. Chunks are contiguous and in offset order,
+ * so this is a binary search — it runs once per candidate match, and a linear
+ * scan made a common phrase on a long page quadratic.
+ */
+function chunkIndexAt(map: TextMap, offset: number): number {
+  let low = 0;
+  let high = map.chunks.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const chunk = map.chunks[mid]!;
+    if (offset < chunk.start) high = mid - 1;
+    else if (offset >= chunk.end) low = mid + 1;
+    else return mid;
   }
+  return -1;
+}
 
+function chunkAt(map: TextMap, offset: number): TextChunk | undefined {
+  const index = chunkIndexAt(map, offset);
+  return index === -1 ? undefined : map.chunks[index];
+}
+
+function isInNavigation(map: TextMap, offset: number): boolean {
+  return Boolean(chunkAt(map, offset)?.node.parentElement?.closest(NAVIGATION_SELECTOR));
+}
+
+/**
+ * Text offset of the first heading whose text is the section title, skipping
+ * headings inside navigation chrome.
+ */
+function findHeadingOffset(map: TextMap, sectionTitle: string): number | null {
+  const wanted = normalize(sectionTitle);
+  for (const heading of Array.from(document.body.querySelectorAll("h1, h2, h3, h4, h5, h6"))) {
+    if (heading.closest(NAVIGATION_SELECTOR)) continue;
+    if (normalize(heading.textContent ?? "") !== wanted) continue;
+    const first = map.chunks.find((chunk) => heading.contains(chunk.node));
+    if (first) return first.start;
+  }
   return null;
 }
 
 // ---------- Range resolution ----------
 
 function resolveRange(map: TextMap, offsets: MatchOffsets): Range | null {
-  let startChunk: TextChunk | undefined;
-  let endChunk: TextChunk | undefined;
-
-  for (const chunk of map.chunks) {
-    if (!startChunk && offsets.start >= chunk.start && offsets.start < chunk.end) {
-      startChunk = chunk;
-    }
-    if (offsets.end > chunk.start && offsets.end <= chunk.end) {
-      endChunk = chunk;
-    }
-    if (startChunk && endChunk) break;
-  }
+  const startChunk = chunkAt(map, offsets.start);
+  // The chunk holding the last matched character, i.e. end is in (start, end].
+  const endChunk = offsets.end > 0 ? chunkAt(map, offsets.end - 1) : undefined;
 
   if (!startChunk || !endChunk) return null;
 
@@ -256,9 +311,11 @@ function scrollIntoViewIfPossible(el: Element): void {
 /**
  * A function compatible with SvelteKit's `afterNavigate` callback.
  *
- * Reads `_sskt` (preferred) or `_ssk` from the destination URL, walks text
- * nodes in document order via a TreeWalker text map, and scrolls/highlights
- * the first match. Matches can span multiple DOM text nodes.
+ * Reads `_sskt` (preferred, falling back to `_ssk` when it does not match) from
+ * the destination URL, walks text nodes in document order via a TreeWalker text
+ * map, and scrolls/highlights the match. When a heading on the page matches
+ * `_ssk`, the first match at or after that heading is used; otherwise the first
+ * match outside `nav`/`aside` chrome. Matches can span multiple DOM text nodes.
  *
  * Uses the CSS Custom Highlight API when available for non-destructive
  * highlighting, with a DOM mutation fallback for older browsers.
@@ -269,14 +326,36 @@ export function searchsocketScrollToText(navigation: AfterNavigateParam): void {
   if (typeof document === "undefined") return;
 
   const params = navigation.to?.url.searchParams;
-  const raw = params?.get("_sskt") ?? params?.get("_ssk");
-  if (!raw) return;
-
-  const needle = normalize(raw);
-  if (!needle) return;
+  const sectionTitle = params?.get("_ssk") ?? "";
+  // The text target is tried first and the section heading second. A text
+  // target is only a phrase lifted from a search snippet, and a snippet is not
+  // guaranteed to be verbatim page text — markdown punctuation is flattened,
+  // and older indexes excerpted a synthetic "Title — Section" prefix no page
+  // contains. The heading is still a reliable landmark when the phrase misses.
+  const needles = [params?.get("_sskt"), params?.get("_ssk")]
+    .map((value) => (value ? normalize(value) : ""))
+    .filter((value, index, all) => value !== "" && all.indexOf(value) === index);
+  if (needles.length === 0) return;
 
   const map = buildTextMap(document.body);
-  const offsets = findMatch(map.text, needle);
+  // When the section heading is on the page, the target is the occurrence at or
+  // after it: a phrase that also appears earlier (in a table of contents, an
+  // intro, a previous section) belongs to that section. Without an anchor, the
+  // first match outside navigation chrome wins, then the first match at all.
+  const anchor = sectionTitle.trim() ? findHeadingOffset(map, sectionTitle) : null;
+  let offsets: MatchOffsets | null = null;
+  if (anchor !== null) {
+    for (const needle of needles) {
+      offsets = findMatch(map.text, needle, anchor);
+      if (offsets) break;
+    }
+  }
+  if (!offsets) {
+    for (const needle of needles) {
+      offsets = findMatch(map.text, needle, 0, (match) => !isInNavigation(map, match.start));
+      if (offsets) break;
+    }
+  }
   if (!offsets) return;
 
   const range = resolveRange(map, offsets);

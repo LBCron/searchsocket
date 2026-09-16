@@ -214,27 +214,17 @@ For local testing, you can also build and index manually:
 ```bash
 pnpm build
 pnpm searchsocket index
-pnpm searchsocket search --q "getting started"   # confirm the index answers
+pnpm searchsocket search "getting started"   # confirm the index answers
 ```
 
 With that index in place, `pnpm dev` and Cmd+K give you a working search.
 
 ### 7. Connect Claude Code (optional)
 
-Point Claude Code at your deployed site's MCP endpoint:
-
-```json
-{
-  "mcpServers": {
-    "searchsocket": {
-      "type": "http",
-      "url": "https://your-site.com/api/mcp"
-    }
-  }
-}
-```
-
-See [MCP Server](#mcp-server) for authentication and other options.
+`searchsocket init` already wrote a `.mcp.json` that runs the index locally over stdio,
+so Claude Code works without deploying anything. To connect to your deployed site
+instead, the route has to be enabled in production and given a key (or opened to
+anonymous callers deliberately); see [MCP Server](#mcp-server) for both setups.
 
 ### Querying the API directly
 
@@ -247,7 +237,7 @@ curl -X POST http://localhost:5173/api/search \
   -d '{"q":"getting started","topK":5,"groupBy":"page"}'
 
 # CLI
-pnpm searchsocket search --q "getting started" --top-k 5
+pnpm searchsocket search "getting started" --top-k 5
 ```
 
 ### Response format
@@ -287,7 +277,7 @@ With `groupBy: "page"` (the default):
 }
 ```
 
-Both `meta.timingsMs.search` and `meta.timingsMs.total` are required. The browser client validates the whole response and rejects one that is missing either, so a custom endpoint or a test fixture that omits `search` surfaces as `Invalid search response`.
+Both `meta.timingsMs.search` and `meta.timingsMs.total` are required. They belong to the response envelope, which the browser client rejects outright when it is malformed (bad individual rows are dropped instead), so a custom endpoint or a test fixture that omits `search` surfaces as `Invalid search response`.
 
 The `chunks` array contains matching sections within each page. Use `groupBy: "chunk"` for flat per-chunk results without page aggregation.
 
@@ -316,7 +306,7 @@ Rules the endpoint enforces:
 - `debug` and `rankingOverrides` are refused with **403** on GET and POST alike, for being present at all — the value is irrelevant. They stay on the engine's own API, which the CLI and the local playground call directly.
 - `GET <api.path>/health` returns **200** only when the engine reports healthy, **503** when it does not. The body keeps its existing shape — `{ "ok": true }`, or `{ "ok": false, "details": "..." }` — so only the status changed.
 - Rate-limited responses are 429 and carry `Retry-After`, exposed to browser JavaScript via `Access-Control-Expose-Headers` when CORS is on. Error responses carry `cache-control: no-store`.
-- A record whose score cannot be read as a number is dropped from the results rather than serialized. The browser client refuses a whole response containing one, so the engine removes it first — a corrupt record costs you that row, not the search.
+- A record whose score cannot be read as a number is dropped from the results rather than serialized. The browser client would drop such a row anyway; removing it on the server keeps every consumer of the API, not only the bundled client, from seeing it.
 
 ## Source Modes
 
@@ -436,7 +426,7 @@ const { results } = await client.search({
 });
 ```
 
-The client validates the whole response before returning it. A 2xx whose body carries a non-finite score, a malformed chunk, a `meta.timingsMs` missing `search` or `total`, or a result URL that is not safe to navigate to is rejected as an error rather than handed back to be rendered. It also strips `debug` and `rankingOverrides` before sending, so type-correct code that names them does not come back as a 403.
+The client validates the response before returning it. A broken envelope — no `q` or `scope`, a `results` value that is not an array, or a `meta.timingsMs` missing `search` or `total` — is rejected with `Invalid search response`. Individual rows are handled more narrowly: a malformed result (a non-finite score, say) or one whose URL is not safe to navigate to is dropped, as is a malformed chunk within a result, and the rest of the response is returned. `createSearch` in `searchsocket/svelte` applies the same rules. To validate a response you fetched yourself, `searchsocket/client` exports `parseSearchResponse` (the cleaned response, or `null` for a broken envelope) and `isSearchResponse`, a strict guard that fails if any row would be dropped. The client also strips `debug` and `rankingOverrides` before sending, so type-correct code that names them does not come back as a 403.
 
 ### `buildResultUrl(result)`
 
@@ -752,46 +742,45 @@ SearchSocket includes an MCP server that gives Claude Code, Claude Desktop, and 
 
 The recommended setup is to connect Claude Code to your deployed site's MCP endpoint. This way the index stays up to date automatically as you deploy, and there's no local process to manage.
 
-Add `.mcp.json` to your project root:
+The route is off by default in production and, once on, **fails closed**. Its tools
+return repository paths, a page's indexed markdown, and any scope the caller names, so
+every MCP call answers **503** until you configure a key or opt into anonymous access.
+`mcp.enable` defaults to `NODE_ENV !== "production"`, so a deployed site must set it
+explicitly.
 
-```json
-{
-  "mcpServers": {
-    "searchsocket": {
-      "type": "http",
-      "url": "https://your-site.com/api/mcp"
+**Private (API key).** Your own agents get full results; anyone without the key gets a
+401. Enable the route in `searchsocket.config.ts`:
+
+```ts
+import type { SearchSocketConfig } from "searchsocket";
+
+export default {
+  project: { id: "my-site", baseUrl: "https://your-site.com" },
+  source: { mode: "build" },
+  mcp: {
+    enable: true, // required: the default is off in production
+    handle: {
+      access: "private", // default
+      // Read from the environment rather than committing the key.
+      apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY"
     }
   }
-}
+} satisfies SearchSocketConfig;
 ```
 
-The MCP endpoint requires an API key. Its tools return repository paths, a
-page's indexed markdown, and any scope the caller names, so it fails closed —
-every MCP call answers **503** until a key is configured:
+Pass the whole config to the hook, so it is bundled with the server (serverless hosts
+cannot read `searchsocket.config.ts` from disk at runtime):
 
 ```ts
 // src/hooks.server.ts
-export const handle = searchsocketHandle({
-  rawConfig: {
-    mcp: {
-      enable: true,
-      handle: {
-        // Read from the environment rather than committing the key.
-        apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY"
-      }
-    }
-  }
-});
+import { searchsocketHandle } from "searchsocket/sveltekit";
+import config from "../searchsocket.config";
+
+export const handle = searchsocketHandle({ rawConfig: config });
 ```
 
-`mcp.enable` defaults to `NODE_ENV !== "production"`, so set it explicitly for a
-production deployment.
-
-The one alternative to a key is `mcp.handle.access: "public"`, which serves anonymous
-callers the same redacted result set the browser API already returns — published
-content and nothing more. It is a deliberate opt-in, not a fallback.
-
-Then pass the key in `.mcp.json`:
+Set `SEARCHSOCKET_MCP_API_KEY` in the deployment environment (for example
+`openssl rand -hex 32`), then send the same key from `.mcp.json`:
 
 ```json
 {
@@ -808,6 +797,37 @@ Then pass the key in `.mcp.json`:
 ```
 
 The `${SEARCHSOCKET_MCP_API_KEY}` syntax references an environment variable so you don't hardcode secrets in `.mcp.json`.
+
+**Anonymous public.** For public documentation, set `access: "public"` instead:
+
+```ts
+mcp: {
+  enable: true,
+  handle: {
+    access: "public",
+    // Optional: a caller presenting this key still gets full results.
+    apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY"
+  }
+}
+```
+
+The hook is unchanged, and `.mcp.json` needs no headers:
+
+```json
+{
+  "mcpServers": {
+    "searchsocket": {
+      "type": "http",
+      "url": "https://your-site.com/api/mcp"
+    }
+  }
+}
+```
+
+Anonymous callers get the same redacted result set the browser API returns —
+`routeFile`, `chunkText` and `breakdown` stripped, any `scope` argument ignored. A
+wrong key is still a 401. This is a deliberate opt-in, not a fallback. The full
+walkthrough is in [docs/mcp-claude-code.md](docs/mcp-claude-code.md).
 
 ### Auto-approving in Claude Code
 
@@ -989,11 +1009,12 @@ behaves this way).
 
 ### `searchsocket search`
 
-CLI search for testing.
+CLI search for testing. The query is a positional argument; `--q <query>` is also
+accepted.
 
 ```bash
-pnpm searchsocket search --q "getting started" --top-k 5
-pnpm searchsocket search --q "api" --path-prefix /docs
+pnpm searchsocket search "getting started" --top-k 5
+pnpm searchsocket search "api" --path-prefix /docs
 ```
 
 ### `searchsocket dev`
@@ -1002,7 +1023,7 @@ Watch for file changes and auto-reindex, with optional playground UI.
 
 ```bash
 pnpm searchsocket dev                                # watch + playground at :3337
-pnpm searchsocket dev --mcp --mcp-port 3338          # also start MCP HTTP server
+pnpm searchsocket dev --mcp                          # also start MCP HTTP server
 pnpm searchsocket dev --no-playground                 # watch only
 ```
 
@@ -1099,10 +1120,16 @@ always protected.
 Run the MCP server standalone.
 
 ```bash
-pnpm searchsocket mcp                                   # stdio (default)
-pnpm searchsocket mcp --transport http --port 3338       # HTTP
+pnpm searchsocket mcp                                   # transport from mcp.transport (default stdio)
+pnpm searchsocket mcp --transport http --port 4000       # HTTP on a specific port
 pnpm searchsocket mcp --access public --api-key SECRET   # public with auth
 ```
+
+`--transport`, `--port` and `--path` override `mcp.transport`, `mcp.http.port` and
+`mcp.http.path` only when passed; otherwise the config (or its defaults: stdio, 3338,
+`/mcp`) applies. The same holds for `dev --mcp-port` and `--mcp-path`. `--access` and
+`--api-key` are merged into the config before it is validated, so
+`mcp.access: "public"` with the key supplied only by `--api-key` is accepted.
 
 ### `searchsocket add`
 
@@ -1116,6 +1143,20 @@ pnpm searchsocket add search-trigger
 pnpm searchsocket add search-dialog --dir src/lib/components/ui  # custom dir
 pnpm searchsocket add search-dialog --overwrite                  # replace existing files
 ```
+
+### Exit codes
+
+Every command exits with one of these codes. They are stable: scripts and CI may
+branch on them.
+
+| Code | Meaning | Examples |
+| --- | --- | --- |
+| 0 | Success | |
+| 1 | Operational failure | a failed `doctor` check, an unexpected error during a run |
+| 2 | Invalid usage | unknown command or option, bad flag value (including `--top-k` above 100), missing or invalid `searchsocket.config.ts`, unreadable `searchsocket test` file or a query in it the engine refuses |
+| 3 | Quality gate failed | `searchsocket test` assertions did not pass, with every query retrieved |
+| 4 | Destructive operation refused | `clean`, `prune` or `migrate cleanup-legacy` declined to delete without the required confirmation |
+| 5 | Search backend unavailable or unconfigured | `index`, `search` or `test` with no vector backend configured; `status` reporting the backend unhealthy; `status`, `prune`, `search` or `test` failing against Upstash Vector (including rate limiting) |
 
 ## Real-World Example
 
@@ -1143,6 +1184,11 @@ export default {
       "/download": 1.05,
       "/docs/**": 1.05
     },
+  },
+  mcp: {
+    // Off in production unless enabled; private with a key from the environment.
+    enable: true,
+    handle: { apiKeyEnv: "SEARCHSOCKET_MCP_API_KEY" }
   }
 };
 ```
@@ -1153,21 +1199,16 @@ export default {
 // src/hooks.server.ts
 import { searchsocketHandle } from "searchsocket/sveltekit";
 import { env } from "$env/dynamic/private";
+import config from "../searchsocket.config";
 
+// Start from the full config so the hook serves exactly what was indexed, and
+// only add what has to come from the runtime environment.
 export const handle = searchsocketHandle({
   rawConfig: {
-    project: { id: "canopy-website", baseUrl: "https://canopy.dev" },
-    source: { mode: "build" },
+    ...config,
     upstash: {
       url: env.UPSTASH_VECTOR_REST_URL,
       token: env.UPSTASH_VECTOR_REST_TOKEN
-    },
-    extract: {
-      dropSelectors: [".nav-blur", ".mobile-overlay", ".docs-sidebar"]
-    },
-    ranking: {
-      minScoreRatio: 0.70,
-      pageWeights: { "/": 0.95, "/download": 1.05, "/docs/**": 1.05 },
     }
   }
 });
@@ -1245,16 +1286,25 @@ The Vite plugin handles the rest. Alternatively, use a postbuild script:
 
 ### Connect Claude Code to the deployed site
 
+With `SEARCHSOCKET_MCP_API_KEY` set in Vercel and exported in the shell that starts
+Claude Code:
+
 ```json
 {
   "mcpServers": {
     "searchsocket": {
       "type": "http",
-      "url": "https://canopy.dev/api/mcp"
+      "url": "https://canopy.dev/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SEARCHSOCKET_MCP_API_KEY}"
+      }
     }
   }
 }
 ```
+
+A site serving public documentation can use `mcp.handle.access: "public"` instead and
+drop the header; see [MCP Server](#mcp-server).
 
 Now Claude Code can search the live docs, retrieve page content, and find source files — all backed by the production index that stays current with every deploy.
 
@@ -1314,7 +1364,10 @@ The CLI automatically loads `.env` from the working directory on startup.
 
 ## Configuration Reference
 
-See [docs/config.md](docs/config.md) for the full configuration reference. Here's the full example:
+See [docs/config.md](docs/config.md) for the full configuration reference. The config is
+validated strictly: an unknown or misspelled key, a removed option, or a URL pattern
+outside the [supported syntax](docs/config.md#url-patterns) fails with `CONFIG_INVALID`
+and names the offending key. Here's the full example:
 
 ```ts
 export default {

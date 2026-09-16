@@ -51,6 +51,20 @@ export interface SearchSocketAutoIndexOptions {
    * mid-run still fails the build.
    */
   allowUnconfigured?: boolean;
+  /**
+   * Permit a deletion exceeding `indexing.maxDeletionRatio`, like
+   * `searchsocket index --accept-large-deletion`. Set it for the one build that
+   * is meant to remove a large part of the site, then remove it again.
+   */
+  acceptLargeDeletion?: boolean;
+  /**
+   * Fail the build when a safety check refuses to change the index — the
+   * deletion ratio was exceeded, or robots.txt could not be read. Defaults to
+   * true: a refused run writes nothing, so a build that passed would deploy a
+   * site whose search index silently stopped following it. Set to false to
+   * log the refusal as a warning and let the build continue.
+   */
+  failOnRefusedWrites?: boolean;
 }
 
 function shouldRunAutoIndex(options: SearchSocketAutoIndexOptions): boolean {
@@ -162,8 +176,25 @@ export function searchsocketVitePlugin(options: SearchSocketAutoIndexOptions = {
             force: (options.force ?? false) || /^(1|true|yes)$/i.test(process.env.SEARCHSOCKET_FORCE_REINDEX ?? ""),
             dryRun: options.dryRun ?? false,
             scopeOverride: options.scope,
-            verbose: options.verbose
+            verbose: options.verbose,
+            acceptLargeDeletion: options.acceptLargeDeletion ?? false
           });
+
+          if (stats.writesRefused) {
+            const remedy =
+              stats.writesRefused.reason === "max-deletion-ratio"
+                ? "If the deletion is intended, pass acceptLargeDeletion: true for this build."
+                : "Fix robots.txt availability and rebuild.";
+            const message =
+              `[searchsocket] index left unchanged — ${stats.writesRefused.detail}. ${remedy} ` +
+              "Pass failOnRefusedWrites: false to build anyway.";
+            if (options.failOnRefusedWrites ?? true) {
+              throw new SearchSocketError("INDEX_WRITES_REFUSED", message);
+            }
+            logger.warn(message);
+            executed = true;
+            return;
+          }
 
           logger.info(
             `[searchsocket] indexed pages=${stats.pagesProcessed} chunks=${stats.chunksTotal} changed=${stats.chunksChanged} upserted=${stats.documentsUpserted}`

@@ -66,5 +66,7 @@ describe("resolveScope", () => {
     delete process.env.MISSING_VAR;
 
     expect(() => resolveScope(config)).toThrow("MISSING_VAR");
+    // A required value that is absent, not a malformed one.
+    expect(() => resolveScope(config)).toThrow(expect.objectContaining({ code: "CONFIG_MISSING" }));
   });
 });

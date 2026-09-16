@@ -5,6 +5,221 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The 1.0 candidate. A final review ran every surface against the one production
+deployment, a SvelteKit site on Vercel, and against its live index. It found that a
+single prerendered redirect page had quietly switched off pruning for four weeks,
+leaving over a thousand stale sections searchable. Most of this release closes that
+class of silent failure: an indexing run that refuses to write now fails the build,
+and a run that sees a page is excluded removes it whatever else went wrong. The rest
+tightens the public boundary and settles the API that 1.0 commits to.
+
+**Upgrading from 0.11 needs action in three places.** Config is now validated
+strictly, so an unknown or misspelled key fails to load. URL patterns that the
+matcher could never honour are rejected. A refused indexing run now fails the Vite
+build. Each is marked **Breaking:** below.
+
+### Changed
+
+- **Breaking: config is validated strictly.** An unknown key fails to load with
+  `CONFIG_INVALID`, naming the full path and suggesting the closest valid key
+  (`ranking.minScoreRaito: unknown option. Did you mean ranking.minScoreRatio?`).
+  Previously a typo was silently ignored and the setting it meant to change stayed
+  at its default.
+- **Breaking: `transform.output`, `chunking.strategy` and `analytics` are removed
+  keys.** Each accepted one fixed value and was read by nothing. Delete them.
+- **Breaking: unsupported URL patterns are rejected.** `exclude`,
+  `source.build.exclude` and `ranking.pageWeights` support exact paths and a
+  trailing `/*` or `/**`. Anything else, such as `/**/private/**`,
+  `/draft-*.html` or a doubled slash like `/docs//**`, was compared as a literal and matched nothing. It now fails
+  config load. See "URL patterns" in `docs/config.md`.
+- **Breaking: a refused indexing run fails.** If `indexing.maxDeletionRatio`
+  refuses a deletion plan, or `robots.txt` cannot be read in `crawl` mode, the run
+  writes nothing, as before. It now also reports `stats.writesRefused`
+  (`{ reason, detail }`, otherwise `null`). `searchsocketVitePlugin()` then fails
+  the build with `INDEX_WRITES_REFUSED` instead of logging "indexed" and deploying
+  over a frozen index, and `searchsocket index` exits `4` for a ratio refusal or
+  `1` for unreadable robots. New plugin options: `failOnRefusedWrites` (default
+  `true`) and `acceptLargeDeletion` (default `false`).
+- **Breaking: CLI exit codes follow the documented table.** Usage and config errors
+  exit `2` (were `1`), including `searchsocket test --top-k` above 100 and a
+  `searchsocket.config.ts` that fails to parse or throws while loading, which is now
+  `CONFIG_INVALID` with the underlying message. Failed
+  `searchsocket test` assertions exit `3`, but only when every query was retrieved:
+  a backend failure during `test` exits `5` rather than counting as failed
+  assertions. An unreachable, rate-limited or unconfigured backend exits `5`, which
+  now covers `search` and `test` without credentials (previously `1` and `3`) and
+  `status` when the health check fails (previously `0`). The full table is in the
+  README.
+- **Breaking: `clean --remote` is plan-only until `--apply`.** It previously
+  printed "dry-run only" after it had already deleted the local state directory.
+- **Breaking: the public search endpoint refuses `debug` and `rankingOverrides`**
+  with 403, and validates numeric query parameters as whole values (`topK=10abc`
+  is a 400, not 10). A repeated singleton parameter is a 400. `GET <api>/health`
+  answers 503 when the backend is unhealthy. The browser client strips the two
+  refused fields, so type-correct calls keep working.
+- **Breaking: MCP endpoints reject JSON-RPC batches** with 400 / `-32600`. One
+  anonymous batch could fan out into thousands of concurrent backend queries while
+  counting as a single request. The current MCP specification no longer has
+  batching. The standalone `searchsocket mcp --transport http` server also refuses
+  a POST whose body Express's JSON parser did not accept (415), rather than letting
+  the MCP transport read the raw body itself: a `Content-Type` the parser skipped
+  but the transport accepted, such as `application/json` followed by U+00A0,
+  reached the transport unchecked for batching and outside the body-size limit.
+- **Breaking: queries are capped at 512 characters and page paths at 2,048**
+  (`MAX_QUERY_LENGTH`, `MAX_PATH_LENGTH`). Longer input is a 400 over HTTP and a
+  validation error over MCP. Both measure the query after trimming, so the MCP
+  tools accept exactly the queries HTTP does. Query-aware excerpts consider at most 32 distinct
+  query terms. A 63 KB query previously cost around 12 seconds of CPU.
+- **Pages a run sees as excluded are removed even when the run is not
+  authoritative.** A page matched by `exclude`, blocked by `robots.txt`, marked
+  `noindex` or weight 0, or served as a redirect stub is deleted from the index
+  even if an unrelated page's extraction failure blocks general pruning. Before,
+  one broken page kept every newly excluded page public. These deletions still
+  count towards `maxDeletionRatio`. An unreadable `robots.txt` still blocks
+  everything. This covers pages excluded by `source.build.exclude`, and every
+  stored section of an excluded page, including older generations and pages
+  indexed before chunk manifests. A URL the same run also indexed is never
+  removed, and neither is one whose other source file failed to load or extract.
+- **Prerendered redirect pages are skipped, not failed.** A page whose original
+  HTML has no body text and a `<meta http-equiv="refresh">` is logged at info and
+  treated as excluded; SvelteKit prerenders exactly this for a `redirect()`.
+  Previously each one was an extraction failure that disabled pruning for the whole
+  site. A page emptied by `dropSelectors` is still an extraction failure. A stub
+  that redirects to its own URL, such as `docs.html` pointing to `/docs/`, is
+  skipped without excluding `/docs`.
+- **`--max-pages` counts URLs, not files.** Source files that serve the same URL,
+  such as `docs.html` and `docs/index.html`, are loaded together, so a limited run
+  cannot load a redirect stub without the page it stands in for.
+- **In manifest mode, a dynamic route that cannot expand blocks deletions.** A
+  route with no `paramValues`, or values that do not fit, left an incomplete
+  inventory that could still authorise deleting live pages. The exception is a
+  route whose every URL is covered by the top-level `exclude` or
+  `source.build.exclude` (`/blog/**` covers `/blog/[slug]`). A route id is no longer
+  matched against patterns as if it were a URL, so `/docs/*` does not exclude
+  `/docs/[...slug]`.
+- **Snippets no longer include the embedding prefix.** Result snippets and
+  `chunkText` had started with the `Title — Section` text prepended for embedding,
+  and page-summary snippets repeated the title. Deep links built from those
+  snippets pointed at text that does not exist on the page. This is fixed at read
+  time, so existing indexes benefit without re-indexing. The prefix is removed only
+  when `chunking.prependTitle` is on, and summary text only from actual
+  page-summary records, so a section that genuinely opens with the page title
+  keeps it.
+- **Scroll-to-text lands on the section, not the table of contents.** When a
+  heading on the page matches `_ssk`, the text target is searched from that
+  heading onwards; otherwise the first match outside `nav`, `aside` and
+  `role="navigation"` wins. A documentation page repeats each heading in its "On
+  this page" list ahead of the content, so a result whose target was the heading
+  scrolled to the list. If `_sskt` cannot be found, the section heading is used.
+  Matching stops at the first eligible occurrence and looks up text nodes by binary
+  search, so a phrase repeated thousands of times on a long page no longer makes
+  the lookup quadratic.
+- **Snippets are plain text.** Markdown syntax was stripped by replacing every
+  `#`, `>`, `*`, `_`, `|` and `-` with a space, which left link syntax such as
+  `[Settings](/docs/settings)` in snippets and broke real words (`right-click`,
+  `max_results`). Only syntax is removed now. Code spans keep their contents
+  verbatim (`__init__`, `a || b`), table pipes are removed only on table rows, and
+  backslash escapes from HTML conversion (`max\_results`) are removed. The
+  conversion is linear, so pathological markdown can no longer make snippet
+  building quadratic. Stored snippets change, so the first run after upgrading
+  refreshes chunk metadata once, without re-embedding.
+- **Browser clients drop malformed or unsafe result rows** instead of failing the
+  whole response. An invalid envelope is still an `Invalid search response`. Result
+  URLs are checked: a `javascript:` or `data:` URL is dropped, and
+  `buildResultUrl` returns `""` for one.
+- **`llms.txt` and `llms-full.txt` carry a "Retrieval API" section** naming the
+  search endpoint, and the MCP endpoint when it would answer. No key or variable
+  name is written.
+- **Configured MCP transport, port and path now apply to the CLI.**
+  `searchsocket mcp` and `dev --mcp` passed their own defaults, which always
+  overrode `mcp.transport`, `mcp.http.port` and `mcp.http.path`.
+- **`searchsocket search` takes the query positionally.** `--q` still works.
+- **Breaking: the root export no longer exposes internals.** `isServerless`,
+  `resolveScope`, `mergeConfigServerless` and `runMcpServer` are removed; none was
+  documented. `createUpstashStore()` returns the new `SearchStore` interface rather
+  than the concrete Upstash class, so storage internals such as legacy-record
+  cleanup are no longer part of the public types. `SearchEngineOptions.store`
+  takes a `SearchStoreReader` and `IndexPipelineOptions.store` a
+  `SearchStoreWriter`.
+- **Breaking: `isSearchResponse` is strict.** It returns `true` only when no row
+  would be dropped. Use the new `parseSearchResponse` to get the cleaned response
+  (or `null` for a broken envelope). Both are exported from `searchsocket/client`
+  and `searchsocket/svelte`, alongside `isSafeResultUrl`.
+- **Public types are complete.** Every type used in a public signature can now be
+  imported: `SearchEngineOptions`, `IndexPipelineOptions`, `LoadConfigOptions`,
+  `ConfigOverrides`, `RelatedPage`, `RelationshipType`, `SiteStructureResult`,
+  `SiteTreeNode`, `ScoreBreakdown`, `RankingOverrides`, `OutgoingLink`,
+  `ScopeMode`, `SourceMode`, `PageHit`, `IndexWriteRefusal`,
+  `SearchSocketErrorOptions`, `SearchSocketHandleOptions`,
+  `SearchSocketAutoIndexOptions`, `SearchClient`, `SearchClientOptions`,
+  `LoggerOptions`, and the
+  store types `SearchStore`, `SearchStoreReader`, `SearchStoreWriter`,
+  `StoreRecord`, `StoreMetadataUpdate`, `StoreQueryOptions`, `PageHashEntry`,
+  `ChunkHashEntry`, `ChunkInventoryEntry` and `RetrievalConstraints`. `searchsocket/client` exports a
+  named `SearchClient` interface. The `Logger` class that
+  `SearchEngineOptions.logger` and `IndexPipelineOptions.logger` accept is exported
+  from `searchsocket`, so those options can be used without an internal import.
+- **Dependencies refreshed.** `@modelcontextprotocol/sdk` now requires `^1.30.0`,
+  and the lockfile picks up patched releases of the transitive runtime
+  dependencies. `pnpm audit --prod` reports no known vulnerabilities, down from 76.
+- **Error codes:** `CONFIG_INVALID` (a config that loads but does not validate;
+  `CONFIG_MISSING` now means a file or required value is absent, such as the
+  variable `scope.mode: "env"` reads) and
+  `INDEX_WRITES_REFUSED` are new. The unused `EMBEDDING_MODEL_MISMATCH` and
+  `EMBEDDING_FAILED` are removed.
+
+### Fixed
+
+- Page titles could come from a heading that `dropSelectors`, `dropTags` or
+  `data-search-ignore` removed, because the title was derived before extraction
+  exclusions ran. `data-search-ignore` on the content root itself was ignored. It
+  now excludes the page.
+- Index reads (page hashes, chunk scans, content hashes, page chunk fetches) retry
+  on 429, 5xx and non-JSON error bodies. The store talks to Upstash through its own
+  `Requester` (the SDK's documented transport hook), which keeps the HTTP status
+  the SDK's default client discards, so this works whatever the error body says,
+  for example a 503 answering `{"error":"overloaded"}`. A single transient Upstash
+  error used to fail the deploy.
+- Reading a page without a chunk manifest from a large scope scanned the whole
+  scope with no ceiling. Pages now also record how many sections they have. A page
+  too large to list its sections is read with page-filtered queries, and that
+  result is used only when the section count matches. Otherwise the read falls
+  back to a scan capped at 50 range requests, with an error that says whether
+  reindexing will help. The first run after upgrading refreshes page metadata once,
+  without re-embedding.
+- `instanceof SearchSocketError` failed across entry points. Each published entry
+  (`searchsocket`, `searchsocket/sveltekit`, the CLI, and the CommonJS and ESM
+  builds) bundles its own copy of the class, so an error thrown by one and checked
+  against the class imported from another was not recognised, and a config file
+  that threw a typed error was reported as an invalid config. The class now
+  recognises instances from every copy.
+- `deletePages()` rethrew the raw SDK error rather than the classified storage
+  error.
+- With `serveMarkdownVariants` on, a backend outage turned the app's own `.md`
+  routes into 500s. They now fall through to the app.
+- `searchsocket mcp --transport http` in public mode refused every request whose
+  `Host` was not localhost. `searchsocket mcp --api-key` could not satisfy a config
+  with `mcp.access: "public"`, because the key was applied after validation.
+- `searchsocket dev` could silently miss every edit inside a directory created
+  after it started. With native file events, chokidar 5 on macOS intermittently
+  never subscribes to such a directory. Source trees (`src/routes`, content roots,
+  the config file) are now polled once a second. Build output stays on native
+  events. `--no-poll` restores native events everywhere. "watcher ready" is printed
+  once, not once per missing root.
+- A non-finite score could reach a 200 response that the client then rejected;
+  such hits are dropped on the server.
+- CommonJS consumers received ESM type declarations. The exports map now points
+  `require` at `.d.cts`.
+- Documentation: the MCP guide and the README no longer claim the route is on by
+  default or show a deployed connection without credentials, and the README's hook
+  examples import the full config rather than replacing it with a partial one; the
+  README and search UI guide describe row-level response validation instead of
+  whole-response rejection; `indexing.maxDeletionRatio` and the
+  URL pattern syntax are documented; CLI help names Upstash Vector;
+  `SECURITY.md` lists 1.0.x.
+
 ## [0.11.0] - 2026-09-12
 
 A correctness release from a full audit of the indexing, retrieval, CLI and
@@ -592,6 +807,15 @@ Initial public release.
 - **Request validation** with Zod schemas
 - **Rate limiting** and CORS configuration for the search API
 
+[Unreleased]: https://github.com/gregpriday/searchsocket/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/gregpriday/searchsocket/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/gregpriday/searchsocket/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/gregpriday/searchsocket/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/gregpriday/searchsocket/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/gregpriday/searchsocket/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/gregpriday/searchsocket/compare/v0.6.3...v0.7.0
+[0.6.3]: https://github.com/gregpriday/searchsocket/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/gregpriday/searchsocket/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gregpriday/searchsocket/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gregpriday/searchsocket/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/gregpriday/searchsocket/compare/v0.4.0...v0.5.0

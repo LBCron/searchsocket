@@ -1,9 +1,9 @@
 import type { SearchRequest, SearchResult } from "../types";
-import { errorMessageFrom, isSearchResponse } from "./response-validation";
+import { errorMessageFrom, parseSearchResponse } from "./response-validation";
 export { default as SearchSocket } from "./SearchSocket.svelte";
 // Re-exported so a Svelte consumer that renders results from its own fetch can
-// apply the same safe-link rule the store applies.
-export { isSafeResultUrl } from "./response-validation";
+// apply the same safe-link and response rules the store applies.
+export { isSafeResultUrl, isSearchResponse, parseSearchResponse } from "./response-validation";
 
 export interface CreateSearchOptions {
   endpoint?: string;
@@ -236,7 +236,9 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
             throw new Error(errorMessageFrom(payload, "Search failed"));
           }
 
-          if (!isSearchResponse(payload)) {
+          // Refuses a malformed envelope; drops individual malformed or unsafe rows.
+          const parsed = parseSearchResponse(payload);
+          if (!parsed) {
             throw new Error("Invalid search response");
           }
 
@@ -245,9 +247,9 @@ export function createSearch(options: CreateSearchOptions = {}): SearchStore {
           // clear() or destroy() already produced.
           if (!isCurrent()) return;
           if (cacheEnabled) {
-            resultCache.set(cacheKey, payload.results);
+            resultCache.set(cacheKey, parsed.results);
           }
-          settle(payload.results, currentQuery);
+          settle(parsed.results, currentQuery);
         } catch (err) {
           if (err instanceof DOMException && err.name === "AbortError") return;
           if (!isCurrent()) return;

@@ -37,12 +37,10 @@ export function createDefaultConfig(projectId: string): ResolvedSearchSocketConf
       respectRobotsNoindex: true
     },
     transform: {
-      output: "markdown",
       preserveCodeBlocks: true,
       preserveTables: true
     },
     chunking: {
-      strategy: "hybrid",
       maxChars: 1500,
       overlapChars: 200,
       minChars: 250,

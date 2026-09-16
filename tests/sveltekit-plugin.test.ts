@@ -193,6 +193,68 @@ describe("searchsocketVitePlugin", () => {
     expect(create).toHaveBeenCalledTimes(1);
     expect(run).toHaveBeenCalledTimes(1);
   });
+  it("fails the build by default when the index mutation was refused", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+    const run = vi.fn().mockResolvedValue({
+      pagesProcessed: 1,
+      chunksTotal: 1,
+      chunksChanged: 0,
+      documentsUpserted: 0,
+      writesRefused: { reason: "max-deletion-ratio", detail: "would delete 9 of 10 pages" }
+    });
+    vi.spyOn(IndexPipeline, "create").mockResolvedValue({ run } as unknown as IndexPipeline);
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+
+    const failure = closeBundle(plugin);
+    await expect(failure).rejects.toThrow(/would delete 9 of 10 pages.*acceptLargeDeletion/);
+    await expect(failure).rejects.toMatchObject({ code: "INDEX_WRITES_REFUSED" });
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ acceptLargeDeletion: false }));
+  });
+
+  it("fails the build with the same code when robots.txt is unavailable", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+    const run = vi.fn().mockResolvedValue({
+      pagesProcessed: 1,
+      chunksTotal: 1,
+      chunksChanged: 0,
+      documentsUpserted: 0,
+      writesRefused: { reason: "robots-unavailable", detail: "robots.txt could not be read" }
+    });
+    vi.spyOn(IndexPipeline, "create").mockResolvedValue({ run } as unknown as IndexPipeline);
+
+    const plugin = searchsocketVitePlugin({ cwd: process.cwd(), verbose: false });
+
+    await expect(closeBundle(plugin)).rejects.toMatchObject({
+      name: "SearchSocketError",
+      code: "INDEX_WRITES_REFUSED"
+    });
+  });
+
+  it("only warns about a refused mutation when failOnRefusedWrites is false", async () => {
+    process.env.SEARCHSOCKET_AUTO_INDEX = "true";
+    const run = vi.fn().mockResolvedValue({
+      pagesProcessed: 1,
+      chunksTotal: 1,
+      chunksChanged: 0,
+      documentsUpserted: 0,
+      writesRefused: { reason: "robots-unavailable", detail: "robots.txt could not be read" }
+    });
+    vi.spyOn(IndexPipeline, "create").mockResolvedValue({ run } as unknown as IndexPipeline);
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+
+    const plugin = searchsocketVitePlugin({
+      cwd: process.cwd(),
+      verbose: false,
+      failOnRefusedWrites: false,
+      acceptLargeDeletion: true
+    });
+
+    await expect(closeBundle(plugin)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("index left unchanged"));
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ acceptLargeDeletion: true }));
+  });
+
   it("skips indexing without failing the build when credentials are missing", async () => {
     process.env.SEARCHSOCKET_AUTO_INDEX = "true";
 

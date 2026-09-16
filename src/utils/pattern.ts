@@ -52,3 +52,47 @@ export function matchUrlPatterns(url: string, patterns: string[]): boolean {
   }
   return false;
 }
+
+/**
+ * The syntax `matchUrlPattern` understands, for error messages and docs.
+ * Anything outside it would otherwise be compared literally and silently
+ * never match, so config loading rejects it up front.
+ */
+export const URL_PATTERN_SYNTAX =
+  'Supported URL patterns: an exact path ("/docs"), one segment below a path ("/docs/*"), ' +
+  'or a path and everything below it ("/docs/**"). Patterns must start with "/", and "*" or ' +
+  '"**" may only appear as the whole final segment. Empty segments ("//") are not allowed.';
+
+/**
+ * Explain why a pattern is outside the supported syntax, or return null when
+ * `matchUrlPattern` will interpret it as written.
+ */
+export function describeUnsupportedUrlPattern(pattern: string): string | null {
+  if (!pattern.startsWith("/")) {
+    return `"${pattern}" must start with "/"; patterns match URL paths, not full URLs or relative paths.`;
+  }
+
+  // The matcher compares segments literally, so an empty segment only ever
+  // matches a URL that itself contains "//", which a normalized path never does.
+  if (pattern.includes("//")) {
+    return `"${pattern}" contains an empty path segment ("//"), which never matches a URL path.`;
+  }
+
+  const glob = pattern.match(/[?[\]{}]/);
+  if (glob) {
+    return `"${pattern}" uses "${glob[0]}", which is not supported.`;
+  }
+
+  if (!pattern.includes("*")) return null;
+
+  const norm = pattern !== "/" && pattern.endsWith("/") ? pattern.slice(0, -1) : pattern;
+  const segments = norm.split("/");
+  const last = segments[segments.length - 1];
+  const wildcardElsewhere = segments.slice(0, -1).some((segment) => segment.includes("*"));
+
+  if (wildcardElsewhere || (last !== "*" && last !== "**")) {
+    return `"${pattern}" places a wildcard somewhere other than the whole final segment.`;
+  }
+
+  return null;
+}

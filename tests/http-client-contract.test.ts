@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SearchEngine } from "../src/search/engine";
 import { createDefaultConfig } from "../src/config/defaults";
 import { toPublicResults } from "../src/utils/redact";
-import { isSearchResponse } from "../src/svelte/response-validation";
+import { parseSearchResponse } from "../src/svelte/response-validation";
 import type { PageHit, ResolvedSearchSocketConfig, SearchResponse, VectorHit } from "../src/types";
 import type { UpstashSearchStore } from "../src/vector/upstash";
 
@@ -132,6 +132,17 @@ function overTheWire(response: SearchResponse, redact = true): unknown {
   return JSON.parse(JSON.stringify(publicResponse));
 }
 
+/**
+ * Accepted with every row intact. The validator drops a malformed row rather
+ * than refusing the response, so "accepted" alone would no longer notice the
+ * engine emitting a row the browser throws away.
+ */
+function expectAcceptedWhole(wire: unknown): void {
+  const parsed = parseSearchResponse(wire);
+  expect(parsed).not.toBeNull();
+  expect(parsed!.results).toEqual((wire as SearchResponse).results);
+}
+
 describe("engine responses satisfy the browser validator", () => {
   it("accepts a page-first response with nested section chunks", async () => {
     const store = createStore({
@@ -147,7 +158,7 @@ describe("engine responses satisfy the browser validator", () => {
 
     expect(response.results.length).toBeGreaterThan(0);
     expect(response.results[0]?.chunks?.length).toBeGreaterThan(0);
-    expect(isSearchResponse(overTheWire(response))).toBe(true);
+    expectAcceptedWhole(overTheWire(response));
   });
 
   it("accepts a page-first response whose page has no sections at all", async () => {
@@ -165,7 +176,7 @@ describe("engine responses satisfy the browser validator", () => {
 
     expect(wire.results).toHaveLength(1);
     expect("chunks" in (wire.results[0] as object)).toBe(false);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it("accepts a chunk-grouped response", async () => {
@@ -177,7 +188,7 @@ describe("engine responses satisfy the browser validator", () => {
     const response = await engine.search({ q: "config", groupBy: "chunk" });
 
     expect(response.results.length).toBeGreaterThan(0);
-    expect(isSearchResponse(overTheWire(response))).toBe(true);
+    expectAcceptedWhole(overTheWire(response));
   });
 
   it.each(["page", "chunk"] as const)("accepts an empty %s-grouped response", async (groupBy) => {
@@ -188,7 +199,7 @@ describe("engine responses satisfy the browser validator", () => {
     const response = await engine.search({ q: "nothing matches this", groupBy });
 
     expect(response.results).toEqual([]);
-    expect(isSearchResponse(overTheWire(response))).toBe(true);
+    expectAcceptedWhole(overTheWire(response));
   });
 
   it("accepts an unredacted response carrying routeFile, chunkText and a breakdown", async () => {
@@ -208,7 +219,7 @@ describe("engine responses satisfy the browser validator", () => {
     expect(wire.results[0]?.routeFile).toBeDefined();
     expect(wire.results[0]?.chunkText).toBeDefined();
     expect(wire.results[0]?.breakdown).toBeDefined();
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 });
 
@@ -244,7 +255,7 @@ describe("non-finite backend scores never reach the wire", () => {
     const wire = overTheWire(response) as SearchResponse;
 
     expect(wire.results.map((r) => r.url)).toEqual(["/good", "/also-good"]);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it.each(nonFinite)("drops a chunk hit scored %s in chunk-grouped mode", async (_label, score) => {
@@ -263,7 +274,7 @@ describe("non-finite backend scores never reach the wire", () => {
     const wire = overTheWire(response) as SearchResponse;
 
     expect(wire.results.map((r) => r.url)).toEqual(["/good", "/also-good"]);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it.each(nonFinite)("drops a sub-result chunk scored %s from a valid page", async (_label, score) => {
@@ -282,7 +293,7 @@ describe("non-finite backend scores never reach the wire", () => {
 
     expect(wire.results).toHaveLength(1);
     expect(wire.results[0]?.chunks).toHaveLength(1);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it("returns an empty result set when every page hit is non-finite", async () => {
@@ -303,7 +314,7 @@ describe("non-finite backend scores never reach the wire", () => {
     const wire = overTheWire(response) as SearchResponse;
 
     expect(wire.results).toEqual([]);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it("returns an empty result set when every chunk hit is non-finite", async () => {
@@ -320,14 +331,15 @@ describe("non-finite backend scores never reach the wire", () => {
     const wire = overTheWire(response) as SearchResponse;
 
     expect(wire.results).toEqual([]);
-    expect(isSearchResponse(wire)).toBe(true);
+    expectAcceptedWhole(wire);
   });
 
   it("is not satisfied by a `null` score, so the guard is doing the work", async () => {
     // Guards the guard: if the engine ever stopped dropping these, the wire
-    // shape would be `score: null` and the validator would refuse it. This
+    // shape would be `score: null` and the validator would refuse the row. This
     // asserts that refusal directly, so a vacuously-passing test above cannot
-    // hide behind an over-permissive validator.
+    // hide behind an over-permissive validator. The response survives — only a
+    // broken envelope is refused whole — but the row does not.
     const withNullScore = {
       q: "test",
       scope: "main",
@@ -335,6 +347,6 @@ describe("non-finite backend scores never reach the wire", () => {
       meta: { timingsMs: { search: 1, total: 2 } }
     };
 
-    expect(isSearchResponse(withNullScore)).toBe(false);
+    expect(parseSearchResponse(withNullScore)?.results).toEqual([]);
   });
 });

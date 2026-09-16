@@ -7,9 +7,12 @@ import {
   routeIdToUrl,
   expandRoutes,
   parseManifest,
+  routeProvablyExcluded,
   type ManifestRoute
 } from "../src/indexing/sources/build/manifest-parser";
 import { Logger } from "../src/core/logger";
+import { matchUrlPattern } from "../src/utils/pattern";
+import type { SourceFailure } from "../src/indexing/sources/result";
 
 const tempDirs: string[] = [];
 
@@ -118,6 +121,29 @@ describe("expandRoutes", () => {
     expect(result).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Skipping dynamic route"));
 
+    warnSpy.mockRestore();
+  });
+
+  it("reports unexpandable dynamic routes as inventory failures", () => {
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const routes: ManifestRoute[] = [
+      { id: "/blog/[slug]", isPage: true, isDynamic: true, routeFile: "src/routes/blog/[slug]/+page.svelte" },
+      { id: "/docs/[a]/[b]", isPage: true, isDynamic: true, routeFile: "src/routes/docs/[a]/[b]/+page.svelte" },
+      { id: "/tags/[tag]", isPage: true, isDynamic: true, routeFile: "src/routes/tags/[tag]/+page.svelte" }
+    ];
+    const failures: Array<{ target: string; reason: string }> = [];
+
+    const result = expandRoutes(
+      routes,
+      { "/docs/[a]/[b]": ["only-one-segment", "guides/quickstart"] },
+      ["/tags/**"],
+      logger,
+      failures
+    );
+
+    // A partial inventory must never look complete, or its gaps are deleted.
+    expect(result.map((r) => r.url)).toEqual(["/docs/guides/quickstart"]);
+    expect(failures.map((f) => f.target)).toEqual(["/blog/[slug]", "/docs/[a]/[b]"]);
     warnSpy.mockRestore();
   });
 
@@ -444,5 +470,100 @@ export const manifest = {
     const dir = await makeTempDir();
 
     await expect(parseManifest(dir, ".svelte-kit/output")).rejects.toThrow("manifest not found");
+  });
+});
+
+describe("dynamic routes and exclude coverage", () => {
+  const logger = new Logger({ quiet: true });
+  const blog: ManifestRoute = {
+    id: "/blog/[slug]",
+    isPage: true,
+    isDynamic: true,
+    routeFile: "src/routes/blog/[slug]/+page.svelte"
+  };
+
+  it("does not need paramValues for a route the top-level exclude provably covers", () => {
+    const failures: { target: string; reason: string }[] = [];
+    const result = expandRoutes([blog], {}, [], logger, failures, { coverageExclude: ["/blog/**"] });
+    expect(result).toEqual([]);
+    expect(failures).toEqual([]);
+  });
+
+  it("still expands given values of a top-level-excluded route, for the pipeline to record", () => {
+    const failures: { target: string; reason: string }[] = [];
+    const result = expandRoutes([blog], { "/blog/[slug]": ["a"] }, [], logger, failures, {
+      coverageExclude: ["/blog/*"]
+    });
+    expect(result.map((r) => r.url)).toEqual(["/blog/a"]);
+    expect(failures).toEqual([]);
+  });
+
+  it("still fails a route the exclude only partly covers", () => {
+    const rest: ManifestRoute = { ...blog, id: "/docs/[...slug]", routeFile: "x" };
+    const failures: { target: string; reason: string }[] = [];
+    // `/docs/*` matches /docs/a but not /docs/a/b or /docs, which the route can produce.
+    expandRoutes([rest], {}, ["/docs/*"], logger, failures, { coverageExclude: ["/docs/*"] });
+    expect(failures.map((f) => f.target)).toEqual(["/docs/[...slug]"]);
+  });
+
+  it("reports the concrete URLs the build exclude removed", () => {
+    const excludedUrls = new Set<string>();
+    const routes: ManifestRoute[] = [
+      { id: "/private", isPage: true, isDynamic: false, routeFile: "a" },
+      { id: "/tags/[tag]", isPage: true, isDynamic: true, routeFile: "b" }
+    ];
+    const result = expandRoutes(routes, { "/tags/[tag]": ["x", "y"] }, ["/private", "/tags/y"], logger, [], {
+      excludedUrls
+    });
+    expect(result.map((r) => r.url)).toEqual(["/tags/x"]);
+    expect([...excludedUrls].sort()).toEqual(["/private", "/tags/y"]);
+  });
+
+  it("reports supplied values of a wholly excluded dynamic route as excluded", () => {
+    const excludedUrls = new Set<string>();
+    const failures: SourceFailure[] = [];
+    const routes: ManifestRoute[] = [
+      { id: "/blog/[slug]", isPage: true, isDynamic: true, routeFile: "a" },
+      { id: "/notes/[slug]", isPage: true, isDynamic: true, routeFile: "b" }
+    ];
+    const result = expandRoutes(routes, { "/blog/[slug]": ["secret"] }, ["/blog/**", "/notes/**"], logger, failures, {
+      excludedUrls
+    });
+    expect(result).toEqual([]);
+    expect([...excludedUrls]).toEqual(["/blog/secret"]);
+    // A covered route without paramValues is still not an expansion failure.
+    expect(failures).toEqual([]);
+  });
+
+  it("proves coverage only from the route's shape", () => {
+    expect(routeProvablyExcluded("/blog/[slug]", ["/**"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/[slug]", ["/blog/**"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/[slug]", ["/blog/*"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/post-[id]", ["/blog/*"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/[[page]]", ["/blog/**"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/[slug]/comments", ["/blog/**"])).toBe(true);
+    expect(routeProvablyExcluded("/blog/[slug]", ["/blog/"])).toBe(false);
+    expect(routeProvablyExcluded("/blog/[slug]", ["/blog"])).toBe(false);
+    expect(routeProvablyExcluded("/blog/[[page]]", ["/blog/*"])).toBe(false);
+    expect(routeProvablyExcluded("/blog/[...rest]", ["/blog/*"])).toBe(false);
+    expect(routeProvablyExcluded("/blog/[slug]/comments", ["/blog/*"])).toBe(false);
+    expect(routeProvablyExcluded("/[[lang]]/blog/[slug]", ["/blog/**"])).toBe(false);
+    expect(routeProvablyExcluded("/[lang]/blog", ["/en/**"])).toBe(false);
+    expect(routeProvablyExcluded("/blog/[slug]", ["/docs/**"])).toBe(false);
+    expect(routeProvablyExcluded("/[slug]", ["/*"])).toBe(true);
+  });
+
+  it("keeps empty segments exactly as the exclusion matcher does", () => {
+    // `/docs//**` never excludes `/docs/live`, so it must not prove coverage
+    // of `/docs/[slug]` and excuse its missing paramValues.
+    expect(matchUrlPattern("/docs/live", "/docs//**")).toBe(false);
+    expect(routeProvablyExcluded("/docs/[slug]", ["/docs//**"])).toBe(false);
+    expect(routeProvablyExcluded("/docs/[slug]", ["/docs//*"])).toBe(false);
+    expect(routeProvablyExcluded("/docs/[slug]", ["//docs/*"])).toBe(false);
+
+    const failures: SourceFailure[] = [];
+    const routes: ManifestRoute[] = [{ id: "/docs/[slug]", isPage: true, isDynamic: true, routeFile: "a" }];
+    expandRoutes(routes, {}, ["/docs//**"], logger, failures);
+    expect(failures).toHaveLength(1);
   });
 });

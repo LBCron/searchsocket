@@ -208,7 +208,7 @@ describe("createSearchClient", () => {
     await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
   });
 
-  it("rejects a result row that is missing its required fields", async () => {
+  it("drops a result row that is missing its url", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -221,7 +221,7 @@ describe("createSearchClient", () => {
 
     const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
 
-    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+    await expect(client.search({ q: "test" })).resolves.toMatchObject({ results: [] });
   });
 
   it("accepts a result row that omits only optional fields", async () => {
@@ -242,7 +242,7 @@ describe("createSearchClient", () => {
     });
   });
 
-  it("rejects a result row that is missing snippet", async () => {
+  it("drops a result row that is missing snippet", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -256,10 +256,10 @@ describe("createSearchClient", () => {
     const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
 
     // buildResultUrl() feeds snippet straight into string normalization.
-    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+    await expect(client.search({ q: "test" })).resolves.toMatchObject({ results: [] });
   });
 
-  it("rejects a present optional field of the wrong type", async () => {
+  it("drops a row whose present optional field has the wrong type", async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -272,7 +272,7 @@ describe("createSearchClient", () => {
 
     const client = createSearchClient({ fetchImpl: mockFetch as unknown as typeof fetch });
 
-    await expect(client.search({ q: "test" })).rejects.toThrow("Invalid search response");
+    await expect(client.search({ q: "test" })).resolves.toMatchObject({ results: [] });
   });
 
   it("rejects a response missing its envelope fields", async () => {
@@ -299,7 +299,11 @@ describe("createSearchClient response validation", () => {
       const search = client.search({ q: "test" });
 
       if (testCase.valid) {
-        await expect(search).resolves.toBeDefined();
+        const response = await search;
+        if (testCase.urls) expect(response.results.map((r) => r.url)).toEqual(testCase.urls);
+        if (testCase.chunkCounts) {
+          expect(response.results.map((r) => r.chunks?.length ?? 0)).toEqual(testCase.chunkCounts);
+        }
       } else {
         await expect(search).rejects.toThrow("Invalid search response");
       }

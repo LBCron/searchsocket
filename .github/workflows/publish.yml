@@ -60,7 +60,9 @@ jobs:
         # Guards against publishing from a branch that never went through the
         # release merge.
         run: |
-          git fetch --depth=1 origin main
+          # No --depth: after the full checkout above, a shallow fetch would
+          # truncate history and make the ancestry check fail spuriously.
+          git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::tagged commit is not reachable from main"
             exit 1
@@ -117,4 +119,9 @@ jobs:
           fi
           node -e "import('searchsocket').then(m => { if (!m) process.exit(1); console.log('root import ok'); })"
           node -e "import('searchsocket/client').then(() => console.log('client import ok'))"
+          # The server entry pulls in the MCP SDK, cheerio and the rest of the
+          # runtime dependencies; importing it proves they all resolve from the
+          # tarball. Neither entry needs the optional svelte peer at import time.
+          node -e "import('searchsocket/sveltekit').then(m => { if (typeof m.searchsocketHandle !== 'function') process.exit(1); console.log('sveltekit import ok'); })"
+          node -e "import('searchsocket/scroll').then(m => { if (typeof m.searchsocketScrollToText !== 'function') process.exit(1); console.log('scroll import ok'); })"
           node ./node_modules/searchsocket/dist/cli.js --version

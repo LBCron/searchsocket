@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   UpstashSearchStore,
   classifyStorageError,
+  createUpstashRequester,
+  UpstashHttpError,
   isMissingNamespaceError,
   toStorageError
 } from "../src/vector/upstash";
@@ -128,6 +130,14 @@ describe("classifyStorageError", () => {
 
   it("does not treat caller cancellation as a retryable timeout", () => {
     expect(classifyStorageError(new Error("The operation was aborted"))).not.toBe("TIMEOUT");
+  });
+
+  it("lets a transient status outrank missing-namespace wording", () => {
+    const message = "namespace chunks not found";
+    expect(classifyStorageError(new UpstashHttpError(message, 503))).toBe("SERVICE_UNAVAILABLE");
+    expect(classifyStorageError(new UpstashHttpError(message, 429))).toBe("RATE_LIMITED");
+    expect(classifyStorageError(new UpstashHttpError(message, 404))).toBe("NAMESPACE_MISSING");
+    expect(classifyStorageError(new Error(message))).toBe("NAMESPACE_MISSING");
   });
 
   it("prefers a status code over message matching", () => {
@@ -433,5 +443,201 @@ describe("listPages pagination", () => {
     // The second call must ask for only the 2 still needed, not another 3.
     expect((ns.range.mock.calls[1] as unknown as [{ limit: number }])[0].limit).toBe(2);
     expect(result.pages.map((p) => p.url)).toEqual(["/a", "/b", "/c"]);
+  });
+});
+
+describe("indexing reads survive transient backend failures", () => {
+  // The SDK retries only thrown network errors; an HTTP 429/5xx response
+  // surfaces as an error the SDK never retries, and used to fail the build.
+  const transient = boom("service unavailable", 503);
+
+  it("retries getPageHashes on a transient failure", async () => {
+    const { store, ns } = createStore({ fail: transient, failTimes: 1, maxRetries: 2 });
+    await expect(store.getPageHashes(scope)).resolves.toEqual(new Map());
+    expect(ns.range).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries scanChunkIds on a rate limit", async () => {
+    const { store, ns } = createStore({ fail: boom("Too Many Requests"), failTimes: 2, maxRetries: 2 });
+    await expect(store.scanChunkIds(scope)).resolves.toEqual(new Map());
+    expect(ns.range).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries fetchContentHashesForKeys on a transient failure", async () => {
+    const { store, ns } = createStore({ fail: transient, failTimes: 1, maxRetries: 1 });
+    await expect(store.fetchContentHashesForKeys(["k"], scope)).resolves.toEqual(new Map());
+    expect(ns.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("still gives up after maxRetries with a typed error", async () => {
+    const { store, ns } = createStore({ fail: transient, maxRetries: 2 });
+    await expect(store.getPageHashes(scope)).rejects.toMatchObject({ code: "VECTOR_BACKEND_UNAVAILABLE" });
+    expect(ns.range).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a read that fails for a non-transient reason", async () => {
+    const { store, ns } = createStore({ fail: boom("Unauthorized"), maxRetries: 2 });
+    await expect(store.scanChunkIds(scope)).rejects.toThrow(SearchSocketError);
+    expect(ns.range).toHaveBeenCalledTimes(1);
+  });
+
+  it("still treats a missing namespace as empty after the retry wrapper", async () => {
+    const { store } = createStore({ fail: boom("namespace chunks not found"), maxRetries: 2 });
+    await expect(store.scanChunkIds(scope)).resolves.toEqual(new Map());
+  });
+
+  it("classifies a non-JSON error body as a retryable service failure", async () => {
+    // The SDK calls res.json() before checking res.ok, so an HTML 502 page
+    // from a proxy arrives as a bare SyntaxError with no status.
+    let htmlError: unknown;
+    try {
+      JSON.parse("<html><body>502 Bad Gateway</body></html>");
+    } catch (error) {
+      htmlError = error;
+    }
+    expect(classifyStorageError(htmlError)).toBe("SERVICE_UNAVAILABLE");
+
+    const { store, ns } = createStore({ fail: htmlError as Error, failTimes: 1, maxRetries: 1 });
+    await expect(store.getPageHashes(scope)).resolves.toEqual(new Map());
+    expect(ns.range).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("deletePages", () => {
+  it("wraps a scan failure as a typed storage error", async () => {
+    const raw = boom("Invalid token abc123secret", 401);
+    const { store } = createStore({ fail: raw });
+    const rejection = store.deletePages(scope);
+    await expect(rejection).rejects.toThrow(SearchSocketError);
+    await expect(rejection).rejects.not.toThrow("abc123secret");
+  });
+});
+
+describe("legacy page reads without a chunk manifest", () => {
+  it("stops scanning the scope at a hard ceiling instead of walking it unbounded", async () => {
+    let cursor = 0;
+    const ns = {
+      fetch: vi.fn(async () => [
+        {
+          id: pageId(scope, "/legacy"),
+          metadata: {
+            projectId: scope.projectId,
+            scopeName: scope.scopeName,
+            schemaVersion: INDEX_SCHEMA_VERSION,
+            type: "page",
+            url: "/legacy",
+            title: "Legacy"
+          }
+        }
+      ]),
+      // An endless scope of chunks that belong to other pages.
+      range: vi.fn(async () => ({ vectors: [], nextCursor: String(++cursor) }))
+    };
+    const store = new UpstashSearchStore({
+      index: { namespace: vi.fn(() => ns) } as never,
+      pagesNamespace: "pages",
+      chunksNamespace: "chunks",
+      maxRetries: 0,
+      retryBaseMs: 1
+    });
+
+    const rejection = store.getPage("/legacy", scope);
+    await expect(rejection).rejects.toMatchObject({ code: "VECTOR_BACKEND_UNAVAILABLE", status: 503 });
+    await expect(rejection).rejects.toThrow(/Reindex/);
+    expect(ns.range.mock.calls.length).toBeLessThanOrEqual(50);
+  });
+});
+
+describe("HTTP errors from the real @upstash/vector SDK", () => {
+  // The SDK builds `new UpstashError(body.error)` and throws the response
+  // status away, so these go through the real Index class with a mocked
+  // `fetch` rather than hand-built error objects.
+  async function realStore(responses: Array<() => Response>, maxRetries = 2) {
+    const { Index } = await import("@upstash/vector");
+    const fetchMock = vi.fn(async () => {
+      const next = responses.shift();
+      if (!next) throw new Error("unexpected extra request");
+      return next();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const index = new Index(createUpstashRequester({ url: "https://vector.example", token: "secret-token" }));
+    const store = new UpstashSearchStore({
+      index,
+      pagesNamespace: "pages",
+      chunksNamespace: "chunks",
+      maxRetries,
+      retryBaseMs: 1
+    });
+    return { store, fetchMock };
+  }
+
+  const json = (status: number, body: unknown) => () =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const html = (status: number) => () =>
+    new Response("<html><body>Bad Gateway</body></html>", { status, headers: { "Content-Type": "text/html" } });
+  const emptyRange = json(200, { result: { vectors: [], nextCursor: "0" } });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("retries a 503 whose JSON body does not say 'unavailable'", async () => {
+    const { store, fetchMock } = await realStore([json(503, { error: "overloaded" }), emptyRange]);
+    await expect(store.getPageHashes(scope)).resolves.toEqual(new Map());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a 429 whatever its wording, and reports it as a rate limit", async () => {
+    const { store, fetchMock } = await realStore([
+      json(429, { error: "ERR max concurrent requests exceeded" }),
+      json(429, { error: "ERR max concurrent requests exceeded" }),
+      json(429, { error: "ERR max concurrent requests exceeded" })
+    ]);
+    await expect(store.scanChunkIds(scope)).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries a 502 answered with an HTML page", async () => {
+    const { store, fetchMock } = await realStore([html(502), emptyRange]);
+    await expect(store.getPageHashes(scope)).resolves.toEqual(new Map());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a 401, even with an unhelpful body", async () => {
+    const { store, fetchMock } = await realStore([json(401, { error: "nope" })]);
+    await expect(store.getPageHashes(scope)).rejects.toMatchObject({ code: "VECTOR_BACKEND_UNAVAILABLE" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 400 filter error", async () => {
+    const { store, fetchMock } = await realStore([json(400, { error: "Invalid filter: unexpected token" })]);
+    await expect(store.getPageHashes(scope)).rejects.toThrow(SearchSocketError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a 503 or 429 that says the namespace is missing instead of reading it as empty", async () => {
+    const missing = { error: "namespace chunks not found" };
+    const { store, fetchMock } = await realStore([json(503, missing), json(429, missing), emptyRange]);
+    await expect(store.scanChunkIds(scope)).resolves.toEqual(new Map());
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails a persistent 503 with missing-namespace wording rather than returning empty", async () => {
+    const missing = { error: "namespace chunks not found" };
+    const { store, fetchMock } = await realStore([json(503, missing), json(503, missing), json(503, missing)]);
+    await expect(store.getPageHashes(scope)).rejects.toMatchObject({ code: "VECTOR_BACKEND_UNAVAILABLE" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("still treats a non-transient status with missing-namespace wording as an absent namespace", async () => {
+    const { store, fetchMock } = await realStore([json(404, { error: "namespace chunks not found" })]);
+    await expect(store.scanChunkIds(scope)).resolves.toEqual(new Map());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still returns successful results and a 200 error body as before", async () => {
+    const { store } = await realStore([emptyRange, json(200, { error: "namespace chunks not found" })]);
+    await expect(store.getPageHashes(scope)).resolves.toEqual(new Map());
+    await expect(store.scanChunkIds(scope)).resolves.toEqual(new Map());
   });
 });

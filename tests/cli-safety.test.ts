@@ -7,6 +7,8 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -41,6 +43,52 @@ function runCli(cwd: string, args: string[]): { status: number | null; stdout: s
     env: { ...process.env, UPSTASH_VECTOR_REST_URL: "", UPSTASH_VECTOR_REST_TOKEN: "" }
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+
+/**
+ * Run the CLI without blocking the event loop, so a fake backend served from
+ * this process can answer it.
+ */
+function runCliAsync(
+  cwd: string,
+  args: string[],
+  env: Record<string, string>
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, "--cwd", cwd, ...args], { env: { ...process.env, ...env } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+/**
+ * A stand-in for the Upstash Vector REST API: `info` fails (an unhealthy
+ * backend), `range` answers an empty page, and every other call fails.
+ */
+async function fakeUpstash(): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url?.includes("/range")) {
+        res.end(JSON.stringify({ result: { nextCursor: "", vectors: [] } }));
+        return;
+      }
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: "fake backend failure" }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise((r) => server.close(() => r()))
+  };
 }
 
 describe("searchsocket CLI safety (real process)", () => {
@@ -194,6 +242,73 @@ describe("searchsocket CLI safety (real process)", () => {
     });
   });
 
+  describe("exit codes", () => {
+    const testFile = JSON.stringify([{ query: "index", expect: { topResult: "/" } }]);
+
+    it("exits 5 when search runs with no backend configured", () => {
+      const { status, stderr } = runCli(tmpDir, ["search", "anything"]);
+
+      expect(status).toBe(5);
+      expect(stderr).toContain("not configured");
+    });
+
+    it.each([["search", "anything"], ["test"], ["status"]])(
+      "exits 2 when the config file does not parse (%s)",
+      (...args) => {
+        fs.writeFileSync(path.join(tmpDir, "searchsocket.config.ts"), "export default {\n  project: { id: \"x\" ,\n");
+        fs.writeFileSync(path.join(tmpDir, "searchsocket.test.json"), testFile);
+
+        const { status, stderr } = runCli(tmpDir, args);
+        expect(status).toBe(2);
+        expect(stderr).toContain("searchsocket.config.ts");
+      }
+    );
+
+    it("exits 2 for test --top-k above the engine's bound", () => {
+      fs.writeFileSync(path.join(tmpDir, "searchsocket.test.json"), testFile);
+
+      expect(runCli(tmpDir, ["test", "--top-k", "101"]).status).toBe(2);
+    });
+
+    it("exits 5 when test runs with no backend configured", () => {
+      fs.writeFileSync(path.join(tmpDir, "searchsocket.test.json"), testFile);
+
+      expect(runCli(tmpDir, ["test"]).status).toBe(5);
+    });
+
+    it("exits 5, not 3, when the backend fails test's queries", async () => {
+      fs.writeFileSync(path.join(tmpDir, "searchsocket.test.json"), testFile);
+      const backend = await fakeUpstash();
+      try {
+        const { status, stdout } = await runCliAsync(tmpDir, ["test"], {
+          UPSTASH_VECTOR_REST_URL: backend.url,
+          UPSTASH_VECTOR_REST_TOKEN: "fake-token"
+        });
+
+        expect(stdout).toContain("search error");
+        expect(status).toBe(5);
+      } finally {
+        await backend.close();
+      }
+    }, 60_000);
+
+    it("exits 5 when status finds the backend unhealthy", async () => {
+      const backend = await fakeUpstash();
+      try {
+        const { status, stdout } = await runCliAsync(tmpDir, ["status"], {
+          UPSTASH_VECTOR_REST_URL: backend.url,
+          UPSTASH_VECTOR_REST_TOKEN: "fake-token"
+        });
+
+        expect(stdout).toContain("backend health: error");
+        expect(stdout).toContain("resolved scope");
+        expect(status).toBe(5);
+      } finally {
+        await backend.close();
+      }
+    }, 60_000);
+  });
+
   describe("dev watcher", () => {
     let child: ChildProcessWithoutNullStreams | undefined;
 
@@ -248,7 +363,10 @@ describe("searchsocket CLI safety (real process)", () => {
       expect(out).not.toContain(".hidden.md");
 
       // The configured glob uses {md,mdx} alternation, which chokidar never saw
-      // and the event filter has to expand itself.
+      // and the event filter has to expand itself. Written straight after
+      // `new.md` into the directory created moments ago: with native events
+      // chokidar 5 on macOS intermittently never watches that directory, so
+      // this is the case the polled source watcher exists for.
       fs.writeFileSync(path.join(tmpDir, "content", "guides", "other.mdx"), "# other\n");
       expect(await waitFor(() => out, "other.mdx", 45_000)).toBe(true);
 

@@ -176,6 +176,20 @@ describe("runMcpServer", () => {
     expect(mocks.stdioConnect).toHaveBeenCalledTimes(1);
     expect(console.log).not.toBe(originalLog);
   });
+
+  it("hands --access and --api-key to loadConfig so they count toward validation", async () => {
+    // Applied after loading, a flag key arrived too late: loadConfig had
+    // already rejected a public config for having no key.
+    const config = { mcp: { transport: "stdio" as const, http: { port: 3338, path: "/mcp" } } };
+    mocks.loadConfig.mockResolvedValue(config);
+    mocks.createEngine.mockResolvedValue({ getConfig: () => config });
+
+    await runMcpServer({ access: "public", apiKey: "SECRET" });
+
+    expect(mocks.loadConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ overrides: { mcp: { access: "public", apiKey: "SECRET" } } })
+    );
+  });
 });
 
 describe("tool registration", () => {
@@ -1025,17 +1039,23 @@ describe("startHttpServer access modes", () => {
   });
 
   it("applies CLI access and apiKey overrides", async () => {
+    // loadConfig merges the overrides (see tests/config.test.ts); the mock
+    // returns the config as it would after that merge.
     const config = {
       mcp: {
-        access: "private" as const,
+        access: "public" as const,
         transport: "http" as const,
-        http: { port: 3338, path: "/mcp" }
+        http: { port: 3338, path: "/mcp", apiKey: "cli-key" }
       }
     };
     mocks.loadConfig.mockResolvedValue(config);
     mocks.createEngine.mockResolvedValue({ getConfig: () => config });
 
     await runMcpServer({ transport: "http", access: "public", apiKey: "cli-key" });
+
+    expect(mocks.loadConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ overrides: { mcp: { access: "public", apiKey: "cli-key" } } })
+    );
 
     // Should bind to 0.0.0.0 because CLI overrode access to public
     expect(mocks.app.listen).toHaveBeenCalledWith(
@@ -1059,15 +1079,10 @@ describe("startHttpServer access modes", () => {
   });
 
   it("throws when CLI sets access to public without apiKey", async () => {
-    const config = {
-      mcp: {
-        access: "private" as const,
-        transport: "http" as const,
-        http: { port: 3338, path: "/mcp" }
-      }
-    };
-    mocks.loadConfig.mockResolvedValue(config);
-    mocks.createEngine.mockResolvedValue({ getConfig: () => config });
+    // The key check runs inside loadConfig against the overridden config.
+    mocks.loadConfig.mockRejectedValue(
+      new Error('`mcp.access` is "public" but no API key is configured.')
+    );
 
     await expect(
       runMcpServer({ transport: "http", access: "public" })

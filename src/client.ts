@@ -2,9 +2,15 @@ import type { SearchRequest, SearchResponse, SearchResult } from "./types";
 // Lives under `src/svelte/` because that is the only source directory the
 // published tarball carries whole, and the raw-source store needs the same
 // checks. This entry point is bundled by tsup, so the import is inlined here.
-import { errorMessageFrom, isSafeResultUrl, isSearchResponse } from "./svelte/response-validation";
+import { errorMessageFrom, isSafeResultUrl, parseSearchResponse } from "./svelte/response-validation";
 
-export { isSafeResultUrl } from "./svelte/response-validation";
+/**
+ * Response validation for callers that fetch the endpoint themselves.
+ * `parseSearchResponse` returns the response with malformed or unsafe rows
+ * dropped (or `null` for a broken envelope), which is what `search()` returns;
+ * `isSearchResponse` is the strict guard that fails if any row would be dropped.
+ */
+export { isSafeResultUrl, isSearchResponse, parseSearchResponse } from "./svelte/response-validation";
 
 const SNIPPET_TARGET_MAX_WORDS = 12;
 
@@ -120,7 +126,16 @@ export interface SearchClientOptions {
   fetchImpl?: typeof fetch;
 }
 
-export function createSearchClient(options: SearchClientOptions = {}) {
+/** The browser search client returned by `createSearchClient`. */
+export interface SearchClient {
+  /**
+   * POST a search to the configured endpoint. Rejects on a non-2xx response or
+   * a malformed envelope; malformed or unsafe individual results are dropped.
+   */
+  search(request: SearchRequest): Promise<SearchResponse>;
+}
+
+export function createSearchClient(options: SearchClientOptions = {}): SearchClient {
   const endpoint = options.endpoint ?? "/api/search";
   const fetchImpl = options.fetchImpl ?? fetch;
 
@@ -148,11 +163,13 @@ export function createSearchClient(options: SearchClientOptions = {}) {
         throw new Error(errorMessageFrom(payload, "Search failed"));
       }
 
-      if (!isSearchResponse(payload)) {
+      // Refuses a malformed envelope; drops individual malformed or unsafe rows.
+      const parsed = parseSearchResponse(payload);
+      if (!parsed) {
         throw new Error("Invalid search response");
       }
 
-      return payload;
+      return parsed;
     }
   };
 }

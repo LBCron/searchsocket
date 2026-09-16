@@ -1,8 +1,13 @@
 import { SearchSocketError } from "../errors";
 import type { ResolvedSearchSocketConfig } from "../types";
-import { UpstashSearchStore } from "./upstash";
+import type { SearchStore } from "./store";
+import { UpstashSearchStore, createUpstashRequester } from "./upstash";
 
-export async function createUpstashStore(config: ResolvedSearchSocketConfig): Promise<UpstashSearchStore> {
+/**
+ * Internal: the concrete store, for the CLI's administrative commands (scope
+ * listing and deletion, legacy migration) that sit outside `SearchStore`.
+ */
+export async function openUpstashStore(config: ResolvedSearchSocketConfig): Promise<UpstashSearchStore> {
   const url = config.upstash.url ?? process.env[config.upstash.urlEnv];
   const token = config.upstash.token ?? process.env[config.upstash.tokenEnv];
 
@@ -15,7 +20,9 @@ export async function createUpstashStore(config: ResolvedSearchSocketConfig): Pr
   }
 
   const { Index } = await import("@upstash/vector");
-  const index = new Index({ url, token });
+  // Our requester rather than the SDK's default client, so an HTTP error keeps
+  // its status and is retried or reported by what it is, not by its wording.
+  const index = new Index(createUpstashRequester({ url, token }));
 
   return new UpstashSearchStore({
     index,
@@ -24,4 +31,9 @@ export async function createUpstashStore(config: ResolvedSearchSocketConfig): Pr
     batchSize: config.upstash.batchSize,
     maxRetries: config.upstash.maxRetries
   });
+}
+
+/** Create the Upstash-backed store from a resolved config. */
+export async function createUpstashStore(config: ResolvedSearchSocketConfig): Promise<SearchStore> {
+  return openUpstashStore(config);
 }

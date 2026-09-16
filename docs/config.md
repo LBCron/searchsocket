@@ -25,6 +25,12 @@ export default {
 };
 ```
 
+Config objects are strict. A key SearchSocket does not recognise — a typo such as
+`ranking.minScoreRatoi`, or an option from another tool — fails config loading with
+`CONFIG_INVALID`, naming the full key path and suggesting the closest valid key when
+one is near. Keys that were removed in an earlier release fail with a migration
+message that says what to do instead.
+
 ## Project
 
 - `project.id` (default: `package.json` name) — unique identifier for the project
@@ -47,7 +53,7 @@ export default {
 
 - `source.build.outputDir` (default `.svelte-kit/output`)
 - `source.build.previewTimeout` (default `30000`) — ms to wait for preview server
-- `source.build.exclude` — glob patterns to skip (e.g., `["/api/*"]`)
+- `source.build.exclude` — [URL patterns](#url-patterns) to skip (e.g., `["/api/*"]`)
 - `source.build.paramValues` — values for dynamic routes (e.g., `{ "/blog/[slug]": ["hello-world"] }`)
 - `source.build.discover` (default `false`) — crawl internal links to find pages
 - `source.build.seedUrls` (default `["/"]`) — starting URLs for discovery
@@ -77,13 +83,11 @@ export default {
 
 ## Transform
 
-- `transform.output` (`markdown`) — output format for extracted content
 - `transform.preserveCodeBlocks` (default `true`) — keep code blocks intact
 - `transform.preserveTables` (default `true`) — keep tables intact
 
 ## Chunking
 
-- `chunking.strategy` (`hybrid`) — chunking strategy
 - `chunking.maxChars` (default `1500`) — maximum characters per chunk
 - `chunking.overlapChars` (default `200`) — overlap between consecutive chunks
 - `chunking.minChars` (default `250`) — minimum characters per chunk (smaller chunks are merged)
@@ -95,6 +99,10 @@ export default {
   content hash; the weighted heading text never reached the embedding model, so
   it caused re-embedding churn without affecting relevance. Use
   `chunking.prependTitle`.
+
+`transform.output` and `chunking.strategy` are also **removed in 1.0**. Each accepted
+exactly one value (`"markdown"` and `"hybrid"`) and nothing read it; setting either now
+fails config loading with a migration message. Delete them.
 
 ## Upstash
 
@@ -158,26 +166,6 @@ now produces a migration error. Tune ranking through `ranking.weights`.
   your repository) and `chunkText` (the matched section's indexed text) in
   browser search responses, and `routeFile` in page responses. Off by default.
 
-### MCP access
-
-- `mcp.enable` (default `NODE_ENV !== "production"`) — mount the MCP endpoint on
-  the SvelteKit handle.
-- `mcp.handle.apiKey` / `mcp.handle.apiKeyEnv` — required for the endpoint to
-  serve anything while `mcp.handle.access` is `private`. MCP returns repository
-  paths, a page's indexed markdown, and any scope the caller names, so without a
-  key the route answers 503.
-- `mcp.handle.access` (default `private`) — governs the **SvelteKit handle
-  route**. `public` serves callers that present no `Authorization` header
-  instead of refusing them, with `routeFile`, `chunkText` and `breakdown`
-  stripped from every tool result and the caller's `scope` ignored — the same
-  fields `api.exposeInternalFields` withholds from the browser API. A valid
-  bearer token still returns them, so an editing agent configured with the key
-  keeps source paths and a public agent does not. A wrong or malformed token is
-  still a 401 rather than a silent downgrade.
-- `mcp.access` (default `private`) — governs the **standalone** MCP server only:
-  whether it binds to loopback or all interfaces. It has no effect on the
-  SvelteKit handle route, which is governed by `mcp.handle.access`.
-
 ## Ranking
 
 - `ranking.enableIncomingLinkBoost` (default `true`) — boost pages with more incoming links
@@ -186,9 +174,9 @@ now produces a migration error. Tune ranking through `ranking.weights`.
 - `ranking.freshnessDecayRate` (default `0.001`) — decay rate for freshness boost
 - `ranking.enableAnchorTextBoost` (default `false`) — boost pages whose anchor text matches the query
 - `ranking.pageWeights` (default `{}`) — per-URL score multipliers (e.g.,
-  `{ "/docs": 1.15 }`). The key is a URL *pattern*, not a raw prefix: `/docs` matches
-  only `/docs`, `/docs/*` matches one level down, and `/docs/**` matches the whole
-  subtree. A page's own `searchsocket-weight` / frontmatter weight takes precedence,
+  `{ "/docs/**": 1.15 }`). The key is a [URL pattern](#url-patterns), not a raw prefix:
+  `/docs` matches only `/docs`, `/docs/*` matches one level down, and `/docs/**`
+  matches the whole subtree; the longest matching pattern wins. A page's own `searchsocket-weight` / frontmatter weight takes precedence,
   except that a `0` from either source excludes the page.
 - `ranking.minScoreRatio` (default `0.70`) — drop results scoring below this
   fraction of the best result
@@ -226,18 +214,47 @@ survives both, so no threshold setting makes an off-topic query return nothing.
 
 ## MCP
 
-- `mcp.enable` (default `true` in dev, `false` in prod) — enable MCP server
-- `mcp.access` (`public` | `private`, default `private`) — access level
-- `mcp.transport` (`stdio` | `http`, default `stdio`) — transport protocol
-- `mcp.http.port` (default `3338`) — HTTP server port
-- `mcp.http.path` (default `/mcp`) — HTTP endpoint path
-- `mcp.http.apiKey` (optional) — API key for HTTP transport
-- `mcp.http.apiKeyEnv` (optional) — env var for HTTP API key
-- `mcp.handle.path` (default `/api/mcp`) — SvelteKit handle endpoint path
-- `mcp.handle.access` (`public` | `private`, default `private`) — whether the
-  handle route serves anonymous callers a redacted result set
-- `mcp.handle.apiKey` (optional) — API key for handle endpoint
-- `mcp.handle.enableJsonResponse` (default `true`) — enable JSON response format
+SearchSocket serves MCP in two independent places, each with its own settings:
+the **SvelteKit handle route** mounted by `searchsocketHandle()`, and the
+**standalone server** started by `searchsocket mcp`. See
+[mcp-claude-code.md](mcp-claude-code.md) for complete client setups.
+
+- `mcp.enable` (default `NODE_ENV !== "production"`) — mount the MCP route on the
+  SvelteKit handle. It is **off in production unless you set it to `true`**.
+  `false` removes the route entirely.
+
+### SvelteKit handle route
+
+- `mcp.handle.path` (default `/api/mcp`) — endpoint path.
+- `mcp.handle.apiKey` / `mcp.handle.apiKeyEnv` — bearer key, or the env var holding
+  it. Required for the route to serve anything while `mcp.handle.access` is
+  `private`: MCP returns repository paths, a page's indexed markdown, and any scope
+  the caller names, so without a key the route answers 503.
+- `mcp.handle.access` (`public` | `private`, default `private`) — `public` serves
+  callers that present no `Authorization` header instead of refusing them, with
+  `routeFile`, `chunkText` and `breakdown` stripped from every tool result and the
+  caller's `scope` ignored — the same fields `api.exposeInternalFields` withholds from
+  the browser API. A valid bearer token still returns them, so an editing agent
+  configured with the key keeps source paths and a public agent does not. A wrong or
+  malformed token is still a 401 rather than a silent downgrade.
+- `mcp.handle.enableJsonResponse` (default `true`) — answer each POST with a JSON
+  body instead of an SSE stream. Keep it on for serverless hosts.
+
+### Standalone server (`searchsocket mcp`)
+
+- `mcp.transport` (`stdio` | `http`, default `stdio`) — used when `--transport` is
+  not passed.
+- `mcp.http.port` (default `3338`) — used when `--port` is not passed.
+- `mcp.http.path` (default `/mcp`) — used when `--path` is not passed.
+- `mcp.access` (`public` | `private`, default `private`) — whether the HTTP server
+  binds to loopback (`private`) or all interfaces (`public`). It has no effect on the
+  SvelteKit handle route, which is governed by `mcp.handle.access`.
+- `mcp.http.apiKey` / `mcp.http.apiKeyEnv` — bearer key, or the env var holding it.
+  Required when `mcp.access` is `public`; `searchsocket mcp --api-key` supplies it
+  instead and is applied before the requirement is checked.
+
+Command-line flags override these values; unset flags fall back to config, then to
+the defaults above.
 
 ## llms.txt
 
@@ -263,10 +280,52 @@ sides.
 
 - `state.dir` (default `.searchsocket`) — state directory for indexing metadata
 
+## Indexing
+
+- `indexing.maxDeletionRatio` (default `0.5`, range `0`–`1`) — refuse to delete stale
+  records when a run would remove more than this fraction of the pages, or of the
+  chunks, already in the index for the scope. A sudden mass deletion is far more often
+  a broken source config than a genuinely emptied site. When the guard trips, the run
+  writes nothing to the index and reports why. Pass
+  `searchsocket index --accept-large-deletion` (or `acceptLargeDeletion` to the
+  pipeline) to permit a deletion past the limit; `1` disables the guard.
+
 ## Filtering
 
-- `exclude` (default `[]`) — glob patterns for URLs to exclude from indexing
+- `exclude` (default `[]`) — [URL patterns](#url-patterns) for pages to exclude from
+  indexing, applied in every source mode
 - `respectRobotsTxt` (default `true`) — honor robots.txt rules
+
+## URL patterns
+
+`exclude`, `source.build.exclude` and the keys of `ranking.pageWeights` take URL path
+patterns. They are **not** general globs. The complete syntax:
+
+| Pattern | Matches | Does not match |
+| --- | --- | --- |
+| `/docs` | `/docs` only | `/docs/api`, `/docsmith` |
+| `/docs/*` | exactly one segment below: `/docs/api` | `/docs`, `/docs/api/auth` |
+| `/docs/**` | `/docs` itself and everything below, at any depth | `/docsmith` |
+| `/*` | any single-segment path: `/about` | `/`, `/docs/api` |
+| `/**` | every path | — |
+| `/` | the root page only | everything else |
+
+Rules:
+
+- A pattern must start with `/`. A trailing slash is ignored on both the pattern and
+  the URL.
+- `*` and `**` are only allowed as the **whole final segment**. Wildcards in the
+  middle of a path (`/**/private/**`), inside a segment (`/draft-*`, `/blog/*.html`),
+  and the characters `?`, `[`, `]`, `{`, `}` are rejected at config load with
+  `CONFIG_INVALID` instead of being silently compared as literal text.
+- Empty segments (`/docs//**`, `//docs`) are rejected at config load for the same
+  reason: a doubled slash is compared literally and never matches a URL path.
+- For `ranking.pageWeights`, when several patterns match a URL the longest pattern
+  wins.
+
+To exclude pages that a single trailing wildcard cannot describe, list the paths
+explicitly, or mark the pages themselves with `data-search-noindex`,
+`<meta name="robots" content="noindex">`, or a weight of `0`.
 
 ## Indexing Hooks
 
@@ -311,7 +370,6 @@ export default {
           return chunks;
         },
 
-        // Run after indexing completes
         // Run after indexing completes. `IndexStats` uses flat counters —
         // pagesProcessed, pagesChanged, pagesDeleted, chunksTotal, chunksChanged,
         // documentsUpserted, deletes — not nested `pages`/`chunks` objects.

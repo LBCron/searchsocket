@@ -44,3 +44,34 @@ describe("toErrorPayload", () => {
     expect(payload.error.message).toBe("Internal error");
   });
 });
+
+describe("SearchSocketError across bundles", () => {
+  it("recognises an instance created by another copy of the class", async () => {
+    // Each published entry point bundles its own copy of the class. A fresh
+    // module instance stands in for a second bundle.
+    const { vi } = await import("vitest");
+    vi.resetModules();
+    // @ts-expect-error -- the query string only forces a second module instance.
+    const other: typeof import("../src/errors/index") = await import("../src/errors/index?copy=2");
+    const foreign = new other.SearchSocketError("RATE_LIMITED", "Retry later", 429);
+
+    expect(other.SearchSocketError).not.toBe(SearchSocketError);
+    expect(foreign instanceof SearchSocketError).toBe(true);
+    expect(new SearchSocketError("CONFIG_INVALID", "x") instanceof other.SearchSocketError).toBe(true);
+    expect(toErrorPayload(foreign)).toEqual({ error: { code: "RATE_LIMITED", message: "Retry later" } });
+  });
+
+  it("does not claim plain errors or look-alikes", () => {
+    const lookalike = Object.assign(new Error("x"), { name: "SearchSocketError", code: "CONFIG_INVALID" });
+    expect(lookalike instanceof SearchSocketError).toBe(false);
+    expect(new Error("x") instanceof SearchSocketError).toBe(false);
+    expect((null as unknown) instanceof SearchSocketError).toBe(false);
+  });
+
+  it("keeps ordinary semantics for subclasses", () => {
+    class Special extends SearchSocketError {}
+    expect(new Special("INTERNAL_ERROR", "x") instanceof Special).toBe(true);
+    expect(new SearchSocketError("INTERNAL_ERROR", "x") instanceof Special).toBe(false);
+    expect(new Special("INTERNAL_ERROR", "x") instanceof SearchSocketError).toBe(true);
+  });
+});

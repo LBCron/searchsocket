@@ -143,20 +143,75 @@ export function isSearchResult(value: unknown): value is SearchResult {
   return true;
 }
 
-export function isSearchResponse(payload: unknown): payload is SearchResponse {
-  if (typeof payload !== "object" || payload === null) return false;
+/**
+ * A result row as it may be shown, or `null` when the row itself is unusable.
+ *
+ * Chunk rows are filtered individually: one malformed section should cost that
+ * section, not the page result it belongs to. A `chunks` field that is not an
+ * array at all is a malformed row.
+ */
+function sanitizeSearchResult(value: unknown): SearchResult | null {
+  if (typeof value !== "object" || value === null) return null;
+  const row = value as Partial<SearchResult>;
+  let candidate: unknown = value;
+  if (Array.isArray(row.chunks)) {
+    const chunks = row.chunks.filter(isSearchResultChunk);
+    if (chunks.length !== row.chunks.length) candidate = { ...row, chunks };
+  }
+  return isSearchResult(candidate) ? candidate : null;
+}
+
+/**
+ * Validate a search response and return the part of it that is safe to use.
+ *
+ * The envelope — `q`, `scope`, `meta.timingsMs` and a `results` array — has to
+ * be well-formed, or the whole response is refused: that is a broken endpoint,
+ * not a bad row. Individual result rows (and chunk rows within them) that are
+ * malformed or carry an unsafe URL are dropped instead. Refusing everything
+ * for one bad row turned a single empty `url` in an index into a search box
+ * that showed nothing but "Invalid search response".
+ *
+ * Never mutates its input; returns `null` when the envelope is invalid.
+ */
+export function parseSearchResponse(payload: unknown): SearchResponse | null {
+  if (typeof payload !== "object" || payload === null) return null;
   const response = payload as Partial<SearchResponse>;
-  if (typeof response.q !== "string" || typeof response.scope !== "string") return false;
+  if (typeof response.q !== "string" || typeof response.scope !== "string") return null;
 
   // `meta.timingsMs` is rendered ("12 results in 30ms"), so an object with the
   // wrong shape inside is a render-time failure, not a cosmetic one.
   const meta = response.meta as SearchResponse["meta"] | undefined;
-  if (typeof meta !== "object" || meta === null) return false;
+  if (typeof meta !== "object" || meta === null) return null;
   const timings = meta.timingsMs as SearchResponse["meta"]["timingsMs"] | undefined;
-  if (typeof timings !== "object" || timings === null) return false;
-  if (!isFiniteNumber(timings.search) || !isFiniteNumber(timings.total)) return false;
+  if (typeof timings !== "object" || timings === null) return null;
+  if (!isFiniteNumber(timings.search) || !isFiniteNumber(timings.total)) return null;
 
-  return Array.isArray(response.results) && response.results.every(isSearchResult);
+  if (!Array.isArray(response.results)) return null;
+  const results = response.results.flatMap((row) => {
+    const sanitized = sanitizeSearchResult(row);
+    return sanitized ? [sanitized] : [];
+  });
+
+  return { ...(response as SearchResponse), results };
+}
+
+/**
+ * Strict type guard: true only when `payload` is a valid search response as it
+ * stands — a well-formed envelope and no row (or chunk row)
+ * {@link parseSearchResponse} would drop. Pure; it never modifies `payload`.
+ * Call `parseSearchResponse` instead to keep the usable rows of a response
+ * that has some bad ones.
+ */
+export function isSearchResponse(payload: unknown): payload is SearchResponse {
+  const parsed = parseSearchResponse(payload);
+  if (!parsed) return false;
+  // `sanitizeSearchResult` returns the original row object when it needed no
+  // cleaning, so identity means nothing was dropped at either level.
+  const original = (payload as SearchResponse).results;
+  return (
+    parsed.results.length === original.length &&
+    parsed.results.every((row, index) => row === original[index])
+  );
 }
 
 /**

@@ -29,7 +29,7 @@
 
 - **`<meta name="robots" content="noindex">`** — SearchSocket respects this by default. Disable with `extract.respectRobotsNoindex: false`.
 
-- **`exclude` patterns.** Check your config's `exclude` array for glob patterns that might match the page URL.
+- **`exclude` patterns.** Check your config's `exclude` array for a pattern that matches the page URL. Patterns are not general globs — see [URL patterns](config.md#url-patterns) for the exact syntax.
 
 - **No `<main>` element.** SearchSocket extracts content from the `<main>` element by default. If your page doesn't have one, configure `extract.mainSelector` to match your content wrapper.
 
@@ -105,7 +105,7 @@ Images are made searchable by extracting their text descriptions (`data-search-d
 | `pnpm searchsocket doctor` | Config, env vars, Upstash connectivity, **local** state-directory write access |
 | `pnpm searchsocket status` | Index health, document count, scope, last indexed time |
 | `pnpm searchsocket test` | Search quality assertions and MRR |
-| `pnpm searchsocket search --q "test"` | Quick search to verify results |
+| `pnpm searchsocket search "test"` | Quick search to verify results |
 | `pnpm searchsocket index --dry-run` | Preview indexing without writing |
 
 ## Getting help
